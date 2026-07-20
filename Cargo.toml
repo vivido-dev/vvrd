@@ -6,7 +6,7 @@ edition = "2024"
 rust-version = "1.86"
 repository = "https://github.com/wensheng/vvrd"
 description = "A terminal PDF and EPUB reader for the Vivido terminal"
-license = "AGPL 3.0"
+license = "AGPL-3.0"
 
 [[bin]]
 name = "vvrd"
