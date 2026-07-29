@@ -34,13 +34,7 @@ log = "0.4"
 flexi_logger = "0.31"
 libc = "0.2"
 
-[target.'cfg(not(windows))'.dependencies]
 mupdf_crates_io = { package = "mupdf", version = "0.8.0", default-features = false, features = ["svg", "system-fonts", "base14-fonts", "img", "html", "epub"] }
-
-[target.'cfg(windows)'.dependencies]
-# mupdf 0.8.0 assumes that bindgen exports C11's max_align_t, but MSVC's C
-# headers do not define it. Keep this patch until upstream ships the MSVC fix.
-mupdf = { version = "0.8.0", path = "vendor/mupdf-0.8.0", default-features = false, features = ["svg", "system-fonts", "base14-fonts", "img", "html", "epub"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal"] }
@@ -48,3 +42,10 @@ nix = { version = "0.31", features = ["signal"] }
 [profile.production]
 inherits = "release"
 lto = "fat"
+
+# mupdf 0.8.0 assumes that bindgen exports C11's max_align_t, but MSVC's C
+# headers do not define it. The vendored copy carries the MSVC fix. This patch
+# section is local-only (stripped on publish), so the published crate still
+# depends on the plain crates.io mupdf 0.8.0. Keep until upstream ships the fix.
+[patch.crates-io]
+mupdf = { path = "vendor/mupdf-0.8.0" }
