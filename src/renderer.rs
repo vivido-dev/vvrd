@@ -38,14 +38,14 @@ pub enum DocumentKind {
     Reflowable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LinkInfo {
     pub text: String,
     pub uri: String,
     pub page: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TocEntry {
     pub title: String,
     pub page: usize,
@@ -111,6 +111,8 @@ pub enum RenderEvent {
         page: usize,
         generation: u64,
         image: PageImage,
+        text: String,
+        links: Vec<LinkInfo>,
     },
     SearchComplete(Vec<usize>),
     Links(Vec<LinkInfo>),
@@ -178,7 +180,7 @@ fn run_render_thread(
         viewport.page_area_height_px() as f32,
         11.0,
     ));
-    if send_opened(&document, kind, &events).is_err() {
+    if !send_opened(&document, kind, &events) {
         return;
     }
 
@@ -219,6 +221,8 @@ fn run_render_thread(
                     page,
                     generation: options.generation,
                     image,
+                    text: extract_page_text(&document, page),
+                    links: extract_links(&document, page),
                 });
                 if event.is_ok() {
                     prerender_request = Some((page, options));
@@ -511,11 +515,7 @@ fn document_kind(document: &Document) -> DocumentKind {
     }
 }
 
-fn send_opened(
-    document: &Document,
-    kind: DocumentKind,
-    events: &Sender<RenderEvent>,
-) -> Result<(), flume::SendError<RenderEvent>> {
+fn send_opened(document: &Document, kind: DocumentKind, events: &Sender<RenderEvent>) -> bool {
     let n_pages = usize::try_from(document.page_count().unwrap_or(0))
         .unwrap_or(0)
         .max(1);
@@ -523,12 +523,14 @@ fn send_opened(
     if let Ok(outlines) = document.outlines() {
         flatten_outlines(&outlines, 0, &mut toc);
     }
-    events.send(RenderEvent::Opened {
-        kind,
-        n_pages,
-        toc,
-        metadata: extract_metadata(document),
-    })
+    events
+        .send(RenderEvent::Opened {
+            kind,
+            n_pages,
+            toc,
+            metadata: extract_metadata(document),
+        })
+        .is_ok()
 }
 
 pub struct RenderedDocument {
@@ -755,6 +757,14 @@ fn extract_links(document: &Document, page_num: usize) -> Vec<LinkInfo> {
             }
         })
         .collect()
+}
+
+fn extract_page_text(document: &Document, page_num: usize) -> String {
+    document
+        .load_page(page_num as i32)
+        .and_then(|page| page.to_text_page(TextPageFlags::empty()))
+        .and_then(|text| text.to_text())
+        .unwrap_or_default()
 }
 
 fn flatten_outlines(outlines: &[mupdf::Outline], level: usize, output: &mut Vec<TocEntry>) {
