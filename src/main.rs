@@ -10,7 +10,6 @@ mod state;
 mod terminal;
 mod vivid_thread;
 
-#[cfg(not(windows))]
 extern crate mupdf_crates_io as mupdf;
 
 use std::{
