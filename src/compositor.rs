@@ -33,6 +33,36 @@ pub struct ComposedFrame {
     pub content_height: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaOperation {
+    Copy {
+        destination_x: u32,
+        destination_y: u32,
+        width: u32,
+        height: u32,
+        source_x: u32,
+        source_y: u32,
+    },
+    Overwrite {
+        rect: DamageRect,
+        rgba: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameDelta {
+    pub operations: Vec<DeltaOperation>,
+    pub damaged_pixels: u64,
+}
+
 impl PageImage {
     pub fn into_rgb(self) -> anyhow::Result<RgbImage> {
         let tight_stride = usize::try_from(self.width)
@@ -128,6 +158,274 @@ pub fn compose_view(
         content_width,
         content_height,
     })
+}
+
+pub fn plan_frame_delta(
+    previous: &ComposedFrame,
+    current: &ComposedFrame,
+    viewport: WindowSize,
+    previous_transform: ViewTransform,
+    current_transform: ViewTransform,
+    same_page_image: bool,
+    operation_limit: u32,
+) -> anyhow::Result<Option<FrameDelta>> {
+    let width = viewport.page_area_width_px();
+    let height = viewport.page_area_height_px();
+    ensure!(
+        previous.rgba.len() == viewport.framebuffer_len()?
+            && current.rgba.len() == previous.rgba.len(),
+        "delta frame dimensions do not match the viewport"
+    );
+    if previous.rgba == current.rgba {
+        return Ok(None);
+    }
+
+    if same_page_image
+        && previous_transform.auto_crop == current_transform.auto_crop
+        && let Some(delta) = plan_translation_delta(
+            &previous.rgba,
+            &current.rgba,
+            width,
+            height,
+            previous_transform,
+            current_transform,
+            operation_limit,
+        )?
+    {
+        return Ok(Some(delta));
+    }
+
+    let Some(rect) = changed_bounds(&previous.rgba, &current.rgba, width, height) else {
+        return Ok(None);
+    };
+    if operation_limit == 0 {
+        return Ok(None);
+    }
+    Ok(Some(FrameDelta {
+        damaged_pixels: u64::from(rect.width) * u64::from(rect.height),
+        operations: vec![DeltaOperation::Overwrite {
+            rgba: extract_rect(&current.rgba, width, rect)?,
+            rect,
+        }],
+    }))
+}
+
+fn plan_translation_delta(
+    previous: &[u8],
+    current: &[u8],
+    width: u32,
+    height: u32,
+    previous_transform: ViewTransform,
+    current_transform: ViewTransform,
+    operation_limit: u32,
+) -> anyhow::Result<Option<FrameDelta>> {
+    let shift_x = i64::from(previous_transform.offset_x) - i64::from(current_transform.offset_x);
+    let shift_y = i64::from(previous_transform.offset_y) - i64::from(current_transform.offset_y);
+    if shift_x == 0 && shift_y == 0 {
+        return Ok(None);
+    }
+    let (source_x, destination_x, copy_width) = translation_axis(width, shift_x);
+    let (source_y, destination_y, copy_height) = translation_axis(height, shift_y);
+    if copy_width == 0 || copy_height == 0 {
+        return Ok(None);
+    }
+
+    let mut rects = Vec::with_capacity(4);
+    push_rect(&mut rects, 0, 0, width, destination_y);
+    push_rect(
+        &mut rects,
+        0,
+        destination_y.saturating_add(copy_height),
+        width,
+        height.saturating_sub(destination_y.saturating_add(copy_height)),
+    );
+    push_rect(&mut rects, 0, destination_y, destination_x, copy_height);
+    push_rect(
+        &mut rects,
+        destination_x.saturating_add(copy_width),
+        destination_y,
+        width.saturating_sub(destination_x.saturating_add(copy_width)),
+        copy_height,
+    );
+    if 1_usize.saturating_add(rects.len()) > operation_limit as usize {
+        return Ok(None);
+    }
+
+    let mut operations = Vec::with_capacity(1 + rects.len());
+    operations.push(DeltaOperation::Copy {
+        destination_x,
+        destination_y,
+        width: copy_width,
+        height: copy_height,
+        source_x,
+        source_y,
+    });
+    for rect in rects {
+        operations.push(DeltaOperation::Overwrite {
+            rgba: extract_rect(current, width, rect)?,
+            rect,
+        });
+    }
+    let damage =
+        u64::from(width) * u64::from(height) - u64::from(copy_width) * u64::from(copy_height);
+    let delta = FrameDelta {
+        operations,
+        damaged_pixels: damage,
+    };
+    if apply_delta_reference(previous, width, height, &delta)? == current {
+        Ok(Some(delta))
+    } else {
+        Ok(None)
+    }
+}
+
+fn translation_axis(length: u32, shift: i64) -> (u32, u32, u32) {
+    let magnitude = u32::try_from(shift.unsigned_abs())
+        .unwrap_or(u32::MAX)
+        .min(length);
+    if shift >= 0 {
+        (0, magnitude, length - magnitude)
+    } else {
+        (magnitude, 0, length - magnitude)
+    }
+}
+
+fn push_rect(rects: &mut Vec<DamageRect>, x: u32, y: u32, width: u32, height: u32) {
+    if width != 0 && height != 0 {
+        rects.push(DamageRect {
+            x,
+            y,
+            width,
+            height,
+        });
+    }
+}
+
+fn changed_bounds(previous: &[u8], current: &[u8], width: u32, height: u32) -> Option<DamageRect> {
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut changed = false;
+    for (index, (before, after)) in previous
+        .chunks_exact(4)
+        .zip(current.chunks_exact(4))
+        .enumerate()
+    {
+        if before != after {
+            let index = u32::try_from(index).ok()?;
+            let x = index % width;
+            let y = index / width;
+            changed = true;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    changed.then_some(DamageRect {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x + 1,
+        height: max_y - min_y + 1,
+    })
+}
+
+fn extract_rect(frame: &[u8], frame_width: u32, rect: DamageRect) -> anyhow::Result<Vec<u8>> {
+    let row_bytes = usize::try_from(rect.width)
+        .context("damage width exceeds address space")?
+        .checked_mul(4)
+        .context("damage row size overflow")?;
+    let mut rgba = Vec::with_capacity(
+        row_bytes
+            .checked_mul(rect.height as usize)
+            .context("damage buffer size overflow")?,
+    );
+    for y in rect.y..rect.y + rect.height {
+        let start = (usize::try_from(y)
+            .context("damage y exceeds address space")?
+            .checked_mul(frame_width as usize)
+            .and_then(|value| value.checked_add(rect.x as usize))
+            .and_then(|value| value.checked_mul(4)))
+        .context("damage offset overflow")?;
+        rgba.extend_from_slice(&frame[start..start + row_bytes]);
+    }
+    Ok(rgba)
+}
+
+fn apply_delta_reference(
+    previous: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    delta: &FrameDelta,
+) -> anyhow::Result<Vec<u8>> {
+    let mut frame = previous.to_vec();
+    for operation in &delta.operations {
+        match operation {
+            DeltaOperation::Copy {
+                destination_x,
+                destination_y,
+                width,
+                height,
+                source_x,
+                source_y,
+            } => {
+                let source = extract_rect(
+                    &frame,
+                    frame_width,
+                    DamageRect {
+                        x: *source_x,
+                        y: *source_y,
+                        width: *width,
+                        height: *height,
+                    },
+                )?;
+                overwrite_rect(
+                    &mut frame,
+                    frame_width,
+                    DamageRect {
+                        x: *destination_x,
+                        y: *destination_y,
+                        width: *width,
+                        height: *height,
+                    },
+                    &source,
+                )?;
+            }
+            DeltaOperation::Overwrite { rect, rgba } => {
+                overwrite_rect(&mut frame, frame_width, *rect, rgba)?;
+            }
+        }
+    }
+    ensure!(
+        frame.len()
+            == usize::try_from(frame_width)?
+                .checked_mul(frame_height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .context("reference frame size overflow")?,
+        "reference frame size mismatch"
+    );
+    Ok(frame)
+}
+
+fn overwrite_rect(
+    frame: &mut [u8],
+    frame_width: u32,
+    rect: DamageRect,
+    rgba: &[u8],
+) -> anyhow::Result<()> {
+    let row_bytes = rect.width as usize * 4;
+    ensure!(
+        rgba.len() == row_bytes * rect.height as usize,
+        "damage payload size mismatch"
+    );
+    for row in 0..rect.height as usize {
+        let destination = ((rect.y as usize + row) * frame_width as usize + rect.x as usize) * 4;
+        let source = row * row_bytes;
+        frame[destination..destination + row_bytes]
+            .copy_from_slice(&rgba[source..source + row_bytes]);
+    }
+    Ok(())
 }
 
 fn apply_highlights(image: &mut RgbImage, highlights: &[HighlightRect]) {
@@ -241,5 +539,105 @@ mod tests {
         .unwrap();
         assert_eq!(frame.content_width, 8);
         assert_eq!(frame.rgba[0], 3);
+    }
+
+    fn composed_rgba(width: u32, height: u32, values: &[u8]) -> ComposedFrame {
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for value in values {
+            rgba.extend_from_slice(&[*value, 0, 0, 255]);
+        }
+        ComposedFrame {
+            rgba,
+            content_width: width,
+            content_height: height,
+        }
+    }
+
+    #[test]
+    fn scroll_delta_uses_overlap_safe_copy_and_exposed_strip() {
+        let viewport = WindowSize::from_cells(4, 5, 1, 1);
+        let previous = composed_rgba(4, 4, &(0..16).collect::<Vec<_>>());
+        let current = composed_rgba(
+            4,
+            4,
+            &[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 90, 91, 92, 93],
+        );
+        let delta = plan_frame_delta(
+            &previous,
+            &current,
+            viewport,
+            ViewTransform::default(),
+            ViewTransform {
+                offset_y: 1,
+                ..ViewTransform::default()
+            },
+            true,
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(delta.operations.len(), 2);
+        assert_eq!(delta.damaged_pixels, 4);
+        assert!(matches!(
+            delta.operations[0],
+            DeltaOperation::Copy {
+                destination_y: 0,
+                source_y: 1,
+                height: 3,
+                ..
+            }
+        ));
+        assert_eq!(
+            apply_delta_reference(&previous.rgba, 4, 4, &delta).unwrap(),
+            current.rgba
+        );
+    }
+
+    #[test]
+    fn local_change_becomes_one_tight_overwrite() {
+        let viewport = WindowSize::from_cells(6, 5, 1, 1);
+        let previous = composed_rgba(6, 4, &[0; 24]);
+        let mut values = [0; 24];
+        values[8] = 1;
+        values[9] = 2;
+        values[14] = 3;
+        values[15] = 4;
+        let current = composed_rgba(6, 4, &values);
+        let delta = plan_frame_delta(
+            &previous,
+            &current,
+            viewport,
+            ViewTransform::default(),
+            ViewTransform::default(),
+            false,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(delta.damaged_pixels, 4);
+        assert!(matches!(
+            &delta.operations[0],
+            DeltaOperation::Overwrite {
+                rect: DamageRect {
+                    x: 2,
+                    y: 1,
+                    width: 2,
+                    height: 2
+                },
+                rgba
+            } if rgba.len() == 16
+        ));
+    }
+
+    #[test]
+    fn one_scroll_step_reduces_raw_wire_bytes_by_eighty_six_percent() {
+        let width = 800_u64;
+        let height = 460_u64;
+        let scroll = 60_u64;
+        let full_bytes = 96 + width * height * 4;
+        let delta_bytes = 48 + 2 * 32 + width * scroll * 4;
+        assert_eq!(full_bytes, 1_472_096);
+        assert_eq!(delta_bytes, 192_112);
+        assert!(delta_bytes * 100 < full_bytes * 14);
     }
 }

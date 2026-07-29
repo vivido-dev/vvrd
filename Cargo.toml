@@ -1,10 +1,10 @@
 [package]
 name = "vvrd"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.86"
-repository = "https://github.com/wensheng/vvrd"
+repository = "https://github.com/vivido-dev/vvrd"
 description = "A terminal PDF and EPUB reader for the Vivido terminal"
 license = "AGPL-3.0"
 
@@ -13,10 +13,9 @@ name = "vvrd"
 path = "src/main.rs"
 
 [dependencies]
-vivid_sdk = { version = "0.1.0", path = "../vivid_sdk" }
-vivid_protocol = { version = "1.2.1", path = "../vivid_protocol" }
+vivid_sdk = { version = "0.2", path = "../vivid_sdk" }
+vivid_protocol = { version = "1.4", path = "../vivid_protocol" }
 
-mupdf = { version = "0.8.0", default-features = false, features = ["svg", "system-fonts", "base14-fonts", "img", "html", "epub"] }
 crossterm = "0.29"
 image = { version = "0.25", features = ["png", "rayon"], default-features = false }
 rayon = { version = "1", default-features = false }
@@ -34,6 +33,14 @@ thiserror = "2"
 log = "0.4"
 flexi_logger = "0.31"
 libc = "0.2"
+
+[target.'cfg(not(windows))'.dependencies]
+mupdf_crates_io = { package = "mupdf", version = "0.8.0", default-features = false, features = ["svg", "system-fonts", "base14-fonts", "img", "html", "epub"] }
+
+[target.'cfg(windows)'.dependencies]
+# mupdf 0.8.0 assumes that bindgen exports C11's max_align_t, but MSVC's C
+# headers do not define it. Keep this patch until upstream ships the MSVC fix.
+mupdf = { version = "0.8.0", path = "vendor/mupdf-0.8.0", default-features = false, features = ["svg", "system-fonts", "base14-fonts", "img", "html", "epub"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal"] }

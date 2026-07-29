@@ -5,9 +5,13 @@ mod export;
 mod geometry;
 mod presenter;
 mod renderer;
+mod semantic;
 mod state;
 mod terminal;
 mod vivid_thread;
+
+#[cfg(not(windows))]
+extern crate mupdf_crates_io as mupdf;
 
 use std::{
     io::IsTerminal as _,
@@ -28,10 +32,12 @@ use crossterm::event::{
 use geometry::WindowSize;
 use renderer::{RenderCmd, RenderEvent, RenderOptions, RenderThread};
 use vivid_protocol::messages;
-use vivid_sdk::{ProducerConfig, ProducerSession};
+use vivid_sdk::{ProducerConfig, ProducerSession, SourceDescriptor};
 use vivid_thread::{PresentCmd, PresentEvent, VividThread};
 
-const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
+// Fallback for presenters that never emit DISPLAY_CHANGED. Vivido's settled timer is shorter, so
+// negotiated settled geometry normally wins and cancels this local terminal-size fallback.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 const LOADING_DELAY: Duration = Duration::from_millis(90);
 
 #[derive(Parser)]
@@ -84,6 +90,7 @@ struct Runtime {
     interactive: bool,
     node_visible: bool,
     loading_deadline: Option<Instant>,
+    semantic: Arc<semantic::SemanticControl>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +161,11 @@ fn main() -> anyhow::Result<()> {
     app.auto_crop = saved.auto_crop;
     app.epub_font_size = saved.epub_font_size.unwrap_or(11.0);
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let title = document_title(&cli.document);
+    let semantic = Arc::new(semantic::SemanticControl::start(
+        title.clone(),
+        initial_page,
+    )?);
     let mut runtime = Runtime {
         app,
         viewport,
@@ -162,6 +174,7 @@ fn main() -> anyhow::Result<()> {
         interactive,
         node_visible: true,
         loading_deadline: None,
+        semantic: semantic.clone(),
     };
 
     let old_hook = std::panic::take_hook();
@@ -176,7 +189,22 @@ fn main() -> anyhow::Result<()> {
         terminal::clear_page_area(viewport)?;
     }
 
-    let vivid = VividThread::spawn(session, viewport);
+    let descriptor = SourceDescriptor {
+        role: messages::SOURCE_ROLE_DOCUMENT,
+        title,
+        content_revision: 1,
+        semantic_availability: messages::SEMANTIC_AVAILABLE_TEXT
+            | messages::SEMANTIC_AVAILABLE_LINKS
+            | messages::SEMANTIC_AVAILABLE_OUTLINE,
+        locator: semantic.locator().to_owned(),
+    };
+    let vivid = VividThread::spawn(
+        session,
+        viewport,
+        document_capture_policy(&cli.document),
+        descriptor,
+        initial_page,
+    )?;
     wait_for_presenter(&vivid)?;
     let render = RenderThread::spawn(cli.document.clone(), viewport);
     wait_for_document(&render, &mut runtime)?;
@@ -255,8 +283,47 @@ fn producer_config(cli: &Cli) -> ProducerConfig {
             messages::FEATURE_RASTER_ZSTD_V1,
             messages::FEATURE_VISIBILITY_EVENTS_V1,
             messages::FEATURE_NODE_CLIP_RECT_V1,
+            messages::FEATURE_OBSERVABILITY_CORE_V1,
+            messages::FEATURE_SOURCE_DESCRIPTOR_V1,
+            messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
+            messages::FEATURE_RASTER_DELTA_V1,
         ],
+        authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
+        allow_version_retry: false,
     }
+}
+
+fn document_capture_policy(path: &Path) -> u64 {
+    const SENSITIVE_COMPONENTS: &[&str] =
+        &[".ssh", ".gnupg", ".aws", ".kube", "Keychains", "Secrets"];
+    let sensitive_component = path.components().any(|component| {
+        let value = component.as_os_str().to_string_lossy();
+        SENSITIVE_COMPONENTS.contains(&value.as_ref())
+    });
+    let sensitive_system_path = path.is_absolute()
+        && (path.starts_with("/etc")
+            || path.starts_with("/private/etc")
+            || path.starts_with("/var/db"));
+    if sensitive_component || sensitive_system_path {
+        messages::CAPTURE_POLICY_MASK
+    } else {
+        0
+    }
+}
+
+fn document_title(path: &Path) -> String {
+    let title = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    let mut output = String::new();
+    for character in title.chars() {
+        if output.len() + character.len_utf8() > messages::MAX_SOURCE_DESCRIPTOR_TITLE_BYTES {
+            break;
+        }
+        output.push(character);
+    }
+    output
 }
 
 fn parse_color(value: &str) -> anyhow::Result<i32> {
@@ -290,6 +357,7 @@ fn request_render(
     white: i32,
     draw_loading: bool,
 ) -> anyhow::Result<()> {
+    sync_semantic_descriptor(vivid, runtime)?;
     match loading_policy(
         draw_loading,
         runtime.current_image.is_some(),
@@ -313,6 +381,24 @@ fn request_render(
         page: runtime.app.page,
         options: render_options(&runtime.app, runtime.viewport, black, white),
     })?;
+    Ok(())
+}
+
+fn sync_semantic_descriptor(vivid: &VividThread, runtime: &Runtime) -> anyhow::Result<()> {
+    let page = runtime.app.page;
+    let search_term = runtime.app.search_term.clone();
+    runtime.semantic.update(|state| {
+        if state.page != page || state.search_term != search_term {
+            state.revision = state.revision.saturating_add(1);
+            state.page = page;
+            state.search_term = search_term.clone();
+            state.text.clear();
+            state.links.clear();
+        }
+    });
+    vivid
+        .commands
+        .send(PresentCmd::UpdateContent { page, search_term })?;
     Ok(())
 }
 
@@ -366,6 +452,12 @@ fn wait_for_document(render: &RenderThread, runtime: &mut Runtime) -> anyhow::Re
             runtime.app.set_document(kind, n_pages);
             runtime.app.toc = toc;
             runtime.app.metadata = metadata;
+            runtime.semantic.update(|state| {
+                state.outline = runtime.app.toc.clone();
+            });
+            runtime.semantic.update(|state| {
+                state.outline = runtime.app.toc.clone();
+            });
             Ok(())
         }
         RenderEvent::Error(error) => bail!("{error}"),
@@ -429,7 +521,10 @@ fn run_event_loop(
                 runtime.viewport.cell_height_px,
             );
             runtime.app.invalidate();
-            vivid.commands.send(PresentCmd::Resize(runtime.viewport))?;
+            vivid.commands.send(PresentCmd::Resize {
+                viewport: runtime.viewport,
+                settled: true,
+            })?;
             show_current(vivid, runtime)?;
             request_render(render, vivid, runtime, black, white, true)?;
         }
@@ -524,7 +619,13 @@ fn handle_render_event(
             page,
             generation,
             image,
+            text,
+            links,
         } if page == runtime.app.page && generation == runtime.app.generation => {
+            runtime.semantic.update(|state| {
+                state.text = text;
+                state.links = links;
+            });
             runtime.current_image = Some((page, generation, Arc::new(image)));
             show_current(vivid, runtime)?;
         }
@@ -602,6 +703,15 @@ fn handle_present_event(
                 } else {
                     request_render(render, vivid, runtime, black, white, true)?;
                 }
+            }
+        }
+        PresentEvent::DisplayChanged { viewport, settled } => {
+            if settled && viewport != runtime.viewport {
+                runtime.pending_resize = None;
+                runtime.viewport = viewport;
+                runtime.app.invalidate();
+                show_current(vivid, runtime)?;
+                request_render(render, vivid, runtime, black, white, true)?;
             }
         }
         PresentEvent::SourceLost(error) => {
@@ -746,6 +856,7 @@ fn handle_key(
                         request_render(render, vivid, runtime, black, white, true)?;
                     } else {
                         runtime.app.show_info("searching...");
+                        sync_semantic_descriptor(vivid, runtime)?;
                         render.commands.send(RenderCmd::Search(input))?;
                     }
                 }
@@ -1052,6 +1163,10 @@ mod tests {
                 messages::FEATURE_RASTER_ZSTD_V1,
                 messages::FEATURE_VISIBILITY_EVENTS_V1,
                 messages::FEATURE_NODE_CLIP_RECT_V1,
+                messages::FEATURE_OBSERVABILITY_CORE_V1,
+                messages::FEATURE_SOURCE_DESCRIPTOR_V1,
+                messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
+                messages::FEATURE_RASTER_DELTA_V1,
             ]
         );
         for features in [&config.required_features, &config.optional_features] {
@@ -1062,6 +1177,18 @@ mod tests {
                 .required_features
                 .iter()
                 .all(|feature| config.optional_features.binary_search(feature).is_err())
+        );
+    }
+
+    #[test]
+    fn sensitive_document_paths_start_with_policy_before_first_frame() {
+        assert_eq!(
+            document_capture_policy(Path::new("/home/alice/.ssh/private-notes.pdf")),
+            messages::CAPTURE_POLICY_MASK
+        );
+        assert_eq!(
+            document_capture_policy(Path::new("/home/alice/books/novel.epub")),
+            0
         );
     }
 
