@@ -5,7 +5,7 @@ authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.86"
 repository = "https://github.com/vivido-dev/vvrd"
-description = "A terminal PDF and EPUB reader for the Vivido terminal"
+description = "A terminal PDF, EPUB, and Office document reader for the Vivido terminal"
 license = "AGPL-3.0"
 
 [[bin]]
@@ -35,6 +35,15 @@ flexi_logger = "0.31"
 libc = "0.2"
 
 mupdf_crates_io = { package = "mupdf", version = "0.8.0", default-features = false, features = ["svg", "system-fonts", "base14-fonts", "img", "html", "epub"] }
+
+# Pure-Rust DOCX/PPTX/ODT/ODP -> PDF fallback for hosts without LibreOffice.
+# These are the two importer/exporter crates plus the ZIP reader used to sniff
+# the container; the umbrella `libreoffice-pure` crate would also drag in
+# lo_calc, lo_base, lo_draw, lo_lok, lo_uno, and lo_app for no benefit here.
+lo_writer = "0.5"
+lo_impress = "0.5"
+lo_zip = "0.5"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal"] }

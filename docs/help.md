@@ -17,12 +17,17 @@ vvrd [OPTIONS] <DOCUMENT>
     --dry-run             validate without a live presenter
     --trace DIR           write control.vivid and raster-*.vivid traces
 -v, --verbose             diagnostic logging without credentials
+
+VVRD_OFFICE_BACKEND      soffice | pure | auto (default) for office conversion
 ```
 
 PDF pages support sharp rerendered zoom, vertical scrolling, horizontal panning, rotation,
 inversion, custom black/white colours, warm tint, whitespace crop, search highlights, links,
 metadata, TOC navigation, and PNG export. EPUB documents use MuPDF reflow and bind `<`/`>` to the
-font size; fixed-layout zoom is intentionally disabled for reflowable content.
+font size; fixed-layout zoom is intentionally disabled for reflowable content. DOCX, PPTX, ODT, and
+ODP are converted to a fixed-layout PDF at startup — by LibreOffice when it is installed, otherwise
+by a pure-Rust converter that reproduces the text but drops embedded images and says so in the
+status row.
 
 In vvmux, moving a floating pane changes only the outer projection; vvrd continues using local
 `(0,0)` coordinates. Resizing a pane recreates its one raster source after a 120 ms debounce.

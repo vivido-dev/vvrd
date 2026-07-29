@@ -3,6 +3,7 @@ mod compositor;
 mod error;
 mod export;
 mod geometry;
+mod office;
 mod presenter;
 mod renderer;
 mod semantic;
@@ -42,7 +43,7 @@ const LOADING_DELAY: Duration = Duration::from_millis(90);
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// PDF or EPUB document to read.
+    /// PDF, EPUB, DOCX, PPTX, ODT, or ODP document to read.
     document: PathBuf,
 
     /// Page number to open (one-based; overrides saved state).
@@ -111,7 +112,11 @@ fn main() -> anyhow::Result<()> {
         let _ = (rendered.page.width, rendered.page_num, rendered.n_pages);
         return Ok(());
     }
-    probe_document(&cli.document)?;
+    // Office formats are converted to PDF once, here, before anything else opens
+    // the document. `input` owns the temporary directory holding that PDF, so it
+    // must stay alive until every reader thread has been shut down.
+    let input = office::resolve(&cli.document)?;
+    probe_document(&input)?;
 
     let black = parse_color(&cli.black)?;
     let white = parse_color(&cli.white)?;
@@ -128,11 +133,11 @@ fn main() -> anyhow::Result<()> {
         options.white = white;
         options.epub_font_size = saved.epub_font_size.unwrap_or(11.0);
         let n_pages =
-            renderer::document_page_count(&cli.document, viewport, options.epub_font_size)?;
+            renderer::document_page_count(input.render_path(), viewport, options.epub_font_size)?;
         let page = initial_page.min(n_pages.saturating_sub(1));
-        let output = export::next_export_path(&cli.document, page, n_pages)?;
+        let output = export::next_export_path(input.origin(), page, n_pages)?;
         renderer::export_document_page(
-            &cli.document,
+            input.render_path(),
             page,
             viewport,
             &options,
@@ -205,8 +210,11 @@ fn main() -> anyhow::Result<()> {
         initial_page,
     )?;
     wait_for_presenter(&vivid)?;
-    let render = RenderThread::spawn(cli.document.clone(), viewport);
+    let render = RenderThread::spawn(input.render_path().to_path_buf(), viewport);
     wait_for_document(&render, &mut runtime)?;
+    if input.backend() == Some(office::Backend::Pure) {
+        runtime.app.show_info(office::PURE_BACKEND_NOTICE);
+    }
     request_render(&render, &vivid, &mut runtime, black, white, interactive)?;
 
     if interactive {
@@ -245,10 +253,13 @@ fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn probe_document(path: &Path) -> anyhow::Result<()> {
+/// Open the document once in a throwaway subprocess. MuPDF can abort the whole
+/// process on a malformed file, and `path` here may be a converted PDF, so the
+/// failure message names both what broke and what produced it.
+fn probe_document(input: &office::DocumentInput) -> anyhow::Result<()> {
     let status = Command::new(std::env::current_exe()?)
         .arg("--probe-document")
-        .arg(path)
+        .arg(input.render_path())
         .env_remove("VIVID_TOKEN")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -256,7 +267,15 @@ fn probe_document(path: &Path) -> anyhow::Result<()> {
         .status()
         .context("cannot start document preflight")?;
     if !status.success() {
-        bail!("MuPDF could not open {}", path.display());
+        // Name the document the user asked for; the converted PDF lives in a
+        // temporary directory they never chose and cannot inspect.
+        if input.backend().is_some() {
+            bail!(
+                "converting {} produced a PDF MuPDF could not open",
+                input.origin().display()
+            );
+        }
+        bail!("MuPDF could not open {}", input.origin().display());
     }
     Ok(())
 }

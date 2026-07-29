@@ -177,6 +177,31 @@ delete the node, `DESTROY_SOURCE`, and `GOODBYE`. A guard (RAII / scopeguard on 
 guarantees this on normal exit, `q`/`Ctrl-C`, error, and panic — otherwise a ghost image lingers in
 Vivido.
 
+### D9 — Office documents are converted to PDF before any thread starts
+MuPDF cannot read DOCX, PPTX, ODT, or ODP. Rather than teach the renderer a second document model,
+`main.rs` resolves the CLI path **once**, up front, into an `office::DocumentInput` holding two
+paths: the `origin` the user named, and the `render_path` MuPDF opens. For PDF and EPUB they are the
+same path and nothing is read or written. For an office format the document is converted into a
+`TempDir` owned by `DocumentInput` and `render_path` points at the resulting PDF.
+
+Consequences, all deliberate:
+
+- `renderer.rs`, `compositor.rs`, `vivid_thread.rs`, the page cache, the prerender window, and the
+  raster-delta planner stay entirely format-agnostic. A converted document is `DocumentKind::Fixed`,
+  so rerendered zoom (D3) works and `epub_font_size` is inert.
+- Conversion happens once per process, never per page or per resize.
+- `origin` remains the identity for saved state, the source descriptor title, the capture policy,
+  and export filenames. A temporary path must never leak into any of them.
+- `DocumentInput` is held in `main` for the whole run; dropping it deletes the converted PDF, on
+  every exit route including panic unwind.
+
+Two backends, chosen at `resolve` time and overridable with `VVRD_OFFICE_BACKEND`: a real
+`soffice --headless --convert-to pdf` (preferred; run with a private `-env:UserInstallation` profile
+so it cannot collide with the user's own LibreOffice session, with `VIVID_TOKEN` stripped from its
+environment and a bounded timeout), and the pure-Rust `lo_writer`/`lo_impress` importers. The
+pure path is lossy — it drops embedded images and ignores page and slide geometry — so it reports
+itself in the status row instead of presenting an approximation as the document.
+
 ---
 
 ## 4. Runtime structure (threads & data flow)
@@ -237,6 +262,7 @@ Modeled on kitpdf, with the Kitty layer swapped for a Vivid presenter layer.
 | `main.rs` | CLI parse, env/config, terminal guard, thread wiring, event loop | port of kitpdf `main.rs` (de-tokio-fied) |
 | `app.rs` | App state: page, scroll/zoom/pan, input mode, search, transforms, pixmap residency | port of kitpdf `app.rs` (near-verbatim; drops Kitty `ImageId`) |
 | `renderer.rs` | MuPDF render thread: pixmaps, search, TOC, metadata, links, EPUB reflow, export, watchdog | port of kitpdf `renderer.rs` (near-verbatim) |
+| `office.rs` | Resolves the CLI path to a MuPDF-readable one: DOCX/PPTX/ODT/ODP → PDF in a self-deleting temp dir, via `soffice` or the pure-Rust importers | **new** (D9) |
 | `compositor.rs` | Page pixmap + view transform → viewport RGBA buffer (crop/scale/highlight/crop-margins) | derived from kitpdf `image_pipeline.rs` + `compute_page_surface` |
 | `presenter.rs` | `Presenter` trait + `VividPresenter`: session, viewport raster source, scene node, frame send, resize, teardown | **new** (replaces `kitty.rs`); wraps `vivid_sdk` |
 | `vivid_thread.rs` | Owns `ProducerSession` + presenter; `PresentCmd`/`PresentEvent` loop; frame coalescing | **new** |
