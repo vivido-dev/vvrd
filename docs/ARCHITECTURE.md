@@ -1,9 +1,9 @@
 # vvrd — Architecture
 
-`vvrd` (Vivido Reader) is a terminal PDF and EPUB reader for the **Vivido** terminal. It renders
-documents with MuPDF and displays them through the **Vivid Protocol 1.1** side channel, using the
-reusable [`vivid_sdk`](../../vivid_sdk) producer client on top of
-[`vivid_protocol`](../../vivid_protocol).
+`vvrd` (Vivido Reader) is a terminal PDF, EPUB, DOCX, and PPTX reader for the **Vivido** terminal.
+It renders PDF/EPUB with MuPDF, converts DOCX/PPTX to a private temporary PDF with LibreOffice, and
+displays pages through the **Vivid Protocol 1.1** side channel. It uses the reusable
+[`vivid_sdk`](../../vivid_sdk) producer client on top of [`vivid_protocol`](../../vivid_protocol).
 
 It is the Vivid-native counterpart of [`kitpdf`](../../kitpdf), which targets the Kitty graphics
 protocol. **The goal is full feature parity with `kitpdf`** (see the parity matrix below), delivered
@@ -177,11 +177,49 @@ delete the node, `DESTROY_SOURCE`, and `GOODBYE`. A guard (RAII / scopeguard on 
 guarantees this on normal exit, `q`/`Ctrl-C`, error, and panic — otherwise a ghost image lingers in
 Vivido.
 
+### D9 — Office input uses a real, isolated LibreOffice conversion
+DOCX/PPTX must preserve embedded images and office layout closely enough for viewing. Vvrd
+therefore invokes a local `soffice`/`libreoffice` executable once at startup, using Writer's
+`pdf:writer_pdf_Export` filter for DOCX and Impress's `pdf:impress_pdf_Export` filter for PPTX.
+MuPDF then receives the generated PDF, so all later render, zoom, navigation, and export paths stay
+shared. Presentation pages are static; transitions, animations, audio, and video are outside this
+viewer path.
+
+The pure-Rust [`libreoffice-pure` crate](https://docs.rs/libreoffice-pure/0.5.3/) is not used.
+Version 0.5.3 describes partial OOXML import rather than LibreOffice layout parity, and its
+DOCX/PPTX import path does not provide the embedded picture relationship handling required by
+Vvrd. A C/C++ [LibreOfficeKit](https://docs.libreoffice.org/libreofficekit.html) integration would
+still require the complete LibreOffice runtime and add an experimental tile-rendering API without
+removing that deployment dependency. The
+[command-line conversion interface](https://help.libreoffice.org/latest/en-US/text/shared/guide/convertfilters.html)
+is smaller, process-isolated, and uses LibreOffice's production import/export implementation.
+
+Conversion is bounded and private:
+
+- input is limited to 512 MiB and generated PDF to 1 GiB;
+- the default timeout is 120 seconds, configurable from 1 through 3600 seconds;
+- stdout/stderr are drained but only 16 KiB is retained for sanitized diagnostics;
+- source and profile live in a private temporary directory under generic names;
+- the LibreOffice profile is isolated with `-env:UserInstallation=file://...`;
+- `VIVID_TOKEN`, `VIVID_ENDPOINT`, and `VIVID_ENDPOINT_BULK` are removed from the child;
+- timeout/output-limit failures kill and reap the whole process group;
+- the temporary PDF is retained only for the process lifetime, with no persistent conversion cache.
+
 ---
 
 ## 4. Runtime structure (threads & data flow)
 
-Three threads, coordinated by `flume` channels (kitpdf already uses `flume`):
+Before the interactive threads start, Office input takes one process-isolated preparation step:
+
+```text
+original DOCX/PPTX → private generic copy → headless LibreOffice → validated temporary PDF
+```
+
+The main process retains both identities: the temporary PDF is only the MuPDF render input, while
+state, title, capture policy, and PNG export names use the original path. The prepared-document
+guard deletes the temporary workspace after render shutdown.
+
+The runtime then uses three threads, coordinated by `flume` channels (kitpdf already uses `flume`):
 
 ```
               key / mouse / resize (crossterm, raw mode, alt screen)
@@ -235,6 +273,7 @@ Modeled on kitpdf, with the Kitty layer swapped for a Vivid presenter layer.
 | Module | Role | Origin |
 |---|---|---|
 | `main.rs` | CLI parse, env/config, terminal guard, thread wiring, event loop | port of kitpdf `main.rs` (de-tokio-fied) |
+| `office.rs` | Office classification, LibreOffice discovery, isolated conversion, bounds/process cleanup | **new** |
 | `app.rs` | App state: page, scroll/zoom/pan, input mode, search, transforms, pixmap residency | port of kitpdf `app.rs` (near-verbatim; drops Kitty `ImageId`) |
 | `renderer.rs` | MuPDF render thread: pixmaps, search, TOC, metadata, links, EPUB reflow, export, watchdog | port of kitpdf `renderer.rs` (near-verbatim) |
 | `compositor.rs` | Page pixmap + view transform → viewport RGBA buffer (crop/scale/highlight/crop-margins) | derived from kitpdf `image_pipeline.rs` + `compute_page_surface` |
@@ -308,14 +347,17 @@ coordinates. (An anchor may be adopted later only if an inline/split-view mode i
 ## 8. Lifecycle sequences
 
 **Startup**
-1. Parse CLI; read `VIVID_ENDPOINT`/`VIVID_TOKEN` (or dry-run/trace). Preflight-probe the document
-   in a subprocess (kitpdf pattern) to fail cleanly on corrupt files.
-2. `ProducerSession::connect` (HELLO/WELCOME, feature check). Read authoritative grid.
-3. Enter alt screen / raw mode / hide cursor (terminal guard). Install panic hook that restores the
+1. Parse CLI. For DOCX/PPTX, discover LibreOffice, convert in a private isolated workspace, and
+   validate the bounded PDF while retaining the original document identity.
+2. Preflight-probe the MuPDF input in a subprocess (kitpdf pattern) to fail cleanly on corrupt
+   files. The probe and LibreOffice child do not receive Vivid credentials.
+3. Read `VIVID_ENDPOINT`/`VIVID_TOKEN` (or dry-run/trace), then
+   `ProducerSession::connect` (HELLO/WELCOME, feature check). Read authoritative grid.
+4. Enter alt screen / raw mode / hide cursor (terminal guard). Install panic hook that restores the
    terminal *and* tears down Vivid.
-4. Spawn render thread (MuPDF) and Vivid thread (owns the session). Send initial `Area`
+5. Spawn render thread (MuPDF) and Vivid thread (owns the session). Send initial `Area`
    (viewport × zoom) to the renderer; create the viewport raster source + full-viewport node.
-5. Load persisted per-file state; jump to saved/`-p` page.
+6. Load persisted per-file state by original path; jump to saved/`-p` page.
 
 **Page turn / navigation** — UI updates `App.page`; sends `RenderNotif::JumpToPage` (renderer
 prioritizes that page's window) and `PresentCmd::ShowView{page, transform}`. Vivid thread composites
@@ -404,6 +446,7 @@ core design; §Verification calls out explicit tiled/floating-pane test cases.
 | kitpdf feature | vvrd mechanism |
 |---|---|
 | PDF & EPUB via MuPDF | Same MuPDF render thread |
+| DOCX/PPTX with embedded images | Isolated LibreOffice Writer/Impress PDF conversion, then the shared MuPDF path |
 | Sharp zoom (re-render at resolution) | Render page at `viewport×zoom`; crop viewport region into framebuffer |
 | Vertical scroll + auto page-turn at bounds | Same `App` scroll logic; compositor crops at scroll offset |
 | Horizontal pan (zoom mode) | Compositor crops at pan offset |
@@ -430,9 +473,11 @@ core design; §Verification calls out explicit tiled/floating-pane test cases.
 - **Media off the PTY.** Only status/overlay text and (if ever adopted) the bounded authenticated
   anchor marker touch the PTY. Page pixels go over Vivid media connections only.
 - **Never log/serialize/forward** `VIVID_TOKEN`, tickets, or derived material; token-bearing config
-  has no `Debug`. Don't pass the token into child processes (external link opener, export).
+  has no `Debug`. Don't pass the token into child processes (LibreOffice, document probe, external
+  link opener, export).
 - **Validate before allocate.** Clamp render dimensions to the raster admissibility budget; use
-  checked arithmetic for geometry and buffer sizes; honor each source's `max_media_body`.
+  checked arithmetic for geometry and buffer sizes; honor each source's `max_media_body`. Bound
+  Office input/output before MuPDF sees it.
 - **Bounded resources.** Pixmap residency budget (MB, like kitpdf); single viewport source; one
   in-flight frame via credit; coalesce superseded views.
 - **Source-scoped behavior.** A malformed page produces a caught panic / status error, never

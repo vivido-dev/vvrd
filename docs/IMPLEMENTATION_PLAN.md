@@ -1,8 +1,9 @@
 # vvrd — Implementation Plan
 
-Phased build order for the Vivido PDF/EPUB reader. Read
-[`ARCHITECTURE.md`](./ARCHITECTURE.md) first — this document assumes its decisions (D1–D8), the
-three-thread runtime, the module map, and the viewport-framebuffer display model.
+Phased build order for the Vivido PDF/EPUB/DOCX/PPTX reader. Read
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) first — this document assumes its decisions (D1–D9), the
+three-thread runtime, the Office preparation step, the module map, and the viewport-framebuffer
+display model.
 
 Guiding principle: **port kitpdf's MuPDF + UI + pixel machinery nearly verbatim, and replace only
 the Kitty layer with a `vivid_sdk` presenter layer.** Get a correct end-to-end path working early
@@ -247,6 +248,33 @@ page-turn on remote; feature-gated and off by default.
 
 ---
 
+## Phase 8 — DOCX/PPTX preparation through LibreOffice
+
+Office viewing is a startup adapter into the existing fixed-page MuPDF path. It does not add a
+second renderer or change Vivid presentation.
+
+### Tasks
+
+- [x] Classify DOCX/PPTX case-insensitively and reject DOCM/PPTM.
+- [x] Discover `soffice`/`libreoffice`, with `--soffice` and `VVRD_SOFFICE` override support.
+- [x] Stage the source under a generic name in a private temporary directory; use an isolated
+      LibreOffice profile and remove all Vivid endpoint/token variables from the child.
+- [x] Export with `pdf:writer_pdf_Export` or `pdf:impress_pdf_Export`; validate and bound the
+      generated PDF before MuPDF preflight.
+- [x] Enforce 512 MiB input, 1 GiB output, 16 KiB diagnostics, and a 120-second default timeout
+      (CLI maximum 3600); terminate/reap the process group on timeout or output overflow.
+- [x] Preserve original-path identity for state, title, capture policy, and export naming while the
+      temporary PDF remains alive through render shutdown.
+- [x] Generate DOCX/PPTX fixtures with embedded PNGs and provide ignored real-LibreOffice tests
+      that assert the embedded red/blue pixels survive conversion and MuPDF rendering.
+- [x] Document the local LibreOffice requirement and static-slide semantics.
+
+**Acceptance:** DOCX and PPTX page/slide images, including embedded pictures, use all existing
+fixed-page controls and PNG export. No conversion artifact persists after exit, and presentation
+animations/audio/video are not claimed or played.
+
+---
+
 ## File-by-file port checklist (kitpdf → vvrd)
 
 | kitpdf file | vvrd action | notes |
@@ -262,6 +290,7 @@ page-turn on remote; feature-gated and off by default.
 | `error.rs`, `perf.rs` | Port verbatim | add Vivid error variants |
 | — | **New** `geometry.rs` | merge kitpdf sizing + `vivi` `terminal_geometry.rs` |
 | — | **New** `presenter.rs`, `vivid_thread.rs` | the Vivid layer |
+| — | **New** `office.rs` | isolated LibreOffice DOCX/PPTX-to-PDF preparation and cleanup |
 
 ---
 
@@ -280,11 +309,14 @@ cargo clippy --all-targets -- -D warnings
 - Add Vivid-specific tests: frame coalescing keeps only the latest view; resize recreates the source
   with matching dims; teardown emits delete-node + destroy-source + goodbye; source-loss triggers
   recreate; `frame_id` strictly increases.
+- With LibreOffice installed, run
+  `VVRD_TEST_SOFFICE=/path/to/soffice cargo test office::tests::libreoffice_ -- --ignored` and
+  require both generated embedded-image fixtures to pass.
 - Because vvrd changes wire behavior only through `vivid_sdk`/`vivid_protocol` (which it does not
   modify), the cross-project rule is light — but **do run the real Vivido presenter path** manually;
   a socket test that hit `PermissionDenied` in a sandbox must be rerun where socket creation is
   allowed. Use the `/verify` and `/run` skills to drive the app.
-- **vvmux test matrix (required):** in `vvmux`, open a PDF and an EPUB and confirm each of —
+- **vvmux test matrix (required):** in `vvmux`, open a PDF, EPUB, DOCX, and PPTX and confirm each of —
   (1) tiled pane renders and navigates; (2) **floating** pane renders; (3) **move** the float (page
   stays put, no flicker / no source recreate); (4) **resize** the float/tiled pane (re-renders once
   on settle at new pane dims); (5) another pane **zoomed** or a **background tab** hides vvrd → sends

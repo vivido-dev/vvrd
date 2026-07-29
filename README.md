@@ -1,16 +1,30 @@
 # vvrd
 
-`vvrd` is a full-screen PDF and EPUB reader for the Vivido terminal. It renders documents with
-MuPDF and sends page pixels through the Vivid 1.1 side channel, never through terminal escape
-sequences. The same binary runs directly in Vivido, in tiled or floating vvmux panes, and in a
-remote shell reached with `vvssh`.
+`vvrd` is a full-screen PDF, EPUB, DOCX, and PPTX reader for the Vivido terminal. It renders
+PDF/EPUB documents with MuPDF; DOCX/PPTX documents are first converted to a private temporary PDF
+by LibreOffice. Page pixels travel through the Vivid 1.1 side channel, never through terminal
+escape sequences. The same binary runs directly in Vivido, in tiled or floating vvmux panes, and
+in a remote shell reached with `vvssh`.
 
 ```sh
 cargo build --release
 target/release/vvrd book.epub
 target/release/vvrd --page 12 paper.pdf
+target/release/vvrd report.docx
+target/release/vvrd slides.pptx
 target/release/vvrd --export paper.pdf
 ```
+
+DOCX and PPTX viewing requires a local LibreOffice installation. Vvrd finds `soffice` or
+`libreoffice` on `PATH` and in common installation locations. Use `--soffice PATH` or
+`VVRD_SOFFICE` to select it explicitly, and `--office-timeout SECONDS` to change the 120-second
+conversion limit (maximum 3600 seconds). Embedded images are retained by LibreOffice's PDF export.
+PPTX pages are static slides: transitions, animations, audio, and video are not played.
+Macro-enabled DOCM/PPTM files are rejected.
+
+Office conversion uses an isolated LibreOffice profile and generic filenames in a private
+temporary directory, removes Vivid credentials from the child environment, and deletes the
+converted PDF on exit. It does not create a persistent document cache.
 
 Vivido, vvmux, and vvssh provide `VIVID_ENDPOINT`, optional `VIVID_ENDPOINT_BULK`, and
 `VIVID_TOKEN`; vvrd discovers them automatically. `--dry-run` exercises the renderer and protocol

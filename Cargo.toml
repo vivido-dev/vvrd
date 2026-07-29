@@ -5,7 +5,7 @@ authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.86"
 repository = "https://github.com/vivido-dev/vvrd"
-description = "A terminal PDF and EPUB reader for the Vivido terminal"
+description = "A terminal PDF, EPUB, DOCX, and PPTX reader for the Vivido terminal"
 license = "AGPL-3.0"
 
 [[bin]]
@@ -33,11 +33,17 @@ thiserror = "2"
 log = "0.4"
 flexi_logger = "0.31"
 libc = "0.2"
+command-group = "5.0.1"
+tempfile = "3"
+url = "2"
 
 mupdf_crates_io = { package = "mupdf", version = "0.8.0", default-features = false, features = ["svg", "system-fonts", "base14-fonts", "img", "html", "epub"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal"] }
+
+[dev-dependencies]
+zip = { version = "6", default-features = false }
 
 [profile.production]
 inherits = "release"

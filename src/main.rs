@@ -3,6 +3,9 @@ mod compositor;
 mod error;
 mod export;
 mod geometry;
+mod office;
+#[cfg(test)]
+mod office_test_fixtures;
 mod presenter;
 mod renderer;
 mod semantic;
@@ -42,7 +45,7 @@ const LOADING_DELAY: Duration = Duration::from_millis(90);
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// PDF or EPUB document to read.
+    /// PDF, EPUB, DOCX, or PPTX document to read.
     document: PathBuf,
 
     /// Page number to open (one-based; overrides saved state).
@@ -76,6 +79,18 @@ struct Cli {
     /// Print diagnostic logging (never includes credentials).
     #[arg(short, long)]
     verbose: bool,
+
+    /// LibreOffice executable used to convert DOCX and PPTX documents.
+    #[arg(long, env = "VVRD_SOFFICE", value_name = "PATH")]
+    soffice: Option<PathBuf>,
+
+    /// Maximum time in seconds allowed for Office conversion.
+    #[arg(
+        long,
+        default_value_t = office::DEFAULT_OFFICE_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..=office::MAX_OFFICE_TIMEOUT_SECS)
+    )]
+    office_timeout: u64,
 
     #[arg(long, hide = true)]
     probe_document: bool,
@@ -111,7 +126,14 @@ fn main() -> anyhow::Result<()> {
         let _ = (rendered.page.width, rendered.page_num, rendered.n_pages);
         return Ok(());
     }
-    probe_document(&cli.document)?;
+    let prepared = office::prepare_document(
+        &cli.document,
+        &office::OfficeOptions {
+            soffice: cli.soffice.clone(),
+            timeout: Duration::from_secs(cli.office_timeout),
+        },
+    )?;
+    probe_document(prepared.render_path(), prepared.original_path())?;
 
     let black = parse_color(&cli.black)?;
     let white = parse_color(&cli.white)?;
@@ -127,12 +149,15 @@ fn main() -> anyhow::Result<()> {
         options.black = black;
         options.white = white;
         options.epub_font_size = saved.epub_font_size.unwrap_or(11.0);
-        let n_pages =
-            renderer::document_page_count(&cli.document, viewport, options.epub_font_size)?;
+        let n_pages = renderer::document_page_count(
+            prepared.render_path(),
+            viewport,
+            options.epub_font_size,
+        )?;
         let page = initial_page.min(n_pages.saturating_sub(1));
-        let output = export::next_export_path(&cli.document, page, n_pages)?;
+        let output = export::next_export_path(prepared.original_path(), page, n_pages)?;
         renderer::export_document_page(
-            &cli.document,
+            prepared.render_path(),
             page,
             viewport,
             &options,
@@ -160,7 +185,7 @@ fn main() -> anyhow::Result<()> {
     app.auto_crop = saved.auto_crop;
     app.epub_font_size = saved.epub_font_size.unwrap_or(11.0);
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let title = document_title(&cli.document);
+    let title = document_title(prepared.original_path());
     let semantic = Arc::new(semantic::SemanticControl::start(
         title.clone(),
         initial_page,
@@ -200,23 +225,30 @@ fn main() -> anyhow::Result<()> {
     let vivid = VividThread::spawn(
         session,
         viewport,
-        document_capture_policy(&cli.document),
+        document_capture_policy(prepared.original_path()),
         descriptor,
         initial_page,
     )?;
     wait_for_presenter(&vivid)?;
-    let render = RenderThread::spawn(cli.document.clone(), viewport);
+    let render = RenderThread::spawn(prepared.render_path().to_owned(), viewport);
     wait_for_document(&render, &mut runtime)?;
     request_render(&render, &vivid, &mut runtime, black, white, interactive)?;
 
     if interactive {
-        run_event_loop(&cli.document, &render, &vivid, &mut runtime, black, white)?;
+        run_event_loop(
+            prepared.original_path(),
+            &render,
+            &vivid,
+            &mut runtime,
+            black,
+            white,
+        )?;
     } else {
         wait_for_noninteractive_frame(&render, &vivid, &mut runtime, black, white)?;
     }
 
     state::save_state(
-        &cli.document,
+        prepared.original_path(),
         &state::SavedState {
             page: runtime.app.page,
             rotation: runtime.app.rotation,
@@ -245,18 +277,20 @@ fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn probe_document(path: &Path) -> anyhow::Result<()> {
+fn probe_document(render_path: &Path, original_path: &Path) -> anyhow::Result<()> {
     let status = Command::new(std::env::current_exe()?)
         .arg("--probe-document")
-        .arg(path)
+        .arg(render_path)
         .env_remove("VIVID_TOKEN")
+        .env_remove("VIVID_ENDPOINT")
+        .env_remove("VIVID_ENDPOINT_BULK")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .context("cannot start document preflight")?;
     if !status.success() {
-        bail!("MuPDF could not open {}", path.display());
+        bail!("MuPDF could not open {}", original_path.display());
     }
     Ok(())
 }
@@ -1176,6 +1210,35 @@ mod tests {
                 .required_features
                 .iter()
                 .all(|feature| config.optional_features.binary_search(feature).is_err())
+        );
+    }
+
+    #[test]
+    fn office_cli_options_are_bounded_and_accept_an_explicit_converter() {
+        let cli = Cli::try_parse_from([
+            "vvrd",
+            "--soffice",
+            "/opt/libreoffice/program/soffice",
+            "--office-timeout",
+            "45",
+            "slides.pptx",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.soffice,
+            Some(PathBuf::from("/opt/libreoffice/program/soffice"))
+        );
+        assert_eq!(cli.office_timeout, 45);
+
+        assert!(Cli::try_parse_from(["vvrd", "--office-timeout", "0", "report.docx"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "vvrd",
+                "--office-timeout",
+                &(office::MAX_OFFICE_TIMEOUT_SECS + 1).to_string(),
+                "report.docx",
+            ])
+            .is_err()
         );
     }
 
