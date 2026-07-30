@@ -30,7 +30,7 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use geometry::WindowSize;
+use geometry::{TargetViewport, WindowSize};
 use renderer::{RenderCmd, RenderEvent, RenderOptions, RenderThread};
 use vivid_sdk::{
     CORE_CONTROL, LIVE_MEDIA, OBSERVABILITY, POLICY_DENY_CAPTURE, POLICY_DENY_DESCRIPTOR_EXPORT,
@@ -99,6 +99,9 @@ struct Runtime {
     current_image: Option<(usize, u64, Arc<PageImage>)>,
     pending_resize: Option<(u16, u16, Instant)>,
     interactive: bool,
+    /// Whether the terminal currently has room for a page and its status row. While it does not,
+    /// the document stays loaded and the session stays open with nothing drawn.
+    target_presentable: bool,
     node_visible: bool,
     loading_deadline: Option<Instant>,
     semantic: Arc<semantic::SemanticControl>,
@@ -168,7 +171,10 @@ fn main() -> anyhow::Result<()> {
         "presenter did not select terminal-surface-v1"
     );
     let viewport = match WindowSize::from_target_descriptor(&session.info().target_descriptor) {
-        Ok((viewport, _)) => viewport,
+        Ok((TargetViewport::Presentable(viewport), _)) => viewport,
+        Ok((TargetViewport::TooSmall { cols, rows }, _)) => bail!(
+            "the terminal is {cols}x{rows}; vvrd needs at least two rows for a page and its status"
+        ),
         Err(error) => {
             log::debug!(
                 "presenter target descriptor unusable ({error}); using local terminal size"
@@ -195,6 +201,7 @@ fn main() -> anyhow::Result<()> {
         current_image: None,
         pending_resize: None,
         interactive,
+        target_presentable: true,
         node_visible: true,
         loading_deadline: None,
         semantic: semantic.clone(),
@@ -561,6 +568,7 @@ fn run_event_loop(
             runtime.loading_deadline = None;
             if !current_image_is_ready(runtime)
                 && matches!(runtime.app.input_mode, InputMode::Normal)
+                && runtime.target_presentable
             {
                 hide_node(vivid, runtime)?;
                 terminal::draw_loading(runtime.viewport)?;
@@ -721,13 +729,22 @@ fn handle_present_event(
                 .set_rendered_size(content_width, content_height, runtime.viewport);
         }
         PresentEvent::TargetChanged { viewport, settled } => {
-            if settled && viewport != runtime.viewport {
+            // A target that shrank below what a page needs left the node hidden and the viewport
+            // unchanged, so growing back to the same geometry still has to redraw.
+            if settled && (viewport != runtime.viewport || !runtime.target_presentable) {
                 runtime.pending_resize = None;
+                runtime.target_presentable = true;
                 runtime.viewport = viewport;
                 runtime.app.invalidate();
                 show_current(vivid, runtime)?;
                 request_render(render, vivid, runtime, black, white, true)?;
             }
+        }
+        PresentEvent::TargetTooSmall { cols, rows } => {
+            log::debug!("terminal is {cols}x{rows}: nothing to present until it grows");
+            runtime.target_presentable = false;
+            runtime.pending_resize = None;
+            hide_node(vivid, runtime)?;
         }
         PresentEvent::TrackLost(error) => {
             runtime.app.show_info(format!("display recovered: {error}"));
@@ -741,7 +758,7 @@ fn handle_present_event(
 }
 
 fn show_current(vivid: &VividThread, runtime: &mut Runtime) -> anyhow::Result<()> {
-    if !matches!(runtime.app.input_mode, InputMode::Normal) {
+    if !matches!(runtime.app.input_mode, InputMode::Normal) || !runtime.target_presentable {
         return Ok(());
     }
     let Some((_, _, image)) = &runtime.current_image else {

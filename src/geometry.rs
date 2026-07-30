@@ -18,12 +18,27 @@ pub struct WindowSize {
     pub cell_height_px: u32,
 }
 
+/// What a document reader can do with the presentation target it was handed.
+///
+/// A terminal is free to be one row tall, so that geometry is valid and has to be distinguished
+/// from a malformed descriptor: one is a target to wait out, the other is a protocol violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetViewport {
+    /// Room for a page and the status row.
+    Presentable(WindowSize),
+    /// Valid terminal geometry with no room for both a page row and the status row.
+    ///
+    /// The session, surface, track, and node all remain valid; there is simply nothing to draw
+    /// until the target grows again. A window dragged down through one row is the common case.
+    TooSmall { cols: u16, rows: u16 },
+}
+
 impl WindowSize {
     /// Read the terminal target descriptor, returning the viewport and whether it has settled.
     ///
     /// Unsettled geometry is returned rather than rejected: vvrd follows a drag with a scene-node
     /// update and only replaces its raster track once the target settles.
-    pub fn from_target_descriptor(descriptor: &PayloadMap) -> io::Result<(Self, bool)> {
+    pub fn from_target_descriptor(descriptor: &PayloadMap) -> io::Result<(TargetViewport, bool)> {
         if descriptor.len() != 9
             || descriptor
                 .iter()
@@ -68,13 +83,10 @@ impl WindowSize {
             ));
         }
         if rows < 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "vvrd requires at least two terminal rows",
-            ));
+            return Ok((TargetViewport::TooSmall { cols, rows }, settled));
         }
         Ok((
-            Self::from_cells(cols, rows, cell_width, cell_height),
+            TargetViewport::Presentable(Self::from_cells(cols, rows, cell_width, cell_height)),
             settled,
         ))
     }
@@ -164,12 +176,18 @@ mod tests {
         ];
         assert_eq!(
             WindowSize::from_target_descriptor(&descriptor).unwrap(),
-            (WindowSize::from_cells(90, 30, 10, 20), false)
+            (
+                TargetViewport::Presentable(WindowSize::from_cells(90, 30, 10, 20)),
+                false
+            )
         );
         descriptor[6].1 = Value::Bool(true);
         assert_eq!(
             WindowSize::from_target_descriptor(&descriptor).unwrap(),
-            (WindowSize::from_cells(90, 30, 10, 20), true)
+            (
+                TargetViewport::Presentable(WindowSize::from_cells(90, 30, 10, 20)),
+                true
+            )
         );
     }
 
@@ -204,8 +222,11 @@ mod tests {
         );
     }
 
+    /// A one-row terminal is valid geometry that this reader cannot draw into. Reporting it as a
+    /// target to wait out, rather than as bad data, is what keeps a window shrunk to one row from
+    /// ending the session.
     #[test]
-    fn a_single_row_target_cannot_host_a_page_and_a_status_row() {
+    fn a_single_row_target_is_too_small_rather_than_malformed() {
         let descriptor = vec![
             (0, Value::Unsigned(900)),
             (1, Value::Unsigned(20)),
@@ -218,10 +239,8 @@ mod tests {
             (8, Value::Unsigned(64)),
         ];
         assert_eq!(
-            WindowSize::from_target_descriptor(&descriptor)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
+            WindowSize::from_target_descriptor(&descriptor).unwrap(),
+            (TargetViewport::TooSmall { cols: 90, rows: 1 }, true)
         );
     }
 }

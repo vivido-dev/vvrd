@@ -11,7 +11,7 @@ use vivid_sdk::{Session, SurfaceDescriptor};
 
 use crate::{
     compositor::{ComposedFrame, PageImage, ViewTransform, compose_view, plan_frame_delta},
-    geometry::WindowSize,
+    geometry::{TargetViewport, WindowSize},
     presenter::{Presenter, PresenterSignal, VividPresenter},
 };
 
@@ -51,6 +51,12 @@ pub enum PresentEvent {
     TargetChanged {
         viewport: WindowSize,
         settled: bool,
+    },
+    /// The terminal is too small to host a page and its status row. Nothing can be presented until
+    /// it grows, but the session and every object in it stay valid.
+    TargetTooSmall {
+        cols: u16,
+        rows: u16,
     },
     /// The raster track was lost and replaced. The document surface and its placement survived.
     TrackLost(String),
@@ -288,10 +294,21 @@ fn service_presenter_signals(
 }
 
 fn apply_target_change(presenter: &mut VividPresenter, events: &Sender<PresentEvent>) {
-    let (viewport, settled) = match presenter.target_viewport() {
+    let (target, settled) = match presenter.target_viewport() {
         Ok(target) => target,
         Err(error) => {
             let _ = events.send(PresentEvent::Error(error.to_string()));
+            return;
+        }
+    };
+    // A terminal with no room for a page and its status row is a target to wait out, not a failed
+    // session: the surface, track, and node are all still valid, and a window shrunk that far is
+    // usually on its way back. Resizing into it would rebuild the track around geometry nothing
+    // can be drawn into.
+    let viewport = match target {
+        TargetViewport::Presentable(viewport) => viewport,
+        TargetViewport::TooSmall { cols, rows } => {
+            let _ = events.send(PresentEvent::TargetTooSmall { cols, rows });
             return;
         }
     };

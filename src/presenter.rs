@@ -18,7 +18,7 @@ use vivid_sdk::{
 
 use crate::{
     compositor::{DeltaOperation, FrameDelta},
-    geometry::WindowSize,
+    geometry::{TargetViewport, WindowSize},
 };
 
 /// Actionable presenter traffic, already scoped to this producer's own objects.
@@ -305,8 +305,8 @@ impl VividPresenter {
         self.track_viewport
     }
 
-    /// Current terminal viewport and settle state, from the presenter's target descriptor.
-    pub fn target_viewport(&self) -> io::Result<(WindowSize, bool)> {
+    /// Current terminal target and settle state, from the presenter's target descriptor.
+    pub fn target_viewport(&self) -> io::Result<(TargetViewport, bool)> {
         WindowSize::from_target_descriptor(&self.session.info().target_descriptor)
     }
 
@@ -1299,6 +1299,63 @@ mod tests {
         presenter
             .teardown()
             .expect("teardown after following the target");
+    }
+
+    /// A window dragged down to one row leaves a target this reader cannot draw into. That is not a
+    /// broken session: the document, the surface, the track, and the node all have to survive it,
+    /// and the reader has to pick presentation back up when the window grows again.
+    #[test]
+    fn a_target_too_small_to_present_is_survived_rather_than_fatal() {
+        let fake = crate::fake_presenter::FakePresenter::start(80, 24).unwrap();
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let mut presenter = live_presenter(&fake, viewport);
+
+        fake.change_target(80, 1, true).unwrap();
+        let waited = wait_for(|| {
+            presenter.take_signal();
+            matches!(
+                presenter.target_viewport(),
+                Ok((TargetViewport::TooSmall { .. }, _))
+            )
+            .then_some(())
+        });
+        assert!(
+            waited.is_some(),
+            "a one-row target was not reported as too small to present"
+        );
+        assert_eq!(
+            presenter.target_viewport().unwrap(),
+            (TargetViewport::TooSmall { cols: 80, rows: 1 }, true)
+        );
+
+        // The session is still live through the unpresentable target: the node it already owns
+        // stays addressable, which is what lets the reader hide it and wait.
+        presenter
+            .set_visible(false)
+            .expect("hiding the node during an unpresentable target must still be accepted");
+
+        fake.change_target(80, 24, true).unwrap();
+        let recovered = wait_for(|| {
+            presenter.take_signal();
+            matches!(
+                presenter.target_viewport(),
+                Ok((TargetViewport::Presentable(_), _))
+            )
+            .then_some(())
+        });
+        assert!(
+            recovered.is_some(),
+            "the reader never saw the target become presentable again"
+        );
+        presenter
+            .resize(viewport, true)
+            .expect("resize after the target became presentable again");
+        presenter
+            .set_visible(true)
+            .expect("the node must be showable again once the target has room");
+        presenter
+            .teardown()
+            .expect("teardown after a too-small target");
     }
 
     fn messages_delete_node() -> u16 {
