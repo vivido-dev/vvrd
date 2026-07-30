@@ -2,6 +2,8 @@ mod app;
 mod compositor;
 mod error;
 mod export;
+#[cfg(test)]
+mod fake_presenter;
 mod geometry;
 mod presenter;
 mod renderer;
@@ -20,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, bail};
+use anyhow::{Context as _, bail, ensure};
 use app::{App, InputMode, ScrollAction, StatusMsg};
 use clap::Parser;
 use compositor::{PageImage, ViewTransform};
@@ -30,11 +32,21 @@ use crossterm::event::{
 };
 use geometry::WindowSize;
 use renderer::{RenderCmd, RenderEvent, RenderOptions, RenderThread};
-use vivid_protocol::messages;
-use vivid_sdk::{ProducerConfig, ProducerSession, SourceDescriptor};
+use vivid_sdk::{
+    CORE_CONTROL, LIVE_MEDIA, OBSERVABILITY, POLICY_DENY_CAPTURE, POLICY_DENY_DESCRIPTOR_EXPORT,
+    POLICY_DENY_IMAGE_CACHE, POLICY_DENY_POSTER_RETENTION, ProducerAuthentication, ProducerConfig,
+    Session, SurfaceDescriptor, SurfaceRole, TERMINAL_SURFACE,
+};
 use vivid_thread::{PresentCmd, PresentEvent, VividThread};
 
-// Fallback for presenters that never emit DISPLAY_CHANGED. Vivido's settled timer is shorter, so
+/// Vivid 1.5 bounds a surface descriptor title at 256 UTF-8 bytes.
+const MAX_SURFACE_TITLE_BYTES: usize = 256;
+/// Availability bits: extracted text (0), structure (1), links (2), outline (3), actions (4).
+const SEMANTIC_AVAILABLE_TEXT: u64 = 1 << 0;
+const SEMANTIC_AVAILABLE_LINKS: u64 = 1 << 2;
+const SEMANTIC_AVAILABLE_OUTLINE: u64 = 1 << 3;
+
+// Fallback for presenters that never emit TARGET_CHANGED. Vivido's settled timer is shorter, so
 // negotiated settled geometry normally wins and cancels this local terminal-size fallback.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 const LOADING_DELAY: Duration = Duration::from_millis(90);
@@ -149,9 +161,21 @@ fn main() -> anyhow::Result<()> {
     }
     let _logger =
         flexi_logger::Logger::try_with_str(if cli.verbose { "debug" } else { "warn" })?.start()?;
-    let session = ProducerSession::connect(&producer_config(&cli))
+    let session = Session::connect(producer_config(&cli))
         .map_err(|error| anyhow::anyhow!("cannot connect to Vivid presenter: {error}"))?;
-    let viewport = WindowSize::current(session.display_state())?;
+    ensure!(
+        session.info().target_profile == TERMINAL_SURFACE,
+        "presenter did not select terminal-surface-v1"
+    );
+    let viewport = match WindowSize::from_target_descriptor(&session.info().target_descriptor) {
+        Ok((viewport, _)) => viewport,
+        Err(error) => {
+            log::debug!(
+                "presenter target descriptor unusable ({error}); using local terminal size"
+            );
+            WindowSize::from_terminal()?
+        }
+    };
 
     let mut app = App::new(initial_page);
     app.rotation = saved.rotation;
@@ -188,14 +212,14 @@ fn main() -> anyhow::Result<()> {
         terminal::clear_page_area(viewport)?;
     }
 
-    let descriptor = SourceDescriptor {
-        role: messages::SOURCE_ROLE_DOCUMENT,
+    let descriptor = SurfaceDescriptor {
+        role: SurfaceRole::Document,
         title,
-        content_revision: 1,
-        semantic_availability: messages::SEMANTIC_AVAILABLE_TEXT
-            | messages::SEMANTIC_AVAILABLE_LINKS
-            | messages::SEMANTIC_AVAILABLE_OUTLINE,
-        locator: semantic.locator().to_owned(),
+        semantic_content_revision: 1,
+        semantic_availability: SEMANTIC_AVAILABLE_TEXT
+            | SEMANTIC_AVAILABLE_LINKS
+            | SEMANTIC_AVAILABLE_OUTLINE,
+        locator_hint: semantic.locator().to_owned(),
     };
     let vivid = VividThread::spawn(
         session,
@@ -246,10 +270,17 @@ fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
 }
 
 fn probe_document(path: &Path) -> anyhow::Result<()> {
+    // The preflight child never talks Vivid, so it inherits no session material or endpoints.
+    // VIVID_TOKEN is the retired 1.1 name and is scrubbed too, so a stale variable cannot leak.
     let status = Command::new(std::env::current_exe()?)
         .arg("--probe-document")
         .arg(path)
+        .env_remove("VIVID_ROOT_SECRET")
         .env_remove("VIVID_TOKEN")
+        .env_remove("VIVID_ENDPOINT_CONTROL")
+        .env_remove("VIVID_ENDPOINT_INTERACTIVE")
+        .env_remove("VIVID_ENDPOINT_REALTIME")
+        .env_remove("VIVID_ENDPOINT_BULK")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -261,34 +292,27 @@ fn probe_document(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Vivid 1.5 negotiates coherent named profiles, not feature-ID sets.
+///
+/// Raster delta and zstd are no longer session features: they are per-track configuration that the
+/// presenter accepts or rejects through `PROBE_TRACK_CONFIG`.
 fn producer_config(cli: &Cli) -> ProducerConfig {
     ProducerConfig {
-        endpoint: std::env::var("VIVID_ENDPOINT").ok(),
-        bulk_endpoint: std::env::var("VIVID_ENDPOINT_BULK").ok(),
-        token: std::env::var("VIVID_TOKEN").ok(),
+        endpoint_control: std::env::var("VIVID_ENDPOINT_CONTROL").ok(),
+        endpoint_bulk: std::env::var("VIVID_ENDPOINT_BULK").ok(),
+        authentication: ProducerAuthentication::RootFromEnvironment,
+        producer_name: "vvrd".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        target_profile: TERMINAL_SURFACE.to_owned(),
+        required_profiles: vec![
+            LIVE_MEDIA.to_owned(),
+            TERMINAL_SURFACE.to_owned(),
+            CORE_CONTROL.to_owned(),
+        ],
+        optional_profiles: vec![OBSERVABILITY.to_owned()],
         dry_run: cli.dry_run,
         trace_dir: cli.trace.clone(),
-        verbose: cli.verbose,
-        producer: "vvrd".to_owned(),
-        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
-        required_features: vec![
-            messages::FEATURE_RASTER_RGBA8,
-            messages::FEATURE_SCENE_TRANSACTIONS,
-            messages::FEATURE_GRID_CELL_NODES,
-            messages::FEATURE_CREDIT_FLOW_CONTROL,
-        ],
-        optional_features: vec![
-            messages::FEATURE_ENCODED_IMAGE_V1,
-            messages::FEATURE_RASTER_ZSTD_V1,
-            messages::FEATURE_VISIBILITY_EVENTS_V1,
-            messages::FEATURE_NODE_CLIP_RECT_V1,
-            messages::FEATURE_OBSERVABILITY_CORE_V1,
-            messages::FEATURE_SOURCE_DESCRIPTOR_V1,
-            messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
-            messages::FEATURE_RASTER_DELTA_V1,
-        ],
-        authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
-        allow_version_retry: false,
+        ..ProducerConfig::default()
     }
 }
 
@@ -304,7 +328,11 @@ fn document_capture_policy(path: &Path) -> u64 {
             || path.starts_with("/private/etc")
             || path.starts_with("/var/db"));
     if sensitive_component || sensitive_system_path {
-        messages::CAPTURE_POLICY_MASK
+        // Effective surface policy is a strictest union, so these can never be relaxed later.
+        POLICY_DENY_CAPTURE
+            | POLICY_DENY_POSTER_RETENTION
+            | POLICY_DENY_IMAGE_CACHE
+            | POLICY_DENY_DESCRIPTOR_EXPORT
     } else {
         0
     }
@@ -317,7 +345,7 @@ fn document_title(path: &Path) -> String {
         .to_string_lossy();
     let mut output = String::new();
     for character in title.chars() {
-        if output.len() + character.len_utf8() > messages::MAX_SOURCE_DESCRIPTOR_TITLE_BYTES {
+        if output.len() + character.len_utf8() > MAX_SURFACE_TITLE_BYTES {
             break;
         }
         output.push(character);
@@ -435,7 +463,7 @@ fn hide_node(vivid: &VividThread, runtime: &mut Runtime) -> anyhow::Result<()> {
 fn wait_for_presenter(vivid: &VividThread) -> anyhow::Result<()> {
     match vivid.events.recv_timeout(Duration::from_secs(10))? {
         PresentEvent::Ready => Ok(()),
-        PresentEvent::Error(error) | PresentEvent::SourceLost(error) => bail!("{error}"),
+        PresentEvent::Error(error) | PresentEvent::TrackLost(error) => bail!("{error}"),
         event => bail!("presenter stopped during startup: {event:?}"),
     }
 }
@@ -692,19 +720,7 @@ fn handle_present_event(
                 .app
                 .set_rendered_size(content_width, content_height, runtime.viewport);
         }
-        PresentEvent::Visibility(visible) => {
-            if runtime.node_visible || visible {
-                runtime.app.visible = visible;
-            }
-            if visible && matches!(runtime.app.input_mode, InputMode::Normal) {
-                if runtime.current_image.is_some() {
-                    show_current(vivid, runtime)?;
-                } else {
-                    request_render(render, vivid, runtime, black, white, true)?;
-                }
-            }
-        }
-        PresentEvent::DisplayChanged { viewport, settled } => {
+        PresentEvent::TargetChanged { viewport, settled } => {
             if settled && viewport != runtime.viewport {
                 runtime.pending_resize = None;
                 runtime.viewport = viewport;
@@ -713,7 +729,7 @@ fn handle_present_event(
                 request_render(render, vivid, runtime, black, white, true)?;
             }
         }
-        PresentEvent::SourceLost(error) => {
+        PresentEvent::TrackLost(error) => {
             runtime.app.show_info(format!("display recovered: {error}"));
             show_current(vivid, runtime)?;
             request_render(render, vivid, runtime, black, white, true)?;
@@ -726,9 +742,6 @@ fn handle_present_event(
 
 fn show_current(vivid: &VividThread, runtime: &mut Runtime) -> anyhow::Result<()> {
     if !matches!(runtime.app.input_mode, InputMode::Normal) {
-        return Ok(());
-    }
-    if !runtime.app.visible {
         return Ok(());
     }
     let Some((_, _, image)) = &runtime.current_image else {
@@ -1143,52 +1156,51 @@ mod tests {
     }
 
     #[test]
-    fn producer_advertises_canonical_feature_sets() {
+    fn producer_advertises_a_closed_and_validated_profile_set() {
         let cli = Cli::try_parse_from(["vvrd", "--dry-run", "doc.pdf"]).unwrap();
         let config = producer_config(&cli);
+        assert_eq!(config.target_profile, TERMINAL_SURFACE);
         assert_eq!(
-            config.required_features,
-            vec![
-                messages::FEATURE_RASTER_RGBA8,
-                messages::FEATURE_SCENE_TRANSACTIONS,
-                messages::FEATURE_GRID_CELL_NODES,
-                messages::FEATURE_CREDIT_FLOW_CONTROL,
-            ]
+            config.required_profiles,
+            vec![LIVE_MEDIA, TERMINAL_SURFACE, CORE_CONTROL]
         );
-        assert_eq!(
-            config.optional_features,
-            vec![
-                messages::FEATURE_ENCODED_IMAGE_V1,
-                messages::FEATURE_RASTER_ZSTD_V1,
-                messages::FEATURE_VISIBILITY_EVENTS_V1,
-                messages::FEATURE_NODE_CLIP_RECT_V1,
-                messages::FEATURE_OBSERVABILITY_CORE_V1,
-                messages::FEATURE_SOURCE_DESCRIPTOR_V1,
-                messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
-                messages::FEATURE_RASTER_DELTA_V1,
-            ]
-        );
-        for features in [&config.required_features, &config.optional_features] {
-            assert!(features.windows(2).all(|pair| pair[0] < pair[1]));
-        }
-        assert!(
-            config
-                .required_features
-                .iter()
-                .all(|feature| config.optional_features.binary_search(feature).is_err())
-        );
+        assert_eq!(config.optional_profiles, vec![OBSERVABILITY]);
+        // Profile validation covers sorting, uniqueness, prerequisite closure, and the rule that
+        // required profiles contain both core control and the selected target.
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn a_1_1_feature_style_required_profile_is_rejected() {
+        let cli = Cli::try_parse_from(["vvrd", "--dry-run", "doc.pdf"]).unwrap();
+        let mut config = producer_config(&cli);
+        // The 1.1 feature registry does not extend into 1.5: a required profile must be a name the
+        // 1.5 registry governs, not a feature repackaged as one.
+        config.required_profiles.push("raster-delta-v1".to_owned());
+        assert!(config.validate().is_err());
     }
 
     #[test]
     fn sensitive_document_paths_start_with_policy_before_first_frame() {
         assert_eq!(
             document_capture_policy(Path::new("/home/alice/.ssh/private-notes.pdf")),
-            messages::CAPTURE_POLICY_MASK
+            POLICY_DENY_CAPTURE
+                | POLICY_DENY_POSTER_RETENTION
+                | POLICY_DENY_IMAGE_CACHE
+                | POLICY_DENY_DESCRIPTOR_EXPORT
         );
         assert_eq!(
             document_capture_policy(Path::new("/home/alice/books/novel.epub")),
             0
         );
+    }
+
+    #[test]
+    fn a_bounded_title_never_splits_a_character() {
+        let long = "é".repeat(300);
+        let title = document_title(Path::new(&format!("/tmp/{long}.pdf")));
+        assert!(title.len() <= MAX_SURFACE_TITLE_BYTES);
+        assert!(title.chars().all(|character| character == 'é'));
     }
 
     #[test]

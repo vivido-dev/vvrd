@@ -1,9 +1,9 @@
 [package]
 name = "vvrd"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
-rust-version = "1.86"
+rust-version = "1.87"
 repository = "https://github.com/vivido-dev/vvrd"
 description = "A terminal PDF and EPUB reader for the Vivido terminal"
 license = "AGPL-3.0"
@@ -13,8 +13,8 @@ name = "vvrd"
 path = "src/main.rs"
 
 [dependencies]
-vivid_sdk = { version = "0.2", path = "../vivid_sdk" }
-vivid_protocol = { version = "1.4", path = "../vivid_protocol" }
+vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
+vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 
 crossterm = "0.29"
 image = { version = "0.25", features = ["png", "rayon"], default-features = false }

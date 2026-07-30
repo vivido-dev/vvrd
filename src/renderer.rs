@@ -605,7 +605,7 @@ fn render_loaded_page(
     let bounds = page.bounds()?;
     let natural_width = (bounds.x1 - bounds.x0).max(1.0);
     let natural_height = (bounds.y1 - bounds.y0).max(1.0);
-    let rotated = options.rotation % 180 != 0;
+    let rotated = !options.rotation.is_multiple_of(180);
     let dimensions = if rotated {
         (natural_height, natural_width)
     } else {

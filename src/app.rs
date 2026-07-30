@@ -69,7 +69,6 @@ pub struct App {
     pub metadata: Vec<(String, String)>,
     pub search_term: Option<String>,
     pub search_counts: Vec<Option<usize>>,
-    pub visible: bool,
     pub generation: u64,
 }
 
@@ -96,7 +95,6 @@ impl App {
             metadata: Vec::new(),
             search_term: None,
             search_counts: vec![None],
-            visible: true,
             generation: 1,
         }
     }

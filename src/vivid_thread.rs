@@ -6,12 +6,13 @@ use std::{
 };
 
 use flume::{Receiver, RecvTimeoutError, Sender};
-use vivid_sdk::{ProducerSession, SourceDescriptor, SourceEvent};
+use vivid_protocol::registry;
+use vivid_sdk::{Session, SurfaceDescriptor};
 
 use crate::{
     compositor::{ComposedFrame, PageImage, ViewTransform, compose_view, plan_frame_delta},
     geometry::WindowSize,
-    presenter::{Presenter, VividPresenter},
+    presenter::{Presenter, PresenterSignal, VividPresenter},
 };
 
 struct PreviousComposition {
@@ -47,12 +48,12 @@ pub enum PresentEvent {
         content_width: u32,
         content_height: u32,
     },
-    Visibility(bool),
-    DisplayChanged {
+    TargetChanged {
         viewport: WindowSize,
         settled: bool,
     },
-    SourceLost(String),
+    /// The raster track was lost and replaced. The document surface and its placement survived.
+    TrackLost(String),
     Error(String),
     Stopped,
 }
@@ -65,14 +66,13 @@ pub struct VividThread {
 
 impl VividThread {
     pub fn spawn(
-        session: ProducerSession,
+        session: Session,
         viewport: WindowSize,
-        capture_policy: u64,
-        descriptor: SourceDescriptor,
+        policy: u64,
+        descriptor: SurfaceDescriptor,
         initial_page: usize,
     ) -> std::io::Result<Self> {
-        let presenter =
-            VividPresenter::new(session, viewport, capture_policy, descriptor, initial_page)?;
+        let presenter = VividPresenter::new(session, viewport, policy, descriptor, initial_page)?;
         let (commands, command_rx) = flume::bounded(presenter.command_queue_capacity());
         let (event_tx, events) = flume::unbounded();
         let join = thread::Builder::new()
@@ -110,32 +110,19 @@ fn run(
     let _ = events.send(PresentEvent::Ready);
 
     let mut deferred = VecDeque::new();
-    let mut display_state = presenter.display_state();
     let mut previous = None;
     loop {
-        let (_, resend_full) = service_source_events(&mut presenter, &events);
-        if resend_full && let Some(previous) = &previous {
+        let signals = service_presenter_signals(&mut presenter, &events);
+        if signals.stop {
+            break;
+        }
+        if signals.resend_full
+            && let Some(previous) = &previous
+        {
             resend_full_frame(&mut presenter, previous, &events);
         }
-        let display = presenter.display_state();
-        if display != display_state {
-            display_state = display;
-            match WindowSize::current(display)
-                .map_err(|error| std::io::Error::other(error.to_string()))
-                .and_then(|viewport| {
-                    presenter.resize(viewport, display.settled)?;
-                    Ok(viewport)
-                }) {
-                Ok(viewport) => {
-                    let _ = events.send(PresentEvent::DisplayChanged {
-                        viewport,
-                        settled: display.settled,
-                    });
-                }
-                Err(error) => {
-                    let _ = events.send(PresentEvent::Error(error.to_string()));
-                }
-            }
+        if signals.target_changed {
+            apply_target_change(&mut presenter, &events);
         }
 
         let command = match next_command(&commands, &mut deferred) {
@@ -150,13 +137,13 @@ fn run(
             // source; submitting one would fail `show_frame`'s length check and take the reader
             // down. Drop it instead: the resize already published `DisplayChanged`, and the
             // re-render it triggers arrives at the current geometry.
-            PresentCmd::ShowView { viewport, .. } if viewport != presenter.source_viewport() => {
+            PresentCmd::ShowView { viewport, .. } if viewport != presenter.track_viewport() => {
                 log::debug!(
-                    "dropped view composed for {}x{} cells; source viewport is {}x{} cells",
+                    "dropped view composed for {}x{} cells; track viewport is {}x{} cells",
                     viewport.cols,
                     viewport.rows,
-                    presenter.source_viewport().cols,
-                    presenter.source_viewport().rows
+                    presenter.track_viewport().cols,
+                    presenter.track_viewport().rows
                 );
                 Ok(None)
             }
@@ -207,19 +194,27 @@ fn run(
                 .map(|()| None),
             PresentCmd::Shutdown => break,
         };
-        let (source_interrupted, resend_full) = service_source_events(&mut presenter, &events);
-        if resend_full && let Some(previous) = &previous {
+        let signals = service_presenter_signals(&mut presenter, &events);
+        if signals.resend_full
+            && let Some(previous) = &previous
+        {
             resend_full_frame(&mut presenter, previous, &events);
         }
+        if signals.target_changed {
+            apply_target_change(&mut presenter, &events);
+        }
         match result {
-            Ok(Some(event)) if !source_interrupted => {
+            Ok(Some(event)) if !signals.interrupted => {
                 let _ = events.send(event);
             }
             Ok(_) => {}
-            Err(error) if !source_interrupted => {
+            Err(error) if !signals.interrupted => {
                 let _ = events.send(PresentEvent::Error(error.to_string()));
             }
             Err(_) => {}
+        }
+        if signals.stop {
+            break;
         }
     }
 
@@ -229,41 +224,85 @@ fn run(
     let _ = events.send(PresentEvent::Stopped);
 }
 
-fn service_source_events(
+#[derive(Debug, Default, Clone, Copy)]
+struct SignalOutcome {
+    /// A recovery displaced the in-flight command, so its result must not be reported.
+    interrupted: bool,
+    /// The retained composition has to be resubmitted as this generation's full frame.
+    resend_full: bool,
+    target_changed: bool,
+    stop: bool,
+}
+
+/// Drain presenter traffic and apply the recovery each signal demands.
+///
+/// The three recoveries are deliberately distinct: a full-frame request keeps the channel, a
+/// channel loss keeps the track, and a track loss keeps the surface, its scene node, and the
+/// document's semantic identity.
+fn service_presenter_signals(
     presenter: &mut VividPresenter,
     events: &Sender<PresentEvent>,
-) -> (bool, bool) {
-    let mut interrupted = false;
-    let mut resend_full = false;
-    if let Some(reason) = presenter.take_full_frame_request() {
-        presenter.require_full_frame(reason);
-        interrupted = true;
-        resend_full = true;
-    }
-    while let Some(event) = presenter.take_source_event() {
-        match event {
-            SourceEvent::Visibility(visible) => {
-                interrupted |= !visible;
-                let _ = events.send(PresentEvent::Visibility(visible));
+) -> SignalOutcome {
+    let mut outcome = SignalOutcome::default();
+    while let Some(signal) = presenter.take_signal() {
+        match signal {
+            PresenterSignal::FullFrameNeeded(reason) => {
+                presenter.require_full_frame(reason);
+                outcome.interrupted = true;
+                outcome.resend_full = true;
             }
-            SourceEvent::Lost(error) => {
-                interrupted = true;
-                resend_full = true;
-                match presenter.recover_source() {
+            PresenterSignal::ChannelLost(diagnostic) => {
+                outcome.interrupted = true;
+                outcome.resend_full = true;
+                if let Err(error) = presenter.recover_channel(registry::error::DEVICE_LOST) {
+                    let _ = events.send(PresentEvent::Error(format!(
+                        "{diagnostic}; channel recovery failed: {error}"
+                    )));
+                    outcome.stop = true;
+                }
+            }
+            PresenterSignal::TrackLost(diagnostic) => {
+                outcome.interrupted = true;
+                outcome.resend_full = true;
+                match presenter.recover_track() {
                     Ok(()) => {
-                        let _ = events.send(PresentEvent::SourceLost(error));
+                        let _ = events.send(PresentEvent::TrackLost(diagnostic));
                     }
-                    Err(recovery_error) => {
+                    Err(error) => {
                         let _ = events.send(PresentEvent::Error(format!(
-                            "{error}; source recovery failed: {recovery_error}"
+                            "{diagnostic}; track recovery failed: {error}"
                         )));
+                        outcome.stop = true;
                     }
                 }
             }
-            SourceEvent::NeedKeyframe(_) => {}
+            PresenterSignal::TargetChanged => outcome.target_changed = true,
+            PresenterSignal::ConnectionClosed(diagnostic) => {
+                let _ = events.send(PresentEvent::Error(diagnostic));
+                outcome.interrupted = true;
+                outcome.stop = true;
+            }
         }
     }
-    (interrupted, resend_full)
+    outcome
+}
+
+fn apply_target_change(presenter: &mut VividPresenter, events: &Sender<PresentEvent>) {
+    let (viewport, settled) = match presenter.target_viewport() {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = events.send(PresentEvent::Error(error.to_string()));
+            return;
+        }
+    };
+    match presenter.resize(viewport, settled) {
+        Ok(()) => {
+            let _ = events.send(PresentEvent::TargetChanged { viewport, settled });
+        }
+        Err(error) => {
+            let _ = events.send(PresentEvent::Error(error.to_string()));
+        }
+    }
 }
 
 fn resend_full_frame(
@@ -271,16 +310,16 @@ fn resend_full_frame(
     previous: &PreviousComposition,
     events: &Sender<PresentEvent>,
 ) {
-    if previous.viewport != presenter.source_viewport() {
-        // The retained composition predates the current source geometry, so it cannot serve as this
-        // source's keyframe. The full-frame request stays armed, which makes the re-render that
-        // follows the resize the keyframe instead.
+    if previous.viewport != presenter.track_viewport() {
+        // The retained composition predates the current track geometry, so it cannot serve as this
+        // generation's full frame. The full-frame request stays armed, which makes the re-render
+        // that follows the resize the recovery unit instead.
         log::debug!(
-            "skipped full-frame recovery: retained composition is {}x{} cells, source viewport is {}x{} cells",
+            "skipped full-frame recovery: retained composition is {}x{} cells, track viewport is {}x{} cells",
             previous.viewport.cols,
             previous.viewport.rows,
-            presenter.source_viewport().cols,
-            presenter.source_viewport().rows
+            presenter.track_viewport().cols,
+            presenter.track_viewport().rows
         );
         return;
     }
@@ -326,33 +365,10 @@ fn next_command(
 mod tests {
     use super::*;
 
-    use vivid_protocol::messages;
-    use vivid_sdk::ProducerConfig;
+    use vivid_sdk::{ProducerConfig, SurfaceRole};
 
-    fn dry_run_session() -> ProducerSession {
-        ProducerSession::connect(&ProducerConfig {
-            endpoint: None,
-            bulk_endpoint: None,
-            token: None,
-            dry_run: true,
-            trace_dir: None,
-            verbose: false,
-            producer: "vvrd-test".to_owned(),
-            producer_version: "1".to_owned(),
-            required_features: vec![
-                messages::FEATURE_RASTER_RGBA8,
-                messages::FEATURE_SCENE_TRANSACTIONS,
-                messages::FEATURE_GRID_CELL_NODES,
-                messages::FEATURE_CREDIT_FLOW_CONTROL,
-            ],
-            optional_features: vec![
-                messages::FEATURE_SOURCE_DESCRIPTOR_V1,
-                messages::FEATURE_RASTER_DELTA_V1,
-            ],
-            authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
-            allow_version_retry: false,
-        })
-        .unwrap()
+    fn dry_run_session() -> Session {
+        Session::connect(ProducerConfig::offline()).unwrap()
     }
 
     fn test_page() -> Arc<PageImage> {
@@ -460,13 +476,13 @@ mod tests {
         assert!(observed.try_recv().is_err());
     }
 
-    fn test_descriptor() -> SourceDescriptor {
-        SourceDescriptor {
-            role: messages::SOURCE_ROLE_DOCUMENT,
+    fn test_descriptor() -> SurfaceDescriptor {
+        SurfaceDescriptor {
+            role: SurfaceRole::Document,
             title: "vvrd-test".to_owned(),
-            content_revision: 1,
+            semantic_content_revision: 1,
             semantic_availability: 0,
-            locator: String::new(),
+            locator_hint: String::new(),
         }
     }
 

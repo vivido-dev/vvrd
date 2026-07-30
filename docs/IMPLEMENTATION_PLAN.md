@@ -1,7 +1,14 @@
 # vvrd — Implementation Plan
 
+> **Historical.** This is the phased build order that produced the original Vivid 1.1 reader. The
+> phases are complete, and vvrd has since migrated to Vivid 1.5 — see
+> [`VIVID_1.5_MIGRATION_PLAN.md`](./VIVID_1.5_MIGRATION_PLAN.md) for that work and
+> [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the current design. Where this document says *source*,
+> *credit*, *media ticket*, or `FEATURE_*`, the current code says *surface* plus *track*, cumulative
+> channel maxima, authenticated channel opening, and profile names.
+
 Phased build order for the Vivido PDF/EPUB reader. Read
-[`ARCHITECTURE.md`](./ARCHITECTURE.md) first — this document assumes its decisions (D1–D8), the
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) first — this document assumes its decisions (D1–D9), the
 three-thread runtime, the module map, and the viewport-framebuffer display model.
 
 Guiding principle: **port kitpdf's MuPDF + UI + pixel machinery nearly verbatim, and replace only
