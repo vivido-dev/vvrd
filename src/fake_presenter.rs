@@ -62,12 +62,21 @@ struct Shared {
     track_bodies: HashMap<u64, u32>,
 }
 
+/// The presentation target, as the presenter's own truth rather than what a producer has read.
+#[derive(Debug, Clone, Copy)]
+struct Target {
+    generation: u64,
+    cols: u64,
+    rows: u64,
+}
+
 pub struct FakePresenter {
     endpoint: String,
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
     control_writer: Arc<Mutex<Option<TcpStream>>>,
     sequence: Arc<Mutex<u64>>,
+    target: Arc<Mutex<Target>>,
     join: Option<JoinHandle<io::Result<()>>>,
 }
 
@@ -81,17 +90,21 @@ impl FakePresenter {
         let stop = Arc::new(AtomicBool::new(false));
         let control_writer = Arc::new(Mutex::new(None));
         let sequence = Arc::new(Mutex::new(0));
+        let target = Arc::new(Mutex::new(Target {
+            generation: 1,
+            cols,
+            rows,
+        }));
 
         let join = {
             let shared = shared.clone();
             let stop = stop.clone();
             let control_writer = control_writer.clone();
             let sequence = sequence.clone();
+            let target = target.clone();
             thread::Builder::new()
                 .name("fake-presenter".to_owned())
-                .spawn(move || {
-                    serve(listener, shared, stop, control_writer, sequence, cols, rows)
-                })?
+                .spawn(move || serve(listener, shared, stop, control_writer, sequence, target))?
         };
 
         Ok(Self {
@@ -100,6 +113,7 @@ impl FakePresenter {
             stop,
             control_writer,
             sequence,
+            target,
             join: Some(join),
         })
     }
@@ -118,6 +132,28 @@ impl FakePresenter {
 
     pub fn destroys(&self) -> Vec<DestroyObservation> {
         self.shared.lock().expect("shared").destroys.clone()
+    }
+
+    /// Move the presentation target and announce it, exactly as a terminal resize does.
+    ///
+    /// The generation advances before the announcement is written, so a commit already planned
+    /// against the previous target is rejected as stale until the producer catches up.
+    pub fn change_target(&self, cols: u64, rows: u64, settled: bool) -> io::Result<()> {
+        let target = {
+            let mut guard = self.target.lock().expect("target");
+            guard.generation += 1;
+            guard.cols = cols;
+            guard.rows = rows;
+            *guard
+        };
+        let mut payload = terminal_descriptor(target.cols, target.rows);
+        payload[6].1 = Value::Bool(settled);
+        payload.push((9, Value::Unsigned(target.generation)));
+        payload.push((10, Value::Unsigned(0)));
+        let body = Envelope::new(0, payload)
+            .encode()
+            .map_err(io::Error::other)?;
+        self.push(messages::TARGET_CHANGED, 0, &body)
     }
 
     /// Push an uncorrelated `TRACK_LOST` for a complete owner identity.
@@ -216,9 +252,12 @@ fn serve(
     stop: Arc<AtomicBool>,
     control_writer: Arc<Mutex<Option<TcpStream>>>,
     sequence: Arc<Mutex<u64>>,
-    cols: u64,
-    rows: u64,
+    target: Arc<Mutex<Target>>,
 ) -> io::Result<()> {
+    let (cols, rows) = {
+        let guard = target.lock().expect("target");
+        (guard.cols, guard.rows)
+    };
     let address = listener.local_addr()?;
     let (mut control, _) = listener.accept()?;
     control.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -460,17 +499,37 @@ fn serve(
                 )
             }
             messages::COMMIT_TXN => {
-                scene_revision += 1;
-                (
-                    messages::SCENE_PRESENTED,
-                    ok_payload(
-                        request_id,
-                        vec![
-                            (0, Value::Unsigned(scene_revision)),
-                            (1, Value::Unsigned(1)),
-                        ],
-                    )?,
-                )
+                // A commit names the target generation it was planned against. The presenter owns
+                // the current one, so a commit that crosses a resize is rejected, not applied to
+                // a target it was never planned for.
+                let generation = target.lock().expect("target").generation;
+                if envelope.expected_target_generation != Some(generation) {
+                    (
+                        messages::ERROR,
+                        messages::ErrorReply {
+                            code: registry::error::STALE_TARGET_GENERATION,
+                            request_id,
+                            detail: messages::ErrorDetail::new(Vec::new())
+                                .map_err(io::Error::other)?,
+                            fatal: false,
+                            diagnostic: "stale target generation".to_owned(),
+                        }
+                        .encode()
+                        .map_err(io::Error::other)?,
+                    )
+                } else {
+                    scene_revision += 1;
+                    (
+                        messages::SCENE_PRESENTED,
+                        ok_payload(
+                            request_id,
+                            vec![
+                                (0, Value::Unsigned(scene_revision)),
+                                (1, Value::Unsigned(generation)),
+                            ],
+                        )?,
+                    )
+                }
             }
             messages::DESTROY_TRACK => {
                 // Give a wrongly dropped transport time to reach EOF before the ordered destroy is

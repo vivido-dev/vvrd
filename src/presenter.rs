@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::io;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use vivid_protocol::{
     cbor::Value,
@@ -60,6 +62,10 @@ const FULL_FRAMES_PER_SECOND_CLAIM: u64 = 4;
 const INFLIGHT_FRAME_CLAIM: u64 = 4;
 const MAXIMUM_LATENCY_US: u64 = 1_000_000;
 const PRIME_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a scene commit keeps following a moving presentation target before it gives up.
+const TARGET_FOLLOW_TIMEOUT: Duration = Duration::from_secs(2);
+/// Pause between attempts while the announcement that explains a stale reply is still in flight.
+const TARGET_FOLLOW_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RasterSendKind {
@@ -89,7 +95,7 @@ pub struct VividPresenter {
     torn_down: bool,
     descriptor: SurfaceDescriptor,
     semantic_state: (usize, Option<String>),
-    signals: std::collections::VecDeque<PresenterSignal>,
+    signals: VecDeque<PresenterSignal>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,9 +153,14 @@ impl VividPresenter {
             let _ = session.destroy_surface(&surface, &RequestMetadata::default());
             return Err(error);
         }
-        if let Err(error) = session.create_node(
-            &terminal_node(context_id, node_id, &surface, viewport, true),
-            &RequestMetadata::default(),
+        let mut signals = VecDeque::new();
+        if let Err(error) = commit_node_following_target(
+            &mut session,
+            &track,
+            &mut signals,
+            NodeCommit::Create(&terminal_node(
+                context_id, node_id, &surface, viewport, true,
+            )),
         ) {
             let _ = session.destroy_track(&track, &RequestMetadata::default());
             drop(channel);
@@ -175,7 +186,7 @@ impl VividPresenter {
             torn_down: false,
             descriptor,
             semantic_state: (initial_page, None),
-            signals: std::collections::VecDeque::new(),
+            signals,
         })
     }
 
@@ -225,7 +236,7 @@ impl VividPresenter {
                 node_viewport,
                 self.visible,
             );
-            self.update_node_with_target_retry(&node)?;
+            self.commit_node(NodeCommit::Update(&node))?;
             self.node_viewport = node_viewport;
         }
 
@@ -246,34 +257,8 @@ impl VividPresenter {
         result
     }
 
-    fn update_node_with_target_retry(&mut self, node: &SceneNode) -> io::Result<()> {
-        match self.session.update_node(node, &RequestMetadata::default()) {
-            Ok(_) => Ok(()),
-            Err(error)
-                if presenter_code(&error) == Some(registry::error::STALE_TARGET_GENERATION) =>
-            {
-                // The target moved under the commit. Apply the change we have not consumed yet and
-                // retry exactly once; a second stale reply means the target is still moving and the
-                // next TARGET_CHANGED will drive a fresh resize.
-                let mut applied = false;
-                while let Some(event) = self.session.take_event()? {
-                    if let SessionEvent::TargetChanged(payload) = event {
-                        self.session.apply_target_changed(&payload)?;
-                        applied = true;
-                        self.signals.push_back(PresenterSignal::TargetChanged);
-                    } else {
-                        self.record_signal(event);
-                    }
-                }
-                if !applied {
-                    return Err(error);
-                }
-                self.session
-                    .update_node(node, &RequestMetadata::default())
-                    .map(|_| ())
-            }
-            Err(error) => Err(error),
-        }
+    fn commit_node(&mut self, commit: NodeCommit<'_>) -> io::Result<()> {
+        commit_node_following_target(&mut self.session, &self.track, &mut self.signals, commit)
     }
 
     pub fn delta_operation_limit(&self) -> Option<u32> {
@@ -359,9 +344,7 @@ impl VividPresenter {
 
     /// Drain the control connection and the active track channel into scoped signals.
     fn poll_presenter(&mut self) -> io::Result<()> {
-        while let Some(event) = self.session.take_event()? {
-            self.record_signal(event);
-        }
+        drain_session_events(&mut self.session, &self.track, &mut self.signals)?;
         let channel_events: Vec<_> = match self.channel.as_ref() {
             Some(channel) => {
                 let mut events = Vec::new();
@@ -413,50 +396,123 @@ impl VividPresenter {
         }
         error
     }
+}
 
-    fn record_signal(&mut self, event: SessionEvent) {
-        match event {
-            SessionEvent::TargetChanged(payload) => {
-                match self.session.apply_target_changed(&payload) {
-                    Ok(_) => self.signals.push_back(PresenterSignal::TargetChanged),
-                    Err(error) => log::debug!("ignored unusable TARGET_CHANGED: {error}"),
-                }
+/// One scene mutation, named so a stale reply can be retried against the target that caused it.
+#[derive(Debug, Clone, Copy)]
+enum NodeCommit<'a> {
+    Create(&'a SceneNode),
+    Update(&'a SceneNode),
+    Delete { context_id: u64, node_id: u64 },
+}
+
+/// Run one scene commit, following the presentation target while it moves.
+///
+/// A commit names the target generation it was planned against, so a resize that lands between
+/// planning and committing is answered with `STALE_TARGET_GENERATION`. That is not a failure: the
+/// presenter announces every change that causes one, so apply what has arrived and commit again
+/// against the target the terminal has now. A drag produces a generation per frame, so this
+/// follows the target until it stops moving rather than retrying a fixed number of times.
+fn commit_node_following_target(
+    session: &mut vivid_sdk::Session,
+    track: &Track,
+    signals: &mut VecDeque<PresenterSignal>,
+    commit: NodeCommit<'_>,
+) -> io::Result<()> {
+    let deadline = Instant::now() + TARGET_FOLLOW_TIMEOUT;
+    loop {
+        let metadata = RequestMetadata::default();
+        let attempt = match commit {
+            NodeCommit::Create(node) => session.create_node(node, &metadata).map(|_| ()),
+            NodeCommit::Update(node) => session.update_node(node, &metadata).map(|_| ()),
+            NodeCommit::Delete {
+                context_id,
+                node_id,
+            } => session
+                .delete_node(context_id, node_id, &metadata)
+                .map(|_| ()),
+        };
+        let stale = match attempt {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if presenter_code(&error) == Some(registry::error::STALE_TARGET_GENERATION) =>
+            {
+                error
             }
-            SessionEvent::TrackLost { object_id, payload } => {
-                // Track loss is matched by complete owner identity. Another producer, or another
-                // context in this session, may legitimately reuse this numeric track ID.
-                let field = |key: u64| {
-                    payload
-                        .iter()
-                        .find(|(candidate, _)| *candidate == key)
-                        .and_then(|(_, value)| value.as_u64())
-                };
-                let Ok(configuration) = self.track.configuration() else {
-                    return;
-                };
-                if field(0) != Some(configuration.context_id)
-                    || field(1) != Some(configuration.surface_id)
-                    || field(2) != Some(configuration.track_id)
-                    || object_id != configuration.track_id
-                {
-                    return;
-                }
-                let code = field(3).unwrap_or(0);
-                self.signals.push_back(PresenterSignal::TrackLost(format!(
-                    "raster track {} was lost (code {code})",
-                    configuration.track_id
-                )));
+            Err(error) => return Err(error),
+        };
+        if !drain_session_events(session, track, signals)? {
+            // The announcement that explains the rejection has not arrived yet.
+            if Instant::now() >= deadline {
+                return Err(stale);
             }
-            SessionEvent::ConnectionClosed { diagnostic } => {
-                self.signals
-                    .push_back(PresenterSignal::ConnectionClosed(diagnostic));
-            }
-            SessionEvent::AnchorReady { .. }
-            | SessionEvent::AnchorGone { .. }
-            | SessionEvent::ContextChanged { .. }
-            | SessionEvent::Other { .. } => {}
+            thread::sleep(TARGET_FOLLOW_POLL);
         }
     }
+}
+
+/// Drain the control connection into scoped signals, reporting whether the target moved.
+fn drain_session_events(
+    session: &mut vivid_sdk::Session,
+    track: &Track,
+    signals: &mut VecDeque<PresenterSignal>,
+) -> io::Result<bool> {
+    let mut target_moved = false;
+    while let Some(event) = session.take_event()? {
+        target_moved |= record_signal(session, track, signals, event);
+    }
+    Ok(target_moved)
+}
+
+/// Turn one session event into a scoped signal, reporting whether the target generation advanced.
+fn record_signal(
+    session: &mut vivid_sdk::Session,
+    track: &Track,
+    signals: &mut VecDeque<PresenterSignal>,
+    event: SessionEvent,
+) -> bool {
+    match event {
+        SessionEvent::TargetChanged(payload) => match session.apply_target_changed(&payload) {
+            Ok(_) => {
+                signals.push_back(PresenterSignal::TargetChanged);
+                return true;
+            }
+            Err(error) => log::debug!("ignored unusable TARGET_CHANGED: {error}"),
+        },
+        SessionEvent::TrackLost { object_id, payload } => {
+            // Track loss is matched by complete owner identity. Another producer, or another
+            // context in this session, may legitimately reuse this numeric track ID.
+            let field = |key: u64| {
+                payload
+                    .iter()
+                    .find(|(candidate, _)| *candidate == key)
+                    .and_then(|(_, value)| value.as_u64())
+            };
+            let Ok(configuration) = track.configuration() else {
+                return false;
+            };
+            if field(0) != Some(configuration.context_id)
+                || field(1) != Some(configuration.surface_id)
+                || field(2) != Some(configuration.track_id)
+                || object_id != configuration.track_id
+            {
+                return false;
+            }
+            let code = field(3).unwrap_or(0);
+            signals.push_back(PresenterSignal::TrackLost(format!(
+                "raster track {} was lost (code {code})",
+                configuration.track_id
+            )));
+        }
+        SessionEvent::ConnectionClosed { diagnostic } => {
+            signals.push_back(PresenterSignal::ConnectionClosed(diagnostic));
+        }
+        SessionEvent::AnchorReady { .. }
+        | SessionEvent::AnchorGone { .. }
+        | SessionEvent::ContextChanged { .. }
+        | SessionEvent::Other { .. } => {}
+    }
+    false
 }
 
 fn command_queue_capacity(maximum_inflight_body_bytes: u64, frame_bytes: usize) -> usize {
@@ -597,7 +653,7 @@ impl Presenter for VividPresenter {
             self.node_viewport,
             visible,
         );
-        self.update_node_with_target_retry(&node)?;
+        self.commit_node(NodeCommit::Update(&node))?;
         self.visible = visible;
         Ok(())
     }
@@ -614,7 +670,7 @@ impl Presenter for VividPresenter {
                     viewport,
                     self.visible,
                 );
-                self.update_node_with_target_retry(&node)?;
+                self.commit_node(NodeCommit::Update(&node))?;
                 self.node_viewport = viewport;
                 Ok(())
             }
@@ -663,10 +719,11 @@ impl Presenter for VividPresenter {
         self.torn_down = true;
         let mut first_error = None;
         let context_id = self.session.info().root_context_id;
-        if let Err(error) =
-            self.session
-                .delete_node(context_id, self.node_id, &RequestMetadata::default())
-        {
+        let node_id = self.node_id;
+        if let Err(error) = self.commit_node(NodeCommit::Delete {
+            context_id,
+            node_id,
+        }) {
             first_error = Some(error);
         }
         let channel = self.channel.take();
@@ -1205,6 +1262,45 @@ mod tests {
         assert!(position(messages_destroy_track()) < position(messages_destroy_surface()));
     }
 
+    /// A resize is announced before it is reachable: the presenter owns the new target the moment
+    /// the window moves, so a placement the reader planned a moment earlier is rejected as stale.
+    /// The reader has to follow the target and commit again, not treat the rejection as fatal.
+    #[test]
+    fn a_commit_that_crosses_a_resize_follows_the_target_instead_of_failing() {
+        let fake = crate::fake_presenter::FakePresenter::start(8, 6).unwrap();
+        let mut presenter = live_presenter(&fake, WindowSize::from_cells(8, 6, 10, 20));
+
+        // Mid-drag: only the node placement moves, and the target moved under it.
+        let dragged = WindowSize::from_cells(12, 6, 10, 20);
+        fake.change_target(12, 6, false).unwrap();
+        presenter
+            .resize(dragged, false)
+            .expect("an unsettled resize must survive the target it was planned against moving");
+        assert_eq!(presenter.node_viewport, dragged);
+
+        // Settled: the track is replaced and the node re-placed, again across a moved target.
+        let settled = WindowSize::from_cells(14, 8, 10, 20);
+        fake.change_target(14, 8, true).unwrap();
+        presenter
+            .resize(settled, true)
+            .expect("a settled resize must survive the target it was planned against moving");
+        assert_eq!(presenter.track_viewport, settled);
+        assert_eq!(presenter.node_viewport, settled);
+
+        // Following the target is not silent: the reader still learns that it moved.
+        assert!(
+            presenter
+                .signals
+                .iter()
+                .any(|signal| *signal == PresenterSignal::TargetChanged),
+            "the applied target changes were never reported: {:?}",
+            presenter.signals
+        );
+        presenter
+            .teardown()
+            .expect("teardown after following the target");
+    }
+
     fn messages_delete_node() -> u16 {
         registry::record::DELETE_NODE
     }
@@ -1346,6 +1442,15 @@ mod tests {
         false
     }
 
+    fn record_signal_for_test(presenter: &mut VividPresenter, event: SessionEvent) {
+        record_signal(
+            &mut presenter.session,
+            &presenter.track,
+            &mut presenter.signals,
+            event,
+        );
+    }
+
     #[test]
     fn track_loss_is_matched_by_complete_owner_identity() {
         let viewport = WindowSize::from_cells(4, 5, 1, 1);
@@ -1363,23 +1468,32 @@ mod tests {
         };
 
         // Another owner reusing our numeric track ID must not be mistaken for our own loss.
-        presenter.record_signal(loss(
-            configuration.context_id + 1,
-            configuration.surface_id,
-            configuration.track_id,
-        ));
-        presenter.record_signal(loss(
-            configuration.context_id,
-            configuration.surface_id + 1,
-            configuration.track_id,
-        ));
+        record_signal_for_test(
+            &mut presenter,
+            loss(
+                configuration.context_id + 1,
+                configuration.surface_id,
+                configuration.track_id,
+            ),
+        );
+        record_signal_for_test(
+            &mut presenter,
+            loss(
+                configuration.context_id,
+                configuration.surface_id + 1,
+                configuration.track_id,
+            ),
+        );
         assert!(presenter.signals.is_empty());
 
-        presenter.record_signal(loss(
-            configuration.context_id,
-            configuration.surface_id,
-            configuration.track_id,
-        ));
+        record_signal_for_test(
+            &mut presenter,
+            loss(
+                configuration.context_id,
+                configuration.surface_id,
+                configuration.track_id,
+            ),
+        );
         assert!(matches!(
             presenter.signals.pop_front(),
             Some(PresenterSignal::TrackLost(_))
