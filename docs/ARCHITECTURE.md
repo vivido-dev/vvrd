@@ -1,8 +1,9 @@
 # vvrd — Architecture
 
-`vvrd` (Vivido Reader) is a terminal PDF and EPUB reader for the **Vivido** terminal. It renders
-documents with MuPDF and displays them through the **Vivid Protocol 1.5** side channel, using the
-reusable [`vivid_sdk`](../../vivid_sdk) producer client on top of
+`vvrd` (Vivido Reader) is a terminal PDF, EPUB, Markdown, and Mermaid reader for the **Vivido**
+terminal. MuPDF renders PDF/EPUB; the native markup backend produces fixed portrait Letter pages.
+All formats display through the **Vivid Protocol 1.5** side channel, using the reusable
+[`vivid_sdk`](../../vivid_sdk) producer client on top of
 [`vivid_protocol`](../../vivid_protocol).
 
 It is the Vivid-native counterpart of [`kitpdf`](../../kitpdf), which targets the Kitty graphics
@@ -30,7 +31,7 @@ This document describes the overall architecture. The step-by-step build order l
                          ▲
                          │  vvrd is a Vivid *producer*
                  ┌───────┴────────┐
-                 │      vvrd       │   MuPDF render · TUI · vivid_sdk
+                 │      vvrd       │   document render · TUI · vivid_sdk
                  └────────────────┘
 ```
 
@@ -167,12 +168,38 @@ Critical compositing fact: Vivid media lives at `TEXT_LAYER_BETWEEN_BACKGROUND_A
 - vvrd must keep glyphs out of the page area while an image shows (mirrors kitpdf clearing the page
   area). "Loading…" text is drawn only when no node is visible.
 
-### D5 — MuPDF render thread + CPU pixmap prerender cache
-A dedicated blocking thread owns the MuPDF `Document` (which is `!Send`) and renders a window of
-pages around the current page into RGB pixmaps, plus search/TOC/metadata/links/export — a near-direct
-port of kitpdf's `renderer.rs`. Prerendering neighbors keeps page turns instant. The cache is
-**CPU-side pixmaps** (bounded by MB budget like kitpdf), feeding the compositor; it is not a
-presenter-side image cache in the primary model.
+### D5 — Backend-owning render thread + CPU pixmap prerender cache
+A dedicated blocking thread owns either the MuPDF `Document` (which is `!Send`) or the native
+Markdown/Mermaid document plan. It renders a window around the current page into RGB pixmaps and
+serves search/TOC/metadata/links/export. Prerendering neighbours keeps page turns instant. The cache
+is **CPU-side pixmaps**, bounded to 24 pages and 256 MiB, feeding the compositor; markup pagination
+and semantics remain resident while only requested pages are rasterized.
+
+### D10 — Fixed Letter markup backend and transactional reload
+
+Extension dispatch is case-insensitive: `.md`, `.markdown`, and `.mkd` select Markdown; `.mmd` and
+`.mermaid` select standalone Mermaid; everything else follows the unchanged MuPDF path. Markup
+layout is independent of terminal dimensions: every logical page is 2040×2640 (portrait Letter at
+240 DPI) with 180-pixel margins. Normal presentation contain-fits that page into the viewport;
+zoom mode crops a bounded higher-resolution copy.
+
+Markdown is parsed by Comrak with the GFM table, strikethrough, task-list, and autolink extensions.
+The arena AST is copied into an owned block IR. Pagination keeps blocks together when possible,
+keeps a heading with its successor, splits oversized prose/code/lists/tables at line/item/row
+boundaries, repeats table headers, and contain-fits images and Mermaid rather than slicing them.
+Local raster, SVG, and base64 data-URI assets are supported; remote URLs become placeholders and
+are never fetched. Standalone Mermaid must pass preflight; an invalid fenced diagram becomes an
+in-page error block.
+
+Pagination also creates heading slugs/outline entries, page-scoped text and links, Mermaid label
+semantics, and search geometry. Source is capped at 16 MiB, encoded assets at 32 MiB, visuals at
+16,384 pixels per axis and 16.7 MP, blocks at 100,000, and pages at 10,000.
+
+`R`/F5 constructs a complete replacement document before swapping it into the render thread.
+Success clears page rasters, clamps the current page, rereads local assets, and advances the
+document content revision. Failure reports an error while the previous plan and visible frame
+remain active. The revision is included in `PresentCmd::UpdateContent`, so a same-page reload
+updates the surface descriptor without changing the surface generation, node, track, or channel.
 
 ### D6 — Input is pure PTY stdin
 Running under Vivido, vvrd is an ordinary terminal app from the PTY's view. Keyboard/mouse come
@@ -239,7 +266,7 @@ Three threads, coordinated by `flume` channels (kitpdf already uses `flume`):
     Area, Search, ▼                                ▼  Resize, HideNode, Teardown)
     Invert…) ┌─────────────────┐        ┌────────────────────────────────┐
              │ Render thread    │ Page  │ Vivid thread                    │
-             │ · MuPDF Document │ pixmap│ · owns vivid_sdk::Session       │
+             │ · backend/plan   │ pixmap│ · owns vivid_sdk::Session       │
              │   (!Send)        ├──────▶│ · owns surface + raster track   │
              │ · page → RGB     │(flume)│   + TrackChannel + scene node   │
              │ · search/TOC/    │       │ · composites viewport RGBA      │
@@ -255,8 +282,8 @@ Three threads, coordinated by `flume` channels (kitpdf already uses `flume`):
 
 - **UI thread** never blocks on the network. It emits `RenderNotif` to the render thread (identical
   enum to kitpdf) and `PresentCmd` to the Vivid thread, and consumes `RenderInfo`/`PresentEvent`.
-- **Render thread** is a port of kitpdf `renderer.rs`: a window of pages rendered around the current
-  page, MuPDF `!Send` isolation, panic-caught per page, a slow-render watchdog, EPUB reflow/layout.
+- **Render thread** owns backend dispatch, a window of rendered pages, MuPDF `!Send` isolation,
+  the owned lazy markup `PagePlan`, panic-caught page rendering, and the slow-render watchdog.
 - **Vivid thread** owns *all* presenter I/O. It composites the current page pixmap + view transform
   into the viewport buffer and sends it as a raster frame (blocking on channel flow off the UI
   thread), runs scene transactions, handles resize (replace the track at new dims), applies presenter
@@ -277,7 +304,9 @@ Modeled on kitpdf, with the Kitty layer swapped for a Vivid presenter layer.
 |---|---|---|
 | `main.rs` | CLI parse, env/config, terminal guard, thread wiring, event loop | port of kitpdf `main.rs` (de-tokio-fied) |
 | `app.rs` | App state: page, scroll/zoom/pan, input mode, search, transforms, pixmap residency | port of kitpdf `app.rs` (near-verbatim; drops Kitty `ImageId`) |
-| `renderer.rs` | MuPDF render thread: pixmaps, search, TOC, metadata, links, EPUB reflow, export, watchdog | port of kitpdf `renderer.rs` (near-verbatim) |
+| `renderer.rs` | Backend dispatch and render thread: cache, search, TOC, metadata, links, reload, EPUB reflow, export, watchdog | MuPDF path from kitpdf plus native backend |
+| `markup/` | Owned Markdown IR, Letter pagination, text/image/SVG raster helpers, bundled Mona Sans/Monaspace fonts | adapted from Kitmd `45cb75f` |
+| `mermaid_engine/` | Complete Rust Mermaid parser, validation, layout, and SVG renderer | copied from Kitmd `45cb75f` |
 | `compositor.rs` | Page pixmap + view transform → viewport RGBA buffer (crop/scale/highlight/crop-margins) | derived from kitpdf `image_pipeline.rs` + `compute_page_surface` |
 | `presenter.rs` | `Presenter` trait + `VividPresenter`: session, document surface, raster track + channel, scene node, frame send, resize, three recoveries, teardown | wraps `vivid_sdk` |
 | `vivid_thread.rs` | Owns `Session` + presenter; `PresentCmd`/`PresentEvent` loop; signal servicing; frame coalescing | — |
@@ -373,7 +402,7 @@ added.)
    verify the selected target profile and read the authoritative grid from the target descriptor.
 3. Enter alt screen / raw mode / hide cursor (terminal guard). Install panic hook that restores the
    terminal *and* tears down Vivid.
-4. Spawn render thread (MuPDF) and Vivid thread (owns the session). Send initial `Area`
+4. Spawn the backend-owning render thread and Vivid thread (owns the session). Send initial `Area`
    (viewport × zoom) to the renderer; `CREATE_SURFACE`, then create + prime the raster track, then
    `ACTIVATE_TRACK` slot 3, then `CREATE_NODE` for the full-viewport placement.
 5. Load persisted per-file state; jump to saved/`-p` page.
@@ -491,19 +520,22 @@ core design; §Verification calls out explicit tiled/floating-pane test cases.
 | kitpdf feature | vvrd mechanism |
 |---|---|
 | PDF & EPUB via MuPDF | Same MuPDF render thread |
+| Markdown and Mermaid | Native fixed 2040×2640 Letter `PagePlan`; Kitmd-derived renderer/engine |
 | Sharp zoom (re-render at resolution) | Render page at `viewport×zoom`; crop viewport region into framebuffer |
 | Vertical scroll + auto page-turn at bounds | Same `App` scroll logic; compositor crops at scroll offset |
 | Horizontal pan (zoom mode) | Compositor crops at pan offset |
 | Auto-crop whitespace | `compositor.rs` (ported `crop_whitespace`) before blit |
-| Colour tint (sepia) / invert / custom B&W | MuPDF `tint`/invert at render (unchanged) |
-| Rotate 90° | MuPDF matrix rotate at render (unchanged) |
-| Search + highlight + n/N + cross-page counts | Renderer search flow (unchanged); highlight composited into buffer |
-| Table of contents (+ mouse) | MuPDF outlines; full-screen text overlay; node hidden |
-| Metadata / links / follow links | MuPDF extract; text overlays; internal jump / external open |
+| Colour tint (sepia) / invert / custom B&W | Backend render transform; MuPDF behavior unchanged |
+| Rotate 90° | MuPDF matrix or markup raster rotation |
+| Search + highlight + n/N + cross-page counts | MuPDF text quads or markup page semantics; highlight composited into buffer |
+| Table of contents (+ mouse) | MuPDF outlines or Markdown heading slugs; full-screen overlay |
+| Metadata / links / follow links | MuPDF extraction or markup semantics; scrubbed external opener |
 | Go-to-page, PgUp/PgDn, arrows, hjkl, space | Same `App` key handling |
 | EPUB reflow + font size `<`/`>` | Renderer EPUB layout path (unchanged) |
 | State persistence (XDG) | `state.rs` (unchanged) |
 | Export page to PNG (`-e`, `e`) | `export.rs` (unchanged) |
+| Light/dark paper theme | `--theme light|dark`, markup only |
+| Source refresh | Atomic backend reload/repagination; old document survives failure |
 | Loading indicator w/ delay | Same UI timer; text drawn while node hidden |
 | Panic isolation + slow-render watchdog | Ported into the render thread |
 | Clean exit / Ctrl-C / panic cleanup | Terminal restore **+ Vivid node/track/surface teardown** |

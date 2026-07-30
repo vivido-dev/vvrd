@@ -25,6 +25,8 @@ pub struct ViewTransform {
     pub offset_x: u32,
     pub offset_y: u32,
     pub auto_crop: bool,
+    /// Scale the whole fixed page into the viewport. Zoom mode clears this and crops instead.
+    pub fit_to_viewport: bool,
 }
 
 pub struct ComposedFrame {
@@ -118,7 +120,17 @@ pub fn compose_view(
     }
 
     let (content_width, content_height, image) =
-        if image.width() <= width && image.height() <= height && !transform.auto_crop {
+        if transform.fit_to_viewport && (image.width() > width || image.height() > height) {
+            let scale =
+                (width as f64 / image.width() as f64).min(height as f64 / image.height() as f64);
+            let scaled_width = ((image.width() as f64 * scale).round() as u32).clamp(1, width);
+            let scaled_height = ((image.height() as f64 * scale).round() as u32).clamp(1, height);
+            (
+                scaled_width,
+                scaled_height,
+                image::imageops::resize(&image, scaled_width, scaled_height, FilterType::Lanczos3),
+            )
+        } else if image.width() <= width && image.height() <= height && !transform.auto_crop {
             (image.width(), image.height(), image)
         } else if image.width() <= width && image.height() <= height {
             let scale =
@@ -534,11 +546,28 @@ mod tests {
                 offset_x: 3,
                 offset_y: 0,
                 auto_crop: false,
+                fit_to_viewport: false,
             },
         )
         .unwrap();
         assert_eq!(frame.content_width, 8);
         assert_eq!(frame.rgba[0], 3);
+    }
+
+    #[test]
+    fn fixed_page_can_be_contain_fitted_for_normal_view() {
+        let page = page(vec![255; 8 * 8 * 3], 8, 8, 24);
+        let frame = compose_view(
+            page,
+            WindowSize::from_cells(1, 2, 4, 4),
+            ViewTransform {
+                fit_to_viewport: true,
+                ..ViewTransform::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((frame.content_width, frame.content_height), (4, 4));
+        assert!(frame.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
     }
 
     fn composed_rgba(width: u32, height: u32, values: &[u8]) -> ComposedFrame {

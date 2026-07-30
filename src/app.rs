@@ -127,7 +127,10 @@ impl App {
     }
 
     pub fn supports_zoom(&self) -> bool {
-        matches!(self.document_kind, DocumentKind::Fixed)
+        matches!(
+            self.document_kind,
+            DocumentKind::Fixed | DocumentKind::Markdown | DocumentKind::Mermaid
+        )
     }
 
     pub fn invalidate(&mut self) {

@@ -5,8 +5,9 @@ specific to vvrd. Read `docs/ARCHITECTURE.md` before changing the Vivid layer.
 
 ## What vvrd is
 
-A terminal PDF/EPUB reader: MuPDF renders pages, a compositor blits the visible region into a
-viewport-sized RGBA framebuffer, and a **Vivid Protocol 1.5** producer submits it as raster media.
+A terminal PDF/EPUB/Markdown/Mermaid reader: MuPDF or the native fixed-Letter markup backend
+renders pages, a compositor blits the visible region into a viewport-sized RGBA framebuffer, and a
+**Vivid Protocol 1.5** producer submits it as raster media.
 The PTY carries only status text and overlays; page pixels never touch it.
 
 ## Object model — the part to get right

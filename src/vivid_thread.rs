@@ -36,6 +36,7 @@ pub enum PresentCmd {
     UpdateContent {
         page: usize,
         search_term: Option<String>,
+        document_revision: u64,
     },
     Shutdown,
 }
@@ -195,8 +196,12 @@ fn run(
             PresentCmd::Resize { viewport, settled } => {
                 presenter.resize(viewport, settled).map(|()| None)
             }
-            PresentCmd::UpdateContent { page, search_term } => presenter
-                .update_content_descriptor(page, search_term)
+            PresentCmd::UpdateContent {
+                page,
+                search_term,
+                document_revision,
+            } => presenter
+                .update_content_descriptor(page, search_term, document_revision)
                 .map(|()| None),
             PresentCmd::Shutdown => break,
         };

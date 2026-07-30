@@ -94,7 +94,7 @@ pub struct VividPresenter {
     recovery_reason: Option<u64>,
     torn_down: bool,
     descriptor: SurfaceDescriptor,
-    semantic_state: (usize, Option<String>),
+    semantic_state: (usize, Option<String>, u64),
     signals: VecDeque<PresenterSignal>,
 }
 
@@ -185,7 +185,7 @@ impl VividPresenter {
             recovery_reason: None,
             torn_down: false,
             descriptor,
-            semantic_state: (initial_page, None),
+            semantic_state: (initial_page, None, 1),
             signals,
         })
     }
@@ -323,8 +323,9 @@ impl VividPresenter {
         &mut self,
         page: usize,
         search_term: Option<String>,
+        document_revision: u64,
     ) -> io::Result<()> {
-        if self.semantic_state == (page, search_term.clone()) {
+        if self.semantic_state == (page, search_term.clone(), document_revision) {
             return Ok(());
         }
         self.descriptor.semantic_content_revision = self
@@ -338,7 +339,7 @@ impl VividPresenter {
         // coordinate and input target truth did not change.
         self.session
             .update_surface(&self.surface, replacement, &RequestMetadata::default())?;
-        self.semantic_state = (page, search_term);
+        self.semantic_state = (page, search_term, document_revision);
         Ok(())
     }
 
@@ -1177,11 +1178,32 @@ mod tests {
         let revision = presenter.surface.revision();
 
         presenter
-            .update_content_descriptor(4, Some("term".to_owned()))
+            .update_content_descriptor(4, Some("term".to_owned()), 1)
             .unwrap();
 
         assert_eq!(presenter.surface.generation(), generation);
         assert!(presenter.surface.revision() > revision);
+        assert_eq!(presenter.descriptor.semantic_content_revision, 2);
+    }
+
+    #[test]
+    fn same_page_source_reload_advances_only_content_revision() {
+        let viewport = WindowSize::from_cells(4, 5, 1, 1);
+        let mut presenter =
+            VividPresenter::new(offline_session(), viewport, 0, test_descriptor(), 0).unwrap();
+        let surface_id = presenter.surface.id();
+        let surface_generation = presenter.surface.generation();
+        let node_id = presenter.node_id;
+        let track_id = presenter.track.id();
+        let track_generation = presenter.track.channel_generation();
+
+        presenter.update_content_descriptor(0, None, 2).unwrap();
+
+        assert_eq!(presenter.surface.id(), surface_id);
+        assert_eq!(presenter.surface.generation(), surface_generation);
+        assert_eq!(presenter.node_id, node_id);
+        assert_eq!(presenter.track.id(), track_id);
+        assert_eq!(presenter.track.channel_generation(), track_generation);
         assert_eq!(presenter.descriptor.semantic_content_revision, 2);
     }
 

@@ -1,14 +1,18 @@
 # vvrd
 
-`vvrd` is a full-screen PDF and EPUB reader for the Vivido terminal. It renders documents with
-MuPDF and sends page pixels through the Vivid 1.5 side channel, never through terminal escape
-sequences. The same binary runs directly in Vivido and in a remote shell reached with `vvssh`.
+`vvrd` is a full-screen PDF, EPUB, Markdown, and Mermaid reader for the Vivido terminal. MuPDF
+handles PDF/EPUB; the built-in Markdown/Mermaid backend paginates markup onto fixed portrait Letter
+pages (2040×2640 pixels at 240 DPI, with 180-pixel margins). Page pixels use the Vivid 1.5 side
+channel, never terminal escape sequences. The same binary runs directly in Vivido and in a remote
+shell reached with `vvssh`.
 (Nested operation in vvmux panes returns once vvmux migrates to Vivid 1.5.)
 
 ```sh
 cargo build --release
 target/release/vvrd book.epub
 target/release/vvrd --page 12 paper.pdf
+target/release/vvrd --theme dark guide.md
+target/release/vvrd diagram.mmd
 target/release/vvrd --export paper.pdf
 ```
 
@@ -32,8 +36,15 @@ without a live presenter. `--trace DIR` writes Vivid control and raster streams 
 | `/`, `n`/`N` | Search; next/previous matching page |
 | `t`, `M`, `f`, `?` | TOC, metadata, links, help |
 | `e` | Export the current page as PNG |
-| `R` or F5 | Reload rendered pages |
+| `R` or F5 | Atomically reread and repaginate the document and local assets |
 | `q`, Esc, Ctrl-C | Quit |
 
 Reader state is saved per document in the platform cache directory. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the transport and compositor design.
+
+Markdown supports GFM tables, strikethrough, task lists, autolinks, styled inline/code text,
+blockquotes, local raster/SVG/data-URI images, and fenced Mermaid. Remote images are represented by
+an in-page placeholder and are never fetched. `--theme light|dark` selects the Markdown/Mermaid
+paper theme (default: `light`); the existing invert, tint, colour mapping, rotation, crop, search,
+TOC, links, zoom/pan, state restore, and PNG export controls apply to markup pages too. A failed
+reload leaves the previous document visible.

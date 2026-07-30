@@ -189,10 +189,10 @@ impl FakePresenter {
 impl Drop for FakePresenter {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Ok(mut guard) = self.control_writer.lock() {
-            if let Some(stream) = guard.take() {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-            }
+        if let Ok(mut guard) = self.control_writer.lock()
+            && let Some(stream) = guard.take()
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
         }
         // The accept loop wakes on its own connection, so a probe connect unblocks it.
         if let Some(address) = self.endpoint.strip_prefix("tcp:") {
