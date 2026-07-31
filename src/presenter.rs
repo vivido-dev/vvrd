@@ -1211,14 +1211,14 @@ mod tests {
     ///
     /// `VIVID_ROOT_SECRET` is process-global, so live tests are serialized on one mutex.
     fn live_presenter(
-        fake: &crate::fake_presenter::FakePresenter,
+        fake: &vivid_sdk::testing::TestPresenter,
         viewport: WindowSize,
     ) -> VividPresenter {
         let config = ProducerConfig {
             endpoint_control: Some(fake.endpoint().to_owned()),
             endpoint_bulk: Some(fake.endpoint().to_owned()),
             authentication: vivid_sdk::ProducerAuthentication::root_hex(
-                crate::fake_presenter::ROOT_SECRET_HEX,
+                vivid_sdk::testing::ROOT_SECRET_HEX,
             )
             .unwrap(),
             producer_name: "vvrd-test".to_owned(),
@@ -1237,7 +1237,7 @@ mod tests {
 
     #[test]
     fn resize_and_teardown_destroy_tracks_before_closing_their_transports() {
-        let fake = crate::fake_presenter::FakePresenter::start(8, 6).unwrap();
+        let fake = vivid_sdk::testing::TestPresenter::start(8, 6).unwrap();
         let viewport = WindowSize::from_cells(8, 6, 10, 20);
         let resized = WindowSize::from_cells(10, 6, 10, 20);
         let mut presenter = live_presenter(&fake, viewport);
@@ -1289,12 +1289,12 @@ mod tests {
     /// The reader has to follow the target and commit again, not treat the rejection as fatal.
     #[test]
     fn a_commit_that_crosses_a_resize_follows_the_target_instead_of_failing() {
-        let fake = crate::fake_presenter::FakePresenter::start(8, 6).unwrap();
+        let fake = vivid_sdk::testing::TestPresenter::start(8, 6).unwrap();
         let mut presenter = live_presenter(&fake, WindowSize::from_cells(8, 6, 10, 20));
 
         // Mid-drag: only the node placement moves, and the target moved under it.
         let dragged = WindowSize::from_cells(12, 6, 10, 20);
-        fake.change_target(12, 6, false).unwrap();
+        fake.resize_terminal(12, 6, false).unwrap();
         presenter
             .resize(dragged, false)
             .expect("an unsettled resize must survive the target it was planned against moving");
@@ -1302,7 +1302,7 @@ mod tests {
 
         // Settled: the track is replaced and the node re-placed, again across a moved target.
         let settled = WindowSize::from_cells(14, 8, 10, 20);
-        fake.change_target(14, 8, true).unwrap();
+        fake.resize_terminal(14, 8, true).unwrap();
         presenter
             .resize(settled, true)
             .expect("a settled resize must survive the target it was planned against moving");
@@ -1328,11 +1328,11 @@ mod tests {
     /// and the reader has to pick presentation back up when the window grows again.
     #[test]
     fn a_target_too_small_to_present_is_survived_rather_than_fatal() {
-        let fake = crate::fake_presenter::FakePresenter::start(80, 24).unwrap();
+        let fake = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
         let viewport = WindowSize::from_cells(80, 24, 10, 20);
         let mut presenter = live_presenter(&fake, viewport);
 
-        fake.change_target(80, 1, true).unwrap();
+        fake.resize_terminal(80, 1, true).unwrap();
         let waited = wait_for(|| {
             presenter.take_signal();
             matches!(
@@ -1356,7 +1356,7 @@ mod tests {
             .set_visible(false)
             .expect("hiding the node during an unpresentable target must still be accepted");
 
-        fake.change_target(80, 24, true).unwrap();
+        fake.resize_terminal(80, 24, true).unwrap();
         let recovered = wait_for(|| {
             presenter.take_signal();
             matches!(
@@ -1396,8 +1396,8 @@ mod tests {
     fn two_owners_reusing_object_numbers_stay_isolated_through_track_loss() {
         // Two independent owners whose SDK sessions allocate the same numeric surface, node, and
         // track IDs. Only the complete owner identity distinguishes them.
-        let first_presenter = crate::fake_presenter::FakePresenter::start(8, 6).unwrap();
-        let second_presenter = crate::fake_presenter::FakePresenter::start(8, 6).unwrap();
+        let first_presenter = vivid_sdk::testing::TestPresenter::start(8, 6).unwrap();
+        let second_presenter = vivid_sdk::testing::TestPresenter::start(8, 6).unwrap();
         let viewport = WindowSize::from_cells(8, 6, 10, 20);
         let mut first = live_presenter(&first_presenter, viewport);
         let mut second = live_presenter(&second_presenter, viewport);
@@ -1462,7 +1462,7 @@ mod tests {
 
     #[test]
     fn a_dead_track_transport_becomes_an_actionable_channel_loss() {
-        let fake = crate::fake_presenter::FakePresenter::start(8, 6).unwrap();
+        let fake = vivid_sdk::testing::TestPresenter::start(8, 6).unwrap();
         let viewport = WindowSize::from_cells(8, 6, 10, 20);
         let mut presenter = live_presenter(&fake, viewport);
         let track_id = presenter.track.id();

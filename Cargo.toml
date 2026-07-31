@@ -65,3 +65,7 @@ lto = "fat"
 # depends on the plain crates.io mupdf 0.8.0. Keep until upstream ships the fix.
 [patch.crates-io]
 mupdf = { path = "vendor/mupdf-0.8.0" }
+
+[dev-dependencies]
+# The shared in-process presenter every producer in this tree tests against.
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["testing"] }

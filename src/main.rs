@@ -2,8 +2,6 @@ mod app;
 mod compositor;
 mod error;
 mod export;
-#[cfg(test)]
-mod fake_presenter;
 mod geometry;
 mod markup;
 mod mermaid_engine;
