@@ -537,6 +537,10 @@ impl Presenter for VividPresenter {
             .channel
             .as_ref()
             .ok_or_else(|| io::Error::other("raster track channel is unavailable"))?;
+        let zstd_enabled = matches!(
+            self.track.configuration()?.kind,
+            KindConfiguration::Raster(raster) if raster.zstd_enabled
+        );
         let frame_id = self
             .frame_id
             .checked_add(1)
@@ -585,21 +589,38 @@ impl Presenter for VividPresenter {
                     },
                 })
                 .collect();
-            match channel.send_raster_delta(
-                self.epoch,
-                frame_id,
-                self.frame_id,
-                0,
-                0,
-                &operations,
-                false,
-            ) {
+            let send_delta = if zstd_enabled {
+                channel.send_raster_delta_adaptive(
+                    self.epoch,
+                    frame_id,
+                    self.frame_id,
+                    0,
+                    0,
+                    &operations,
+                )
+            } else {
+                channel.send_raster_delta(
+                    self.epoch,
+                    frame_id,
+                    self.frame_id,
+                    0,
+                    0,
+                    &operations,
+                    false,
+                )
+            };
+            match send_delta {
                 Ok(_) => RasterSendKind::Delta,
                 // The channel may have been told to recover between the plan and the send. A full
                 // frame is always legal, so fall back rather than dropping the composition.
                 Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
                     log::debug!("raster delta rejected, sending a full frame instead: {error}");
-                    match channel.send_raster(self.epoch, frame_id, rgba, false) {
+                    let full = if zstd_enabled {
+                        channel.send_raster_adaptive(self.epoch, frame_id, rgba)
+                    } else {
+                        channel.send_raster(self.epoch, frame_id, rgba, false)
+                    };
+                    match full {
                         Ok(_) => RasterSendKind::Full,
                         Err(error) => return Err(self.classify_send_failure(error)),
                     }
@@ -607,7 +628,12 @@ impl Presenter for VividPresenter {
                 Err(error) => return Err(self.classify_send_failure(error)),
             }
         } else {
-            match channel.send_raster(self.epoch, frame_id, rgba, false) {
+            let full = if zstd_enabled {
+                channel.send_raster_adaptive(self.epoch, frame_id, rgba)
+            } else {
+                channel.send_raster(self.epoch, frame_id, rgba, false)
+            };
+            match full {
                 Ok(_) => RasterSendKind::Full,
                 Err(error) => return Err(self.classify_send_failure(error)),
             }
@@ -756,25 +782,38 @@ fn create_and_prime_track(
     viewport: WindowSize,
 ) -> io::Result<(Track, TrackChannel)> {
     let track_id = session.allocate_id()?;
-    let configuration = raster_track(surface, track_id, viewport, true)?;
-    let configuration = if session.probe_track(&probe_of(&configuration))?.supported {
-        configuration
-    } else {
-        let plain = raster_track(surface, track_id, viewport, false)?;
-        if !session.probe_track(&probe_of(&plain))?.supported {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "presenter rejected the viewport raster track configuration",
-            ));
+    let mut configuration = None;
+    // Compression matters more than deltas for document page turns, while deltas dominate scroll
+    // and pan. Prefer both, then preserve zstd if the presenter accepts only one enhancement.
+    for (delta_enabled, zstd_enabled) in
+        [(true, true), (false, true), (true, false), (false, false)]
+    {
+        let candidate = raster_track(surface, track_id, viewport, delta_enabled, zstd_enabled)?;
+        if session.probe_track(&probe_of(&candidate))?.supported {
+            configuration = Some(candidate);
+            break;
         }
-        plain
-    };
+    }
+    let configuration = configuration.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "presenter rejected the viewport raster track configuration",
+        )
+    })?;
+    let zstd_enabled = matches!(
+        &configuration.kind,
+        KindConfiguration::Raster(raster) if raster.zstd_enabled
+    );
     let track = session.create_track(configuration, &RequestMetadata::default())?;
 
     let prime = (|| -> io::Result<TrackChannel> {
         let channel = session.open_track_channel(&track)?;
         let blank = vec![0_u8; viewport.framebuffer_len().map_err(io::Error::other)?];
-        channel.send_raster(1, 1, &blank, false)?;
+        if zstd_enabled {
+            channel.send_raster_adaptive(1, 1, &blank)?;
+        } else {
+            channel.send_raster(1, 1, &blank, false)?;
+        }
         session.wait_track(
             &track,
             TrackWaitCondition::MilestoneSet,
@@ -850,6 +889,7 @@ fn raster_track(
     track_id: u64,
     viewport: WindowSize,
     delta_enabled: bool,
+    zstd_enabled: bool,
 ) -> io::Result<TrackConfiguration> {
     let width = viewport.page_area_width_px();
     let height = viewport.page_area_height_px();
@@ -886,7 +926,7 @@ fn raster_track(
             } else {
                 1
             },
-            zstd_enabled: false,
+            zstd_enabled,
         }),
         target_latency_us: 0,
         maximum_latency_us: MAXIMUM_LATENCY_US,
@@ -1043,6 +1083,20 @@ mod tests {
     fn command_queue_capacity_obeys_the_declared_inflight_claim() {
         assert_eq!(command_queue_capacity(8 * 1024, 2 * 1024), 4);
         assert_eq!(command_queue_capacity(1, 4096), 1);
+    }
+
+    #[test]
+    fn viewport_track_prefers_delta_and_zstd_when_the_presenter_supports_both() {
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let presenter =
+            VividPresenter::new(offline_session(), viewport, 0, test_descriptor(), 0).unwrap();
+        let configuration = presenter.track.configuration().unwrap();
+        let KindConfiguration::Raster(raster) = configuration.kind else {
+            panic!("vvrd created a non-raster viewport track")
+        };
+        assert!(raster.delta_enabled);
+        assert!(raster.zstd_enabled);
+        assert_eq!(raster.maximum_delta_operations, REQUESTED_DELTA_OPERATIONS);
     }
 
     #[test]

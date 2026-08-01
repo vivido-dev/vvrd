@@ -126,8 +126,9 @@ Why this model is the primary path:
   page at zoom resolution in MuPDF and cropping the viewport region, exactly as kitpdf does.
 - **Single bounded presenter resource** with retained delta composition and full-frame recovery.
 - **Zstd is per-track.** Raster zstd is a field of the immutable raster track configuration, not a
-  session feature; when enabled the SDK compresses frames internally and vvrd adds no zstd
-  dependency. vvrd currently declares it off.
+  session feature. vvrd probes it together with raster deltas, prefers zstd when the presenter can
+  grant only one enhancement, and uses the SDK's adaptive sends so compressed bytes are selected
+  only when they are smaller than the raw frame or delta.
 
 Raster deltas are requested in the track configuration and granted by `TRACK_READY`, which returns
 the **effective** operation limit; vvrd plans against that granted value, never the requested one.

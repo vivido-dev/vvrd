@@ -425,7 +425,6 @@ fn request_render(
     white: i32,
     draw_loading: bool,
 ) -> anyhow::Result<()> {
-    sync_semantic_descriptor(vivid, runtime)?;
     match loading_policy(
         draw_loading,
         runtime.current_image.is_some(),
@@ -456,11 +455,13 @@ fn sync_semantic_descriptor(vivid: &VividThread, runtime: &Runtime) -> anyhow::R
     let page = runtime.app.page;
     let search_term = runtime.app.search_term.clone();
     let document_revision = runtime.document_revision;
+    let mut changed = false;
     runtime.semantic.update(|state| {
         if state.page != page
             || state.search_term != search_term
             || state.document_revision != document_revision
         {
+            changed = true;
             state.revision = state.revision.saturating_add(1);
             state.page = page;
             state.search_term = search_term.clone();
@@ -469,11 +470,13 @@ fn sync_semantic_descriptor(vivid: &VividThread, runtime: &Runtime) -> anyhow::R
             state.links.clear();
         }
     });
-    vivid.commands.send(PresentCmd::UpdateContent {
-        page,
-        search_term,
-        document_revision,
-    })?;
+    if changed {
+        vivid.commands.send(PresentCmd::UpdateContent {
+            page,
+            search_term,
+            document_revision,
+        })?;
+    }
     Ok(())
 }
 
@@ -717,6 +720,10 @@ fn handle_render_event(
             text,
             links,
         } if page == runtime.app.page && generation == runtime.app.generation => {
+            // Publish semantic identity only for a page that survived render coalescing. Rapid
+            // navigation can skip many requested pages, and serializing their descriptor updates
+            // ahead of the one visible frame needlessly stalls the Vivid control lane.
+            sync_semantic_descriptor(vivid, runtime)?;
             runtime.semantic.update(|state| {
                 state.text = text;
                 state.links = links;
