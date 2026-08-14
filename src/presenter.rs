@@ -511,6 +511,8 @@ fn record_signal(
         SessionEvent::AnchorReady { .. }
         | SessionEvent::AnchorGone { .. }
         | SessionEvent::ContextChanged { .. }
+        | SessionEvent::FileDropOffered(_)
+        | SessionEvent::FileDropCancelled(_)
         | SessionEvent::Other { .. } => {}
     }
     false
