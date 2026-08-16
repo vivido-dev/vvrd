@@ -179,7 +179,10 @@ and semantics remain resident while only requested pages are rasterized.
 ### D10 — Fixed Letter markup backend and transactional reload
 
 Extension dispatch is case-insensitive: `.md`, `.markdown`, and `.mkd` select Markdown; `.mmd` and
-`.mermaid` select standalone Mermaid; everything else follows the unchanged MuPDF path. Markup
+`.mermaid` select standalone Mermaid; `.pptx`, `.docx`, `.odp`, and `.odt` select the office
+conversion step, which runs a bounded headless LibreOffice (`office.rs`) to produce a PDF cached
+by source content hash and then opens that PDF through the unchanged MuPDF path; everything else
+follows the unchanged MuPDF path directly. Markup
 layout is independent of terminal dimensions: every logical page is 2040×2640 (portrait Letter at
 240 DPI) with 180-pixel margins. Normal presentation contain-fits that page into the viewport;
 zoom mode crops a bounded higher-resolution copy.
@@ -306,6 +309,7 @@ Modeled on kitpdf, with the Kitty layer swapped for a Vivid presenter layer.
 | `main.rs` | CLI parse, env/config, terminal guard, thread wiring, event loop | port of kitpdf `main.rs` (de-tokio-fied) |
 | `app.rs` | App state: page, scroll/zoom/pan, input mode, search, transforms, pixmap residency | port of kitpdf `app.rs` (near-verbatim; drops Kitty `ImageId`) |
 | `renderer.rs` | Backend dispatch and render thread: cache, search, TOC, metadata, links, reload, EPUB reflow, export, watchdog | MuPDF path from kitpdf plus native backend |
+| `office.rs` | Office conversion: LibreOffice discovery, content-hash PDF cache, bounded headless `soffice` subprocess with isolated profile | New for PPTX/DOCX/ODP/ODT viewing |
 | `markup/` | Owned Markdown IR, Letter pagination, text/image/SVG raster helpers, bundled Mona Sans/Monaspace fonts | adapted from Kitmd `45cb75f` |
 | `mermaid_engine/` | Complete Rust Mermaid parser, validation, layout, and SVG renderer | copied from Kitmd `45cb75f` |
 | `compositor.rs` | Page pixmap + view transform → viewport RGBA buffer (crop/scale/highlight/crop-margins) | derived from kitpdf `image_pipeline.rs` + `compute_page_surface` |

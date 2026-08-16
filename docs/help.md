@@ -25,6 +25,11 @@ inversion, custom black/white colours, warm tint, whitespace crop, search highli
 metadata, TOC navigation, and PNG export. EPUB documents use MuPDF reflow and bind `<`/`>` to the
 font size; fixed-layout zoom is intentionally disabled for reflowable content.
 
+`.pptx`, `.docx`, `.odp`, and `.odt` files are converted to PDF once per distinct content by a
+headless LibreOffice (`soffice` from `VVRD_SOFFICE`, `PATH`, or the platform install location;
+converted PDFs cache under the platform cache directory, or `VVRD_OFFICE_CACHE`) and then behave
+like any PDF. Without LibreOffice, vvrd prints a warning and exits.
+
 `.md`, `.markdown`, and `.mkd` files are block-aware paginated onto portrait 2040×2640 Letter
 pages with 180-pixel margins. `.mmd` and `.mermaid` files are contain-fitted and centred on one
 Letter page. Markdown includes GFM tables/task lists/autolinks/strikethrough, local raster/SVG/data

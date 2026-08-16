@@ -5,6 +5,7 @@ mod export;
 mod geometry;
 mod markup;
 mod mermaid_engine;
+mod office;
 mod presenter;
 mod renderer;
 mod semantic;
@@ -55,7 +56,7 @@ const LOADING_DELAY: Duration = Duration::from_millis(90);
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// PDF, EPUB, Markdown, or Mermaid document to read.
+    /// PDF, EPUB, Markdown, Mermaid, PPTX, DOCX, ODP, or ODT document to read.
     document: PathBuf,
 
     /// Page number to open (one-based; overrides saved state).
@@ -138,6 +139,16 @@ enum LoadingPolicy {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     validate_cli(&cli)?;
+    if matches!(
+        renderer::detect_backend(&cli.document),
+        renderer::RenderBackend::Office
+    ) && office::find_soffice().is_none()
+    {
+        eprintln!(
+            "warning: LibreOffice (soffice) not found; PPTX/DOCX/ODP/ODT viewing requires LibreOffice"
+        );
+        std::process::exit(1);
+    }
     if cli.probe_document {
         let rendered = renderer::render_page(
             &cli.document,

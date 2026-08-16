@@ -24,6 +24,7 @@ use crate::{
         ThemeMode,
         markdown::{MarkupDocument, MarkupKind},
     },
+    office,
 };
 
 const MAX_RENDER_DIMENSION: f32 = 16_384.0;
@@ -50,6 +51,8 @@ pub enum RenderBackend {
     MuPdf,
     Markdown,
     Mermaid,
+    /// Office documents (PPTX/DOCX/ODP/ODT) converted to PDF by LibreOffice before opening.
+    Office,
 }
 
 pub fn detect_backend(path: &Path) -> RenderBackend {
@@ -61,6 +64,7 @@ pub fn detect_backend(path: &Path) -> RenderBackend {
     {
         Some("md" | "markdown" | "mkd") => RenderBackend::Markdown,
         Some("mmd" | "mermaid") => RenderBackend::Mermaid,
+        Some("pptx" | "docx" | "odp" | "odt") => RenderBackend::Office,
         _ => RenderBackend::MuPdf,
     }
 }
@@ -222,11 +226,23 @@ impl BackendDocument {
                     layout,
                 })
             }
+            // Office documents become ordinary fixed-layout PDFs; every later stage (cache,
+            // search, export, reload) works on the converted file, which `ensure_pdf` re-derives
+            // from the source content, so reloading picks up source edits.
+            RenderBackend::Office => {
+                let pdf = office::ensure_pdf(path)?;
+                let document = open_document(&pdf, viewport, epub_font_size)?;
+                Ok(Self::MuPdf {
+                    kind: document_kind(&document),
+                    document,
+                    layout: None,
+                })
+            }
             RenderBackend::Markdown | RenderBackend::Mermaid => {
                 let kind = match detect_backend(path) {
                     RenderBackend::Markdown => MarkupKind::Markdown,
                     RenderBackend::Mermaid => MarkupKind::Mermaid,
-                    RenderBackend::MuPdf => unreachable!(),
+                    RenderBackend::MuPdf | RenderBackend::Office => unreachable!(),
                 };
                 MarkupDocument::open(path, kind, theme)
                     .map(Self::Markup)
@@ -1092,6 +1108,9 @@ mod tests {
         for path in ["a.mmd", "a.MERMAID"] {
             assert_eq!(detect_backend(Path::new(path)), RenderBackend::Mermaid);
         }
+        for path in ["a.pptx", "Deck.PPTX", "a.docx", "b.Odt", "c.odp"] {
+            assert_eq!(detect_backend(Path::new(path)), RenderBackend::Office);
+        }
         assert_eq!(detect_backend(Path::new("a.pdf")), RenderBackend::MuPdf);
         assert_eq!(
             detect_backend(Path::new("no-extension")),
@@ -1311,6 +1330,50 @@ mod tests {
         let (width, height, _) = scale_fit((1.0, 1.0), (100_000.0, 100_000.0));
         assert!(width <= MAX_RENDER_DIMENSION);
         assert!(height <= MAX_RENDER_DIMENSION);
+    }
+
+    #[test]
+    fn office_document_converts_and_renders_pages() {
+        if office::find_soffice().is_none() {
+            // A skip is not a pass: this must run on any machine claiming office support.
+            eprintln!("SKIPPED, no LibreOffice (soffice) on this machine");
+            return;
+        }
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/office/demo.pptx");
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let renderer = RenderThread::spawn(fixture, viewport, ThemeMode::Light);
+        // The first conversion of a deck pays for LibreOffice cold start plus profile creation.
+        match renderer
+            .events
+            .recv_timeout(Duration::from_secs(180))
+            .unwrap()
+        {
+            RenderEvent::Opened { kind, n_pages, .. } => {
+                assert_eq!(kind, DocumentKind::Fixed);
+                assert!(n_pages >= 1);
+            }
+            event => panic!("expected Opened, got {}", event_name(&event)),
+        }
+        renderer
+            .commands
+            .send(RenderCmd::Render {
+                page: 0,
+                options: RenderOptions::for_viewport(viewport, 1),
+            })
+            .unwrap();
+        match renderer
+            .events
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap()
+        {
+            RenderEvent::Page { page, image, .. } => {
+                assert_eq!(page, 0);
+                assert!(image.width > 0 && image.height > 0);
+                assert_eq!(image.pixels.len() % 3, 0);
+            }
+            event => panic!("expected Page, got {}", event_name(&event)),
+        }
+        renderer.shutdown();
     }
 
     #[test]
