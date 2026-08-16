@@ -24,6 +24,7 @@ use crate::{
         ThemeMode,
         markdown::{MarkupDocument, MarkupKind},
     },
+    quicklook::{self, OfficeKind},
 };
 
 const MAX_RENDER_DIMENSION: f32 = 16_384.0;
@@ -50,6 +51,8 @@ pub enum RenderBackend {
     MuPdf,
     Markdown,
     Mermaid,
+    /// PowerPoint and Word, previewed through macOS Quick Look and then read as a fixed page.
+    QuickLook,
 }
 
 pub fn detect_backend(path: &Path) -> RenderBackend {
@@ -61,6 +64,9 @@ pub fn detect_backend(path: &Path) -> RenderBackend {
     {
         Some("md" | "markdown" | "mkd") => RenderBackend::Markdown,
         Some("mmd" | "mermaid") => RenderBackend::Mermaid,
+        Some(extension) if quicklook::office_kind_for_extension(extension).is_some() => {
+            RenderBackend::QuickLook
+        }
         _ => RenderBackend::MuPdf,
     }
 }
@@ -196,6 +202,10 @@ enum BackendDocument {
         document: Document,
         kind: DocumentKind,
         layout: Option<(f32, f32, f32)>,
+        /// Set when the pages came from a Quick Look preview of an Office file rather than from
+        /// the file the user named. Quick Look renders one page only, so this drives the metadata
+        /// row and the notice that says so.
+        preview: Option<OfficeKind>,
     },
     Markup(MarkupDocument),
 }
@@ -208,31 +218,64 @@ impl BackendDocument {
         theme: ThemeMode,
     ) -> Result<Self, RenderError> {
         match detect_backend(path) {
-            RenderBackend::MuPdf => {
-                let document = open_document(path, viewport, epub_font_size)?;
-                let kind = document_kind(&document);
-                let layout = matches!(kind, DocumentKind::Reflowable).then_some((
-                    viewport.page_area_width_px() as f32,
-                    viewport.page_area_height_px() as f32,
-                    epub_font_size,
-                ));
-                Ok(Self::MuPdf {
-                    document,
-                    kind,
-                    layout,
-                })
+            RenderBackend::MuPdf => Self::open_mupdf(path, viewport, epub_font_size, None),
+            RenderBackend::QuickLook => {
+                let office = quicklook::office_kind(path).ok_or_else(|| {
+                    RenderError::Converting(format!(
+                        "{} is not a PowerPoint or Word document",
+                        path.display()
+                    ))
+                })?;
+                let preview = quicklook::convert(path)?;
+                Self::open_mupdf(&preview, viewport, epub_font_size, Some(office))
             }
-            RenderBackend::Markdown | RenderBackend::Mermaid => {
-                let kind = match detect_backend(path) {
-                    RenderBackend::Markdown => MarkupKind::Markdown,
-                    RenderBackend::Mermaid => MarkupKind::Mermaid,
-                    RenderBackend::MuPdf => unreachable!(),
-                };
-                MarkupDocument::open(path, kind, theme)
-                    .map(Self::Markup)
-                    .map_err(|error| RenderError::Markup(error.to_string()))
-            }
+            RenderBackend::Markdown => Self::open_markup(path, MarkupKind::Markdown, theme),
+            RenderBackend::Mermaid => Self::open_markup(path, MarkupKind::Mermaid, theme),
         }
+    }
+
+    fn open_mupdf(
+        target: &Path,
+        viewport: WindowSize,
+        epub_font_size: f32,
+        preview: Option<OfficeKind>,
+    ) -> Result<Self, RenderError> {
+        let document = open_document(target, viewport, epub_font_size)?;
+        let kind = document_kind(&document);
+        let layout = matches!(kind, DocumentKind::Reflowable).then_some((
+            viewport.page_area_width_px() as f32,
+            viewport.page_area_height_px() as f32,
+            epub_font_size,
+        ));
+        Ok(Self::MuPdf {
+            document,
+            kind,
+            layout,
+            preview,
+        })
+    }
+
+    fn open_markup(path: &Path, kind: MarkupKind, theme: ThemeMode) -> Result<Self, RenderError> {
+        MarkupDocument::open(path, kind, theme)
+            .map(Self::Markup)
+            .map_err(|error| RenderError::Markup(error.to_string()))
+    }
+
+    /// A one-line status message for documents whose pages are a Quick Look preview, so the single
+    /// page never reads as a truncated document.
+    fn preview_notice(&self) -> Option<String> {
+        let Self::MuPdf {
+            preview: Some(office),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(format!(
+            "{} via Quick Look: {} only",
+            office.label(),
+            office.previewed_unit()
+        ))
     }
 
     fn kind(&self) -> DocumentKind {
@@ -269,6 +312,7 @@ impl BackendDocument {
             document,
             kind,
             layout,
+            ..
         } = self
         else {
             return Ok(false);
@@ -302,7 +346,21 @@ impl BackendDocument {
 
     fn metadata(&self) -> Vec<(String, String)> {
         match self {
-            Self::MuPdf { document, .. } => extract_metadata(document),
+            Self::MuPdf {
+                document, preview, ..
+            } => {
+                let mut metadata = extract_metadata(document);
+                // Replace rather than prepend: MuPDF already reports a Format, and for a preview
+                // that describes the generated image ("PNG"), not the document the user opened.
+                if let Some(office) = preview {
+                    let format = format!("{} (Quick Look preview)", office.label());
+                    match metadata.iter_mut().find(|(key, _)| key == "Format") {
+                        Some((_, value)) => *value = format,
+                        None => metadata.insert(0, ("Format".to_owned(), format)),
+                    }
+                }
+                metadata
+            }
             Self::Markup(document) => document.metadata().to_vec(),
         }
     }
@@ -360,7 +418,7 @@ fn send_backend_opened(
     reloaded: bool,
     events: &Sender<RenderEvent>,
 ) -> bool {
-    events
+    if events
         .send(RenderEvent::Opened {
             kind: document.kind(),
             n_pages: document.page_count(),
@@ -369,7 +427,15 @@ fn send_backend_opened(
             document_revision,
             reloaded,
         })
-        .is_ok()
+        .is_err()
+    {
+        return false;
+    }
+    // Strictly after `Opened`: `wait_for_document` in `main.rs` requires that event first.
+    match document.preview_notice() {
+        Some(notice) => events.send(RenderEvent::Notice(notice)).is_ok(),
+        None => true,
+    }
 }
 
 fn run_render_thread(
@@ -1092,7 +1158,12 @@ mod tests {
         for path in ["a.mmd", "a.MERMAID"] {
             assert_eq!(detect_backend(Path::new(path)), RenderBackend::Mermaid);
         }
+        for path in ["a.pptx", "a.PPTX", "a.ppt", "a.docx", "a.DocX", "a.doc"] {
+            assert_eq!(detect_backend(Path::new(path)), RenderBackend::QuickLook);
+        }
         assert_eq!(detect_backend(Path::new("a.pdf")), RenderBackend::MuPdf);
+        // Spreadsheets share the Quick Look generator but stay on the unchanged MuPDF path.
+        assert_eq!(detect_backend(Path::new("a.xlsx")), RenderBackend::MuPdf);
         assert_eq!(
             detect_backend(Path::new("no-extension")),
             RenderBackend::MuPdf
@@ -1136,6 +1207,62 @@ mod tests {
             .unwrap();
         assert_eq!(image::image_dimensions(&output).unwrap(), (2_040, 2_640));
         fs::remove_file(output).unwrap();
+    }
+
+    /// A Quick Look preview is a single page, so it must announce itself; otherwise the one page
+    /// reads as a truncated deck. The image stands in for the converted artifact, which is what
+    /// `quicklook::convert` hands to this constructor.
+    #[test]
+    fn a_quicklook_preview_announces_itself_in_the_notice_and_metadata() {
+        let artifact = temp_file("png");
+        image::RgbaImage::from_pixel(320, 180, image::Rgba([12, 34, 56, 255]))
+            .save(&artifact)
+            .unwrap();
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+
+        let preview =
+            BackendDocument::open_mupdf(&artifact, viewport, 11.0, Some(OfficeKind::Presentation))
+                .unwrap();
+        assert_eq!(
+            preview.preview_notice().as_deref(),
+            Some("PowerPoint via Quick Look: first slide only")
+        );
+        let metadata = preview.metadata();
+        assert_eq!(
+            metadata.first(),
+            Some(&(
+                "Format".to_owned(),
+                "PowerPoint (Quick Look preview)".to_owned()
+            ))
+        );
+        // The MuPDF format row is replaced, not duplicated.
+        assert_eq!(
+            metadata.iter().filter(|(key, _)| key == "Format").count(),
+            1
+        );
+        // The preview is a fixed page, so zoom and the rest of the MuPDF path apply unchanged.
+        assert!(matches!(preview.kind(), DocumentKind::Fixed));
+
+        let word =
+            BackendDocument::open_mupdf(&artifact, viewport, 11.0, Some(OfficeKind::Document))
+                .unwrap();
+        assert_eq!(
+            word.preview_notice().as_deref(),
+            Some("Word via Quick Look: first page only")
+        );
+
+        // An ordinary document is not a preview and stays silent.
+        let plain = BackendDocument::open_mupdf(&artifact, viewport, 11.0, None).unwrap();
+        assert_eq!(plain.preview_notice(), None);
+        assert!(
+            !plain
+                .metadata()
+                .iter()
+                .any(|(_, value)| value.contains("Quick Look")),
+            "an ordinary document keeps MuPDF's own metadata"
+        );
+
+        fs::remove_file(artifact).unwrap();
     }
 
     #[test]

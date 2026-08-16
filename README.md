@@ -1,10 +1,10 @@
 # vvrd
 
-`vvrd` is a full-screen PDF, EPUB, Markdown, and Mermaid reader for the Vivido terminal. MuPDF
-handles PDF/EPUB; the built-in Markdown/Mermaid backend paginates markup onto fixed portrait Letter
-pages (2040×2640 pixels at 240 DPI, with 180-pixel margins). Page pixels use the Vivid 1.5 side
-channel, never terminal escape sequences. The same binary runs directly in Vivido and in a remote
-shell reached with `vvssh`.
+`vvrd` is a full-screen PDF, EPUB, Markdown, and Mermaid reader for the Vivido terminal, and on
+macOS it previews PowerPoint and Word files too. MuPDF handles PDF/EPUB; the built-in
+Markdown/Mermaid backend paginates markup onto fixed portrait Letter pages (2040×2640 pixels at
+240 DPI, with 180-pixel margins). Page pixels use the Vivid 1.5 side channel, never terminal escape
+sequences. The same binary runs directly in Vivido and in a remote shell reached with `vvssh`.
 (Nested operation in vvmux panes returns once vvmux migrates to Vivid 1.5.)
 
 ```sh
@@ -13,6 +13,7 @@ target/release/vvrd book.epub
 target/release/vvrd --page 12 paper.pdf
 target/release/vvrd --theme dark guide.md
 target/release/vvrd diagram.mmd
+target/release/vvrd deck.pptx          # macOS only
 target/release/vvrd --export paper.pdf
 ```
 
@@ -44,7 +45,15 @@ Reader state is saved per document in the platform cache directory. See
 
 Markdown supports GFM tables, strikethrough, task lists, autolinks, styled inline/code text,
 blockquotes, local raster/SVG/data-URI images, and fenced Mermaid. Remote images are represented by
-an in-page placeholder and are never fetched. `--theme light|dark` selects the Markdown/Mermaid
+an in-page placeholder and are never fetched.
+
+On macOS, PowerPoint and Word documents are rendered by Quick Look using the system's own Office
+renderer, so fonts, theme colours, tables, and embedded art match what Finder shows. Quick Look
+previews rather than paginates, so vvrd shows **the first slide or page only** and says so in the
+status line and metadata. Zoom, rotation, invert, tint, crop, and PNG export work as they do for a
+PDF page, and previews are cached per file and refreshed by `R`/F5. These formats need macOS.
+
+`--theme light|dark` selects the Markdown/Mermaid
 paper theme (default: `light`); the existing invert, tint, colour mapping, rotation, crop, search,
 TOC, links, zoom/pan, state restore, and PNG export controls apply to markup pages too. A failed
 reload leaves the previous document visible.

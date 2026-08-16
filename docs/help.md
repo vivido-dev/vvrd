@@ -31,6 +31,14 @@ Letter page. Markdown includes GFM tables/task lists/autolinks/strikethrough, lo
 URI images, and fenced Mermaid; it never fetches remote images. `R`/F5 atomically rereads source
 and local assets. If parsing or pagination fails, the prior document remains visible.
 
+On macOS, PowerPoint (`.pptx`, `.pptm`, `.ppsx`, `.ppt`, …) and Word (`.docx`, `.docm`, `.doc`, …)
+files are rendered by Quick Look, which uses the system's own Office renderer. Quick Look previews
+a document rather than paginating it, so vvrd shows **the first slide or page only**; the status
+line and the metadata overlay both say so. Everything else — zoom, rotation, invert, tint, crop,
+and PNG export — behaves as it does for a PDF page. Previews are cached per source file and
+refreshed by `R`/F5 when the file changes. Off macOS these formats report that Quick Look is
+required.
+
 In vvmux, moving a floating pane changes only the outer projection; vvrd continues using local
 `(0,0)` coordinates. Resizing a pane recreates its one raster source after a 120 ms debounce.
 Background tabs, zoom-hidden panes, and fully occluded panes pause frame submission until vvmux

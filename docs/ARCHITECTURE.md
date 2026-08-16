@@ -179,7 +179,8 @@ and semantics remain resident while only requested pages are rasterized.
 ### D10 — Fixed Letter markup backend and transactional reload
 
 Extension dispatch is case-insensitive: `.md`, `.markdown`, and `.mkd` select Markdown; `.mmd` and
-`.mermaid` select standalone Mermaid; everything else follows the unchanged MuPDF path. Markup
+`.mermaid` select standalone Mermaid; PowerPoint and Word extensions select the Quick Look preview
+path (D11); everything else follows the unchanged MuPDF path. Markup
 layout is independent of terminal dimensions: every logical page is 2040×2640 (portrait Letter at
 240 DPI) with 180-pixel margins. Normal presentation contain-fits that page into the viewport;
 zoom mode crops a bounded higher-resolution copy.
@@ -201,6 +202,32 @@ Success clears page rasters, clamps the current page, rereads local assets, and 
 document content revision. Failure reports an error while the previous plan and visible frame
 remain active. The revision is included in `PresentCmd::UpdateContent`, so a same-page reload
 updates the surface descriptor without changing the surface generation, node, track, or channel.
+
+### D11 — PowerPoint and Word through macOS Quick Look
+
+`.pptx`/`.pptm`/`.ppsx`/`.ppsm`/`.potx`/`.potm`/`.ppt`/`.pps`/`.pot` and
+`.docx`/`.docm`/`.dotx`/`.dotm`/`.doc`/`.dot` are converted before they are rendered.
+`quicklook.rs` runs `/usr/bin/qlmanage -t -s 2048` and hands the resulting PNG to the unchanged
+MuPDF backend, which opens images through its `img` feature. Quick Look is therefore a *converter*,
+not a renderer: there is no new `BackendDocument` variant, and paging, zoom, rotation, inversion,
+tint, crop, search, and PNG export all apply without further work.
+
+Quick Look renders with the system's own Office generator, so fidelity is exact — fonts, theme
+colours, tables, and embedded art all match what Finder shows. It is a preview technology, though,
+and produces exactly **one image per document**: vvrd shows the first slide or page and nothing
+more. `qlmanage -p` does emit every slide, but only as WebKit-specific markup (unitless CSS
+lengths, `<img src="Attachment1.pdf">`) that no other engine renders correctly, and Word previews
+carry no page structure at all. The single page is announced with a `Notice` after `Opened` and a
+`Format` metadata row, so it never reads as a truncated document.
+
+Conversions are cached under the `state.rs` cache root, keyed by source path, length, and
+modification time, so the `--probe-document` preflight re-exec and the render thread that follows
+it share one `qlmanage` run, and `R`/F5 re-converts exactly when the source changes. The
+subprocess is bounded: stdio is null (vvrd owns the terminal), `VIVID_*` session material is
+scrubbed from its environment, artifacts are size-capped, the scratch directory is removed on every
+path, and a 15-second timeout is mandatory because `qlmanage` blocks indefinitely on a file with an
+Office extension but malformed contents rather than reporting failure. Off macOS the conversion
+returns an error naming Quick Look as the requirement.
 
 ### D6 — Input is pure PTY stdin
 Running under Vivido, vvrd is an ordinary terminal app from the PTY's view. Keyboard/mouse come
@@ -307,6 +334,7 @@ Modeled on kitpdf, with the Kitty layer swapped for a Vivid presenter layer.
 | `app.rs` | App state: page, scroll/zoom/pan, input mode, search, transforms, pixmap residency | port of kitpdf `app.rs` (near-verbatim; drops Kitty `ImageId`) |
 | `renderer.rs` | Backend dispatch and render thread: cache, search, TOC, metadata, links, reload, EPUB reflow, export, watchdog | MuPDF path from kitpdf plus native backend |
 | `markup/` | Owned Markdown IR, Letter pagination, text/image/SVG raster helpers, bundled Mona Sans/Monaspace fonts | adapted from Kitmd `45cb75f` |
+| `quicklook.rs` | macOS Office preview: extension classification, bounded `qlmanage` subprocess, mtime-keyed preview cache | — |
 | `mermaid_engine/` | Complete Rust Mermaid parser, validation, layout, and SVG renderer | copied from Kitmd `45cb75f` |
 | `compositor.rs` | Page pixmap + view transform → viewport RGBA buffer (crop/scale/highlight/crop-margins) | derived from kitpdf `image_pipeline.rs` + `compute_page_surface` |
 | `presenter.rs` | `Presenter` trait + `VividPresenter`: session, document surface, raster track + channel, scene node, frame send, resize, three recoveries, teardown | wraps `vivid_sdk` |
@@ -522,6 +550,7 @@ core design; §Verification calls out explicit tiled/floating-pane test cases.
 |---|---|
 | PDF & EPUB via MuPDF | Same MuPDF render thread |
 | Markdown and Mermaid | Native fixed 2040×2640 Letter `PagePlan`; Kitmd-derived renderer/engine |
+| PowerPoint and Word (new) | macOS Quick Look converts to a PNG that the MuPDF backend opens; first slide/page only |
 | Sharp zoom (re-render at resolution) | Render page at `viewport×zoom`; crop viewport region into framebuffer |
 | Vertical scroll + auto page-turn at bounds | Same `App` scroll logic; compositor crops at scroll offset |
 | Horizontal pan (zoom mode) | Compositor crops at pan offset |

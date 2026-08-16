@@ -6,6 +6,7 @@ mod geometry;
 mod markup;
 mod mermaid_engine;
 mod presenter;
+mod quicklook;
 mod renderer;
 mod semantic;
 mod state;
@@ -55,7 +56,7 @@ const LOADING_DELAY: Duration = Duration::from_millis(90);
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// PDF, EPUB, Markdown, or Mermaid document to read.
+    /// PDF, EPUB, Markdown, Mermaid, or (on macOS) PowerPoint or Word document to read.
     document: PathBuf,
 
     /// Page number to open (one-based; overrides saved state).
@@ -307,7 +308,7 @@ fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
 fn probe_document(path: &Path, theme: ThemeArg) -> anyhow::Result<()> {
     // The preflight child never talks Vivid, so it inherits no session material or endpoints.
     // VIVID_TOKEN is the retired 1.1 name and is scrubbed too, so a stale variable cannot leak.
-    let status = Command::new(std::env::current_exe()?)
+    let output = Command::new(std::env::current_exe()?)
         .arg("--probe-document")
         .arg("--theme")
         .arg(match theme {
@@ -323,11 +324,23 @@ fn probe_document(path: &Path, theme: ThemeArg) -> anyhow::Result<()> {
         .env_remove("VIVID_ENDPOINT_BULK")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        // Captured rather than discarded: the child's message is what distinguishes a corrupt file
+        // from a Quick Look preview that needs a logged-in macOS session. Never inherited, so the
+        // child cannot write to the terminal vvrd is about to take over.
+        .stderr(Stdio::piped())
+        .output()
         .context("cannot start document preflight")?;
-    if !status.success() {
-        bail!("document preflight failed for {}", path.display());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("Error: "))
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+        {
+            Some(reason) => bail!("{reason}"),
+            None => bail!("document preflight failed for {}", path.display()),
+        }
     }
     Ok(())
 }
