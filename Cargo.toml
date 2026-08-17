@@ -1,6 +1,6 @@
 [package]
 name = "vvrd"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.89"
@@ -22,7 +22,19 @@ vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 
 crossterm = "0.29"
-image = { version = "0.25", features = ["bmp", "gif", "ico", "jpeg", "png", "pnm", "qoi", "rayon", "tga", "tiff", "webp"], default-features = false }
+image = { version = "0.25", features = [
+  "bmp",
+  "gif",
+  "ico",
+  "jpeg",
+  "png",
+  "pnm",
+  "qoi",
+  "rayon",
+  "tga",
+  "tiff",
+  "webp",
+], default-features = false }
 rayon = { version = "1", default-features = false }
 base64 = "0.22"
 comrak = "0.52"
@@ -50,7 +62,14 @@ log = "0.4"
 flexi_logger = "0.31"
 libc = "0.2"
 
-mupdf_crates_io = { package = "mupdf", version = "0.8.0", default-features = false, features = ["svg", "system-fonts", "base14-fonts", "img", "html", "epub"] }
+mupdf_crates_io = { package = "mupdf", version = "0.8.0", default-features = false, features = [
+  "svg",
+  "system-fonts",
+  "base14-fonts",
+  "img",
+  "html",
+  "epub",
+] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal"] }
