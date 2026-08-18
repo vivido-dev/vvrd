@@ -71,6 +71,10 @@ struct Cli {
     #[arg(short = 'i', long)]
     invert: bool,
 
+    /// Landscape pages for Markdown, Mermaid, HTML, and EPUB documents.
+    #[arg(short = 'l', long)]
+    landscape: bool,
+
     /// Custom document black colour.
     #[arg(short = 'b', long = "black-color", default_value = "#000000")]
     black: String,
@@ -154,12 +158,12 @@ fn main() -> anyhow::Result<()> {
             &cli.document,
             cli.page.unwrap_or(1) - 1,
             WindowSize::from_cells(80, 24, 10, 20),
-            cli.theme.into(),
+            paper_style(&cli),
         )?;
         let _ = (rendered.page.width, rendered.page_num, rendered.n_pages);
         return Ok(());
     }
-    probe_document(&cli.document, cli.theme)?;
+    probe_document(&cli.document, cli.theme, cli.landscape)?;
 
     let black = parse_color(&cli.black)?;
     let white = parse_color(&cli.white)?;
@@ -179,7 +183,7 @@ fn main() -> anyhow::Result<()> {
             &cli.document,
             viewport,
             options.epub_font_size,
-            cli.theme.into(),
+            paper_style(&cli),
         )?;
         let page = initial_page.min(n_pages.saturating_sub(1));
         let output = export::next_export_path(&cli.document, page, n_pages)?;
@@ -190,7 +194,7 @@ fn main() -> anyhow::Result<()> {
             &options,
             &output,
             saved.auto_crop,
-            cli.theme.into(),
+            paper_style(&cli),
         )?;
         println!("{}", output.display());
         return Ok(());
@@ -275,7 +279,7 @@ fn main() -> anyhow::Result<()> {
         initial_page,
     )?;
     wait_for_presenter(&vivid)?;
-    let render = RenderThread::spawn(cli.document.clone(), viewport, cli.theme.into());
+    let render = RenderThread::spawn(cli.document.clone(), viewport, paper_style(&cli));
     wait_for_document(&render, &mut runtime)?;
     request_render(&render, &vivid, &mut runtime, black, white, interactive)?;
 
@@ -315,16 +319,28 @@ fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn probe_document(path: &Path, theme: ThemeArg) -> anyhow::Result<()> {
+fn paper_style(cli: &Cli) -> renderer::PaperStyle {
+    renderer::PaperStyle {
+        theme: cli.theme.into(),
+        landscape: cli.landscape,
+    }
+}
+
+fn probe_document(path: &Path, theme: ThemeArg, landscape: bool) -> anyhow::Result<()> {
     // The preflight child never talks Vivid, so it inherits no session material or endpoints.
     // VIVID_TOKEN is the retired 1.1 name and is scrubbed too, so a stale variable cannot leak.
-    let status = Command::new(std::env::current_exe()?)
+    let mut command = Command::new(std::env::current_exe()?);
+    command
         .arg("--probe-document")
         .arg("--theme")
         .arg(match theme {
             ThemeArg::Light => "light",
             ThemeArg::Dark => "dark",
-        })
+        });
+    if landscape {
+        command.arg("--landscape");
+    }
+    let status = command
         .arg(path)
         .env_remove("VIVID_ROOT_SECRET")
         .env_remove("VIVID_TOKEN")

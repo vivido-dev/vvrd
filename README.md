@@ -14,6 +14,7 @@ cargo build --release
 target/release/vvrd book.epub
 target/release/vvrd --page 12 paper.pdf
 target/release/vvrd --theme dark guide.md
+target/release/vvrd --landscape guide.md
 target/release/vvrd diagram.mmd
 target/release/vvrd deck.pptx
 target/release/vvrd --export paper.pdf
@@ -48,9 +49,10 @@ Reader state is saved per document in the platform cache directory. See
 Markdown supports GFM tables, strikethrough, task lists, autolinks, styled inline/code text,
 blockquotes, local raster/SVG/data-URI images, and fenced Mermaid. Remote images are represented by
 an in-page placeholder and are never fetched. `--theme light|dark` selects the Markdown/Mermaid
-paper theme (default: `light`); the existing invert, tint, colour mapping, rotation, crop, search,
-TOC, links, zoom/pan, state restore, and PNG export controls apply to markup pages too. A failed
-reload leaves the previous document visible.
+paper theme (default: `light`); `-l`/`--landscape` paginates Markdown and Mermaid onto landscape
+2640×2040 Letter pages and lays out reflowable HTML/EPUB wider than tall. The existing invert,
+tint, colour mapping, rotation, crop, search, TOC, links, zoom/pan, state restore, and PNG export
+controls apply to markup pages too. A failed reload leaves the previous document visible.
 
 PPTX, DOCX, ODP, and ODT documents require LibreOffice. vvrd locates the `soffice` launcher on
 `PATH` or in the standard install location per platform (override with `VVRD_SOFFICE`), prints a

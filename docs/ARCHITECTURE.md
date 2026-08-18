@@ -184,8 +184,9 @@ conversion step, which runs a bounded headless LibreOffice (`office.rs`) to prod
 by source content hash and then opens that PDF through the unchanged MuPDF path; everything else
 follows the unchanged MuPDF path directly. Markup
 layout is independent of terminal dimensions: every logical page is 2040×2640 (portrait Letter at
-240 DPI) with 180-pixel margins. Normal presentation contain-fits that page into the viewport;
-zoom mode crops a bounded higher-resolution copy.
+240 DPI, swapped to 2640×2040 by `-l`/`--landscape`) with 180-pixel margins. Normal presentation
+contain-fits that page into the viewport; zoom mode crops a bounded higher-resolution copy. The
+same flag widens the MuPDF reflow layout for HTML/EPUB documents.
 
 Markdown is parsed by Comrak with the GFM table, strikethrough, task-list, and autolink extensions.
 The arena AST is copied into an owned block IR. Pagination keeps blocks together when possible,

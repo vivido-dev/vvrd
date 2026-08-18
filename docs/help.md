@@ -12,6 +12,7 @@ vvrd [OPTIONS] <DOCUMENT>
 -p, --page N             open one-based page N instead of the saved page
 -e, --export             export one page as PNG and exit
 -i, --invert             start inverted
+-l, --landscape          landscape pages for Markdown/Mermaid and HTML/EPUB
 -b, --black-color CSS    custom document black
 -w, --white-color CSS    custom document white
     --theme light|dark   Markdown/Mermaid paper theme (default: light)
@@ -31,8 +32,9 @@ converted PDFs cache under the platform cache directory, or `VVRD_OFFICE_CACHE`)
 like any PDF. Without LibreOffice, vvrd prints a warning and exits.
 
 `.md`, `.markdown`, and `.mkd` files are block-aware paginated onto portrait 2040×2640 Letter
-pages with 180-pixel margins. `.mmd` and `.mermaid` files are contain-fitted and centred on one
-Letter page. Markdown includes GFM tables/task lists/autolinks/strikethrough, local raster/SVG/data
+pages with 180-pixel margins (landscape 2640×2040 with `-l`). `.mmd` and `.mermaid` files are
+contain-fitted and centred on one Letter page. Markdown includes GFM tables/task
+lists/autolinks/strikethrough, local raster/SVG/data
 URI images, and fenced Mermaid; it never fetches remote images. `R`/F5 atomically rereads source
 and local assets. If parsing or pagination fails, the prior document remains visible.
 

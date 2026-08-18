@@ -33,11 +33,47 @@ use crate::{
     renderer::{LinkInfo, TocEntry},
 };
 
-pub const PAGE_WIDTH: u32 = 2_040;
-pub const PAGE_HEIGHT: u32 = 2_640;
-pub const PAGE_MARGIN: u32 = 180;
-pub const CONTENT_WIDTH: u32 = PAGE_WIDTH - PAGE_MARGIN * 2;
-pub const CONTENT_HEIGHT: u32 = PAGE_HEIGHT - PAGE_MARGIN * 2;
+/// Fixed paper geometry for markup pages: portrait Letter by default, swapped when landscape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageGeometry {
+    /// Paper width in pixels.
+    pub width: u32,
+    /// Paper height in pixels.
+    pub height: u32,
+    /// Uniform paper margin in pixels.
+    pub margin: u32,
+}
+
+impl PageGeometry {
+    /// Portrait Letter at 240 DPI: 8.5in × 11in.
+    pub const PORTRAIT: Self = Self {
+        width: 2_040,
+        height: 2_640,
+        margin: 180,
+    };
+    /// Landscape Letter at 240 DPI: 11in × 8.5in.
+    pub const LANDSCAPE: Self = Self {
+        width: 2_640,
+        height: 2_040,
+        margin: 180,
+    };
+
+    fn for_orientation(landscape: bool) -> Self {
+        if landscape {
+            Self::LANDSCAPE
+        } else {
+            Self::PORTRAIT
+        }
+    }
+
+    fn content_width(&self) -> u32 {
+        self.width - self.margin * 2
+    }
+
+    fn content_height(&self) -> u32 {
+        self.height - self.margin * 2
+    }
+}
 
 pub const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ASSET_BYTES: usize = 32 * 1024 * 1024;
@@ -70,6 +106,7 @@ pub struct MarkupDocument {
     kind: MarkupKind,
     theme_mode: ThemeMode,
     theme: RenderTheme,
+    geometry: PageGeometry,
     blocks: Vec<Block>,
     pages: Vec<PlannedPage>,
     toc: Vec<TocEntry>,
@@ -171,6 +208,14 @@ struct OwnedLink {
     href: String,
 }
 
+/// Owner-facing semantics attached to a visual before it is fitted to the page.
+#[derive(Debug, Clone)]
+struct VisualSemantics {
+    alt: String,
+    text: String,
+    links: Vec<OwnedLink>,
+}
+
 #[derive(Debug, Clone)]
 struct Heading {
     title: String,
@@ -186,7 +231,12 @@ struct ImageSpec {
 }
 
 impl MarkupDocument {
-    pub fn open(path: &Path, kind: MarkupKind, theme_mode: ThemeMode) -> Result<Self> {
+    pub fn open(
+        path: &Path,
+        kind: MarkupKind,
+        theme_mode: ThemeMode,
+        landscape: bool,
+    ) -> Result<Self> {
         let source = read_bounded(path, MAX_SOURCE_BYTES)
             .with_context(|| format!("cannot read {}", path.display()))?;
         let source = String::from_utf8(source).context("markup source is not valid UTF-8")?;
@@ -198,6 +248,7 @@ impl MarkupDocument {
                 .unwrap_or("document"),
             kind,
             theme_mode,
+            landscape,
         )
     }
 
@@ -207,14 +258,16 @@ impl MarkupDocument {
         fallback_title: &str,
         kind: MarkupKind,
         theme_mode: ThemeMode,
+        landscape: bool,
     ) -> Result<Self> {
         ensure!(
             source.len() <= MAX_SOURCE_BYTES,
             "markup source exceeds the 16 MiB limit"
         );
         let theme = RenderTheme::for_mode(theme_mode);
+        let geometry = PageGeometry::for_orientation(landscape);
         let (mut blocks, title) = match kind {
-            MarkupKind::Markdown => parse_markdown(source, base_dir, fallback_title)?,
+            MarkupKind::Markdown => parse_markdown(source, base_dir, fallback_title, geometry)?,
             MarkupKind::Mermaid => {
                 let svg = render_mermaid_svg(source)
                     .context("standalone Mermaid source failed preflight")?;
@@ -224,10 +277,13 @@ impl MarkupDocument {
                     VisualSource::MermaidSvg(svg),
                     width,
                     height,
-                    fallback_title.to_owned(),
-                    semantics.0.clone(),
-                    semantics.1,
+                    VisualSemantics {
+                        alt: fallback_title.to_owned(),
+                        text: semantics.0.clone(),
+                        links: semantics.1,
+                    },
                     None,
+                    geometry,
                 );
                 (
                     vec![Block {
@@ -261,11 +317,11 @@ impl MarkupDocument {
         }
 
         let mut measurer = TextRenderer::new();
-        let mut pages = paginate(&blocks, &theme, &mut measurer)?;
+        let mut pages = paginate(&blocks, &theme, &mut measurer, geometry)?;
         if kind == MarkupKind::Mermaid
             && let Some(item) = pages.first_mut().and_then(|page| page.items.first_mut())
         {
-            item.y = PAGE_HEIGHT.saturating_sub(item.height) / 2;
+            item.y = geometry.height.saturating_sub(item.height) / 2;
         }
         let mut slug_pages = HashMap::new();
         let mut toc = Vec::new();
@@ -305,6 +361,7 @@ impl MarkupDocument {
             kind,
             theme_mode,
             theme,
+            geometry,
             blocks,
             pages,
             toc,
@@ -354,13 +411,18 @@ impl MarkupDocument {
             .pages
             .get(page)
             .ok_or_else(|| anyhow!("page {} is out of range", page + 1))?;
-        let mut canvas = Canvas::new(PAGE_WIDTH, PAGE_HEIGHT, self.theme.background);
+        let mut canvas = Canvas::new(
+            self.geometry.width,
+            self.geometry.height,
+            self.theme.background,
+        );
         let mut text_renderer = TextRenderer::new();
         let mut highlights = Vec::new();
         for item in &page.items {
             let block = &self.blocks[item.block];
             let image = self.render_item(block, &item.units, &mut text_renderer)?;
-            let x = PAGE_MARGIN + CONTENT_WIDTH.saturating_sub(image.width()) / 2;
+            let x = self.geometry.margin
+                + self.geometry.content_width().saturating_sub(image.width()) / 2;
             canvas.overlay(x as i32, item.y as i32, &image);
             if search_term.is_some_and(|term| contains_case_insensitive(&block.text, term)) {
                 let occurrences =
@@ -368,8 +430,8 @@ impl MarkupDocument {
                 highlights.extend((0..occurrences).map(|_| crate::compositor::HighlightRect {
                     x0: x,
                     y0: item.y,
-                    x1: x.saturating_add(image.width()).min(PAGE_WIDTH),
-                    y1: item.y.saturating_add(item.height).min(PAGE_HEIGHT),
+                    x1: x.saturating_add(image.width()).min(self.geometry.width),
+                    y1: item.y.saturating_add(item.height).min(self.geometry.height),
                 }));
             }
         }
@@ -388,7 +450,13 @@ impl MarkupDocument {
         match &block.kind {
             BlockKind::Text(block) => {
                 let spans = joined_lines(&block.lines[units.clone()]);
-                Ok(render_text(text, &spans, block.style, &self.theme))
+                Ok(render_text(
+                    text,
+                    &spans,
+                    block.style,
+                    &self.theme,
+                    self.geometry,
+                ))
             }
             BlockKind::List(block) => {
                 let spans = joined_lines(&block.lines[units.clone()]);
@@ -397,17 +465,21 @@ impl MarkupDocument {
                     &spans,
                     TextBlockStyle::Prose,
                     &self.theme,
+                    self.geometry,
                 ))
             }
-            BlockKind::Table(table) => render_table(text, table, units.clone(), &self.theme),
+            BlockKind::Table(table) => {
+                render_table(text, table, units.clone(), &self.theme, self.geometry)
+            }
             BlockKind::Visual(visual) => self.render_visual(visual),
             BlockKind::Rule => {
-                let mut canvas = Canvas::new(CONTENT_WIDTH, 32, self.theme.background);
-                canvas.fill_rect(0, 15, CONTENT_WIDTH, 2, self.theme.border);
+                let mut canvas =
+                    Canvas::new(self.geometry.content_width(), 32, self.theme.background);
+                canvas.fill_rect(0, 15, self.geometry.content_width(), 2, self.theme.border);
                 Ok(canvas.into_image())
             }
             BlockKind::Blank => Ok(RgbaImage::from_pixel(
-                CONTENT_WIDTH,
+                self.geometry.content_width(),
                 1,
                 self.theme.background,
             )),
@@ -449,18 +521,20 @@ impl MarkupDocument {
                     _ => "",
                 },
                 &error,
-                CONTENT_WIDTH,
+                self.geometry.content_width(),
                 self.theme_mode,
             ),
-            Err(error) => render_placeholder(&visual.alt, &error.to_string(), &self.theme),
+            Err(error) => {
+                render_placeholder(&visual.alt, &error.to_string(), &self.theme, self.geometry)
+            }
         };
         let image = fit_raster(&image, max_width, max_height);
         let mut canvas = Canvas::new(
-            CONTENT_WIDTH,
+            self.geometry.content_width(),
             image.height().saturating_add(18),
             self.theme.background,
         );
-        let x = CONTENT_WIDTH.saturating_sub(image.width()) / 2;
+        let x = self.geometry.content_width().saturating_sub(image.width()) / 2;
         canvas.overlay(x as i32, 9, &image);
         Ok(canvas.into_image())
     }
@@ -475,12 +549,14 @@ fn parse_markdown(
     input: &str,
     base_dir: &Path,
     fallback_title: &str,
+    geometry: PageGeometry,
 ) -> Result<(Vec<Block>, String)> {
     let arena = Arena::new();
     let rewritten = preprocess_markdown_image_width_syntax(input);
     let root = parse_document(&arena, &rewritten, &comrak_options());
     let mut parser = MarkdownParser {
         base_dir,
+        geometry,
         blocks: Vec::new(),
         slug_counts: HashMap::new(),
         first_heading: None,
@@ -508,6 +584,7 @@ fn comrak_options() -> Options<'static> {
 
 struct MarkdownParser<'a> {
     base_dir: &'a Path,
+    geometry: PageGeometry,
     blocks: Vec<Block>,
     slug_counts: HashMap<String, usize>,
     first_heading: Option<String>,
@@ -529,7 +606,10 @@ impl MarkdownParser<'_> {
                 for span in &mut styled {
                     span.span.style.bold = true;
                 }
-                let lines = wrap_inline(styled.clone(), heading_char_budget(heading.level));
+                let lines = wrap_inline(
+                    styled.clone(),
+                    heading_char_budget(heading.level, self.geometry),
+                );
                 self.blocks.push(Block {
                     text: title.clone(),
                     links: inline_links(&styled),
@@ -547,7 +627,7 @@ impl MarkdownParser<'_> {
             NodeValue::Paragraph => self.parse_paragraph(node)?,
             NodeValue::CodeBlock(code) => {
                 if code.info.trim().eq_ignore_ascii_case("mermaid") {
-                    let visual = embedded_mermaid(&code.literal);
+                    let visual = embedded_mermaid(&code.literal, self.geometry);
                     self.blocks.push(Block {
                         text: visual.semantic_text.clone(),
                         links: visual.links.clone(),
@@ -571,7 +651,7 @@ impl MarkdownParser<'_> {
                         links: Vec::new(),
                         heading: None,
                         kind: BlockKind::Text(TextBlock {
-                            lines: wrap_inline(inline, code_char_budget()),
+                            lines: wrap_inline(inline, code_char_budget(self.geometry)),
                             style: TextBlockStyle::Code,
                         }),
                     });
@@ -590,7 +670,10 @@ impl MarkdownParser<'_> {
                     links: inline_links(&inline),
                     heading: None,
                     kind: BlockKind::Text(TextBlock {
-                        lines: wrap_inline(inline, prose_char_budget().saturating_sub(4)),
+                        lines: wrap_inline(
+                            inline,
+                            prose_char_budget(self.geometry).saturating_sub(4),
+                        ),
                         style: TextBlockStyle::Quote,
                     }),
                 });
@@ -619,7 +702,7 @@ impl MarkdownParser<'_> {
                         links: Vec::new(),
                         heading: None,
                         kind: BlockKind::Text(TextBlock {
-                            lines: wrap_inline(inline, code_char_budget()),
+                            lines: wrap_inline(inline, code_char_budget(self.geometry)),
                             style: TextBlockStyle::Code,
                         }),
                     });
@@ -660,14 +743,14 @@ impl MarkdownParser<'_> {
             links: inline_links(&inline),
             heading: None,
             kind: BlockKind::Text(TextBlock {
-                lines: wrap_inline(inline, prose_char_budget()),
+                lines: wrap_inline(inline, prose_char_budget(self.geometry)),
                 style: TextBlockStyle::Prose,
             }),
         });
     }
 
     fn push_visual(&mut self, spec: ImageSpec) -> Result<()> {
-        let visual = image_visual(spec, self.base_dir)?;
+        let visual = image_visual(spec, self.base_dir, self.geometry)?;
         self.blocks.push(Block {
             text: visual.semantic_text.clone(),
             links: visual.links.clone(),
@@ -708,7 +791,10 @@ impl MarkdownParser<'_> {
                 text.push('\n');
             }
             text.push_str(&plain);
-            lines.extend(wrap_inline(inline, prose_char_budget().saturating_sub(4)));
+            lines.extend(wrap_inline(
+                inline,
+                prose_char_budget(self.geometry).saturating_sub(4),
+            ));
         }
         self.blocks.push(Block {
             text,
@@ -730,7 +816,11 @@ impl MarkdownParser<'_> {
             .unwrap_or(1)
             .max(alignments.len())
             .max(1);
-        let widths = measured_column_widths(&rows, columns, CONTENT_WIDTH - columns as u32 - 1);
+        let widths = measured_column_widths(
+            &rows,
+            columns,
+            self.geometry.content_width() - columns as u32 - 1,
+        );
         let row_heights = rows
             .iter()
             .map(|row| table_row_height(row, &widths))
@@ -1034,45 +1124,53 @@ fn paginate(
     blocks: &[Block],
     theme: &RenderTheme,
     text: &mut TextRenderer,
+    geometry: PageGeometry,
 ) -> Result<Vec<PlannedPage>> {
     let mut pages = vec![PlannedPage {
         items: Vec::new(),
         text: String::new(),
         links: Vec::new(),
     }];
-    let mut y = PAGE_MARGIN;
+    let mut y = geometry.margin;
     for (block_index, block) in blocks.iter().enumerate() {
         let units = block_unit_count(block).max(1);
-        let full_height = block_height(block, 0..units, theme, text);
-        let remaining = PAGE_HEIGHT.saturating_sub(PAGE_MARGIN).saturating_sub(y);
+        let full_height = block_height(block, 0..units, theme, text, geometry);
+        let remaining = geometry
+            .height
+            .saturating_sub(geometry.margin)
+            .saturating_sub(y);
         let keep_with_next = block.heading.is_some()
             && blocks.get(block_index + 1).is_some_and(|next| {
                 let next_units = block_unit_count(next).max(1);
                 full_height
                     .saturating_add(BLOCK_GAP)
-                    .saturating_add(block_height(next, 0..next_units, theme, text))
-                    <= CONTENT_HEIGHT
+                    .saturating_add(block_height(next, 0..next_units, theme, text, geometry))
+                    <= geometry.content_height()
             });
         if keep_with_next
             && blocks.get(block_index + 1).is_some_and(|next| {
                 let next_units = block_unit_count(next).max(1);
                 full_height
                     .saturating_add(BLOCK_GAP)
-                    .saturating_add(block_height(next, 0..next_units, theme, text))
+                    .saturating_add(block_height(next, 0..next_units, theme, text, geometry))
                     > remaining
             })
             && !pages.last().unwrap().items.is_empty()
         {
             push_page(&mut pages)?;
-            y = PAGE_MARGIN;
+            y = geometry.margin;
         }
 
-        if full_height <= CONTENT_HEIGHT {
-            if full_height > PAGE_HEIGHT.saturating_sub(PAGE_MARGIN).saturating_sub(y)
+        if full_height <= geometry.content_height() {
+            if full_height
+                > geometry
+                    .height
+                    .saturating_sub(geometry.margin)
+                    .saturating_sub(y)
                 && !pages.last().unwrap().items.is_empty()
             {
                 push_page(&mut pages)?;
-                y = PAGE_MARGIN;
+                y = geometry.margin;
             }
             place_item(&mut pages, block_index, 0..units, y, full_height);
             y = y.saturating_add(full_height).saturating_add(BLOCK_GAP);
@@ -1081,26 +1179,35 @@ fn paginate(
 
         let mut start = 0usize;
         while start < units {
-            if PAGE_HEIGHT.saturating_sub(PAGE_MARGIN).saturating_sub(y)
-                < minimum_unit_height(block, theme, text)
+            if geometry
+                .height
+                .saturating_sub(geometry.margin)
+                .saturating_sub(y)
+                < minimum_unit_height(block, theme, text, geometry)
                 && !pages.last().unwrap().items.is_empty()
             {
                 push_page(&mut pages)?;
-                y = PAGE_MARGIN;
+                y = geometry.margin;
             }
-            let available = PAGE_HEIGHT.saturating_sub(PAGE_MARGIN).saturating_sub(y);
+            let available = geometry
+                .height
+                .saturating_sub(geometry.margin)
+                .saturating_sub(y);
             let mut end = start + 1;
-            while end <= units && block_height(block, start..end, theme, text) <= available {
+            while end <= units
+                && block_height(block, start..end, theme, text, geometry) <= available
+            {
                 end += 1;
             }
             let end = end.saturating_sub(1).max(start + 1).min(units);
-            let height = block_height(block, start..end, theme, text).min(CONTENT_HEIGHT);
+            let height = block_height(block, start..end, theme, text, geometry)
+                .min(geometry.content_height());
             place_item(&mut pages, block_index, start..end, y, height);
             start = end;
             y = y.saturating_add(height).saturating_add(BLOCK_GAP);
             if start < units {
                 push_page(&mut pages)?;
-                y = PAGE_MARGIN;
+                y = geometry.margin;
             }
         }
     }
@@ -1146,29 +1253,44 @@ fn block_height(
     units: Range<usize>,
     theme: &RenderTheme,
     text: &mut TextRenderer,
+    geometry: PageGeometry,
 ) -> u32 {
     match &block.kind {
-        BlockKind::Text(block) => {
-            measure_text(text, &joined_lines(&block.lines[units]), block.style, theme)
-        }
+        BlockKind::Text(block) => measure_text(
+            text,
+            &joined_lines(&block.lines[units]),
+            block.style,
+            theme,
+            geometry,
+        ),
         BlockKind::List(block) => measure_text(
             text,
             &joined_lines(&block.lines[units]),
             TextBlockStyle::Prose,
             theme,
+            geometry,
         ),
-        BlockKind::Table(table) => table_fragment_height(table, units),
+        BlockKind::Table(table) => table_fragment_height(table, units, geometry),
         BlockKind::Visual(visual) => visual.render_height.saturating_add(18),
         BlockKind::Rule => 32,
         BlockKind::Blank => 1,
     }
 }
 
-fn minimum_unit_height(block: &Block, theme: &RenderTheme, text: &mut TextRenderer) -> u32 {
-    block_height(block, 0..1, theme, text).min(CONTENT_HEIGHT)
+fn minimum_unit_height(
+    block: &Block,
+    theme: &RenderTheme,
+    text: &mut TextRenderer,
+    geometry: PageGeometry,
+) -> u32 {
+    block_height(block, 0..1, theme, text, geometry).min(geometry.content_height())
 }
 
-fn text_options(style: TextBlockStyle, theme: &RenderTheme) -> TextBlockOptions {
+fn text_options(
+    style: TextBlockStyle,
+    theme: &RenderTheme,
+    geometry: PageGeometry,
+) -> TextBlockOptions {
     let (font_size, line_height, padding_x, padding_y, background, default_color) = match style {
         TextBlockStyle::Prose => (
             PROSE_FONT_SIZE,
@@ -1200,7 +1322,7 @@ fn text_options(style: TextBlockStyle, theme: &RenderTheme) -> TextBlockOptions 
         TextBlockStyle::Error => (27.0, 38.0, 24, 18, theme.error_bg, theme.error_text),
     };
     TextBlockOptions {
-        width: CONTENT_WIDTH,
+        width: geometry.content_width(),
         padding_x,
         padding_y,
         font_size,
@@ -1218,8 +1340,9 @@ fn measure_text(
     spans: &[TextSpan],
     style: TextBlockStyle,
     theme: &RenderTheme,
+    geometry: PageGeometry,
 ) -> u32 {
-    renderer.measure_text_block(spans, &text_options(style, theme))
+    renderer.measure_text_block(spans, &text_options(style, theme, geometry))
 }
 
 fn render_text(
@@ -1227,10 +1350,11 @@ fn render_text(
     spans: &[TextSpan],
     style: TextBlockStyle,
     theme: &RenderTheme,
+    geometry: PageGeometry,
 ) -> RgbaImage {
-    let image = renderer.render_text_block(spans, &text_options(style, theme));
+    let image = renderer.render_text_block(spans, &text_options(style, theme, geometry));
     if style == TextBlockStyle::Quote {
-        let mut canvas = Canvas::new(CONTENT_WIDTH, image.height(), theme.background);
+        let mut canvas = Canvas::new(geometry.content_width(), image.height(), theme.background);
         canvas.fill_rect(0, 0, 5, image.height(), theme.blockquote_bar);
         canvas.overlay(10, 0, &image);
         canvas.into_image()
@@ -1295,7 +1419,11 @@ fn table_row_height(row: &[Vec<InlineSpan>], widths: &[u32]) -> u32 {
         .unwrap_or(50)
 }
 
-fn table_fragment_height(table: &TableBlock, body_units: Range<usize>) -> u32 {
+fn table_fragment_height(
+    table: &TableBlock,
+    body_units: Range<usize>,
+    geometry: PageGeometry,
+) -> u32 {
     let header = table.row_heights.first().copied().unwrap_or(1);
     let body_start = if table.rows.len() > 1 {
         body_units.start + 1
@@ -1313,7 +1441,7 @@ fn table_fragment_height(table: &TableBlock, body_units: Range<usize>) -> u32 {
     header
         .saturating_add(body)
         .saturating_add(3)
-        .min(CONTENT_HEIGHT)
+        .min(geometry.content_height())
 }
 
 fn render_table(
@@ -1321,14 +1449,15 @@ fn render_table(
     table: &TableBlock,
     body_units: Range<usize>,
     theme: &RenderTheme,
+    geometry: PageGeometry,
 ) -> Result<RgbaImage> {
     let mut row_indices = vec![0usize];
     if table.rows.len() > 1 {
         row_indices.extend((body_units.start + 1)..(body_units.end + 1).min(table.rows.len()));
     }
-    let height = table_fragment_height(table, body_units);
+    let height = table_fragment_height(table, body_units, geometry);
     let table_width = table.widths.iter().sum::<u32>() + table.widths.len() as u32 + 1;
-    let mut canvas = Canvas::new(CONTENT_WIDTH, height, theme.background);
+    let mut canvas = Canvas::new(geometry.content_width(), height, theme.background);
     canvas.stroke_rect(0, 0, table_width, height, theme.border);
     let mut y = 1i32;
     for (visible_row, row_index) in row_indices.into_iter().enumerate() {
@@ -1344,7 +1473,7 @@ fn render_table(
             };
             canvas.fill_rect(x, y, width, row_height, background);
             let cell = row.get(column).cloned().unwrap_or_default();
-            let mut opts = text_options(TextBlockStyle::Prose, theme);
+            let mut opts = text_options(TextBlockStyle::Prose, theme, geometry);
             opts.width = width;
             opts.padding_x = 8;
             opts.padding_y = 7;
@@ -1364,13 +1493,14 @@ fn render_table(
     Ok(canvas.into_image())
 }
 
-fn image_visual(spec: ImageSpec, base_dir: &Path) -> Result<VisualBlock> {
+fn image_visual(spec: ImageSpec, base_dir: &Path, geometry: PageGeometry) -> Result<VisualBlock> {
     let lower = spec.url.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
         return Ok(placeholder_visual(
             spec.alt,
             spec.url,
             "remote images are not supported".to_owned(),
+            geometry,
         ));
     }
     if lower.starts_with("data:image/") {
@@ -1379,12 +1509,15 @@ fn image_visual(spec: ImageSpec, base_dir: &Path) -> Result<VisualBlock> {
                 VisualSource::DataUri(spec.url),
                 width,
                 height,
-                spec.alt.clone(),
-                spec.alt,
-                Vec::new(),
+                VisualSemantics {
+                    alt: spec.alt.clone(),
+                    text: spec.alt,
+                    links: Vec::new(),
+                },
                 spec.width_px,
+                geometry,
             ),
-            Err(error) => placeholder_visual(spec.alt, spec.url, error.to_string()),
+            Err(error) => placeholder_visual(spec.alt, spec.url, error.to_string(), geometry),
         });
     }
     let path_part = spec.url.split(['#', '?']).next().unwrap_or(&spec.url);
@@ -1397,7 +1530,12 @@ fn image_visual(spec: ImageSpec, base_dir: &Path) -> Result<VisualBlock> {
     let bytes = match read_bounded(&path, MAX_ASSET_BYTES) {
         Ok(bytes) => bytes,
         Err(error) => {
-            return Ok(placeholder_visual(spec.alt, spec.url, error.to_string()));
+            return Ok(placeholder_visual(
+                spec.alt,
+                spec.url,
+                error.to_string(),
+                geometry,
+            ));
         }
     };
     let svg = path
@@ -1420,16 +1558,24 @@ fn image_visual(spec: ImageSpec, base_dir: &Path) -> Result<VisualBlock> {
             },
             width,
             height,
-            spec.alt.clone(),
-            spec.alt,
-            Vec::new(),
+            VisualSemantics {
+                alt: spec.alt.clone(),
+                text: spec.alt,
+                links: Vec::new(),
+            },
             spec.width_px,
+            geometry,
         )),
-        Err(error) => Ok(placeholder_visual(spec.alt, spec.url, error.to_string())),
+        Err(error) => Ok(placeholder_visual(
+            spec.alt,
+            spec.url,
+            error.to_string(),
+            geometry,
+        )),
     }
 }
 
-fn embedded_mermaid(source: &str) -> VisualBlock {
+fn embedded_mermaid(source: &str, geometry: PageGeometry) -> VisualBlock {
     match render_mermaid_svg(source) {
         Ok(svg) => match svg_dimensions(&svg) {
             Ok((width, height)) => {
@@ -1438,16 +1584,20 @@ fn embedded_mermaid(source: &str) -> VisualBlock {
                     VisualSource::Mermaid(source.to_owned()),
                     width,
                     height,
-                    "Mermaid diagram".to_owned(),
-                    text,
-                    links,
+                    VisualSemantics {
+                        alt: "Mermaid diagram".to_owned(),
+                        text,
+                        links,
+                    },
                     None,
+                    geometry,
                 )
             }
             Err(error) => placeholder_visual(
                 "Mermaid diagram".to_owned(),
                 source.to_owned(),
                 error.to_string(),
+                geometry,
             ),
         },
         Err(error) => {
@@ -1455,12 +1605,12 @@ fn embedded_mermaid(source: &str) -> VisualBlock {
                 .saturating_add(3)
                 .saturating_mul(CODE_LINE_HEIGHT as u32)
                 .saturating_add(36)
-                .min(CONTENT_HEIGHT);
+                .min(geometry.content_height());
             VisualBlock {
                 source: VisualSource::Mermaid(source.to_owned()),
-                natural_width: CONTENT_WIDTH,
+                natural_width: geometry.content_width(),
                 natural_height: height,
-                render_width: CONTENT_WIDTH,
+                render_width: geometry.content_width(),
                 render_height: height,
                 alt: "Mermaid diagram".to_owned(),
                 semantic_text: format!("Mermaid render failed: {error}"),
@@ -1470,12 +1620,17 @@ fn embedded_mermaid(source: &str) -> VisualBlock {
     }
 }
 
-fn placeholder_visual(alt: String, source: String, message: String) -> VisualBlock {
+fn placeholder_visual(
+    alt: String,
+    source: String,
+    message: String,
+    geometry: PageGeometry,
+) -> VisualBlock {
     VisualBlock {
         source: VisualSource::Placeholder { source, message },
-        natural_width: CONTENT_WIDTH,
+        natural_width: geometry.content_width(),
         natural_height: 180,
-        render_width: CONTENT_WIDTH,
+        render_width: geometry.content_width(),
         render_height: 180,
         semantic_text: alt.clone(),
         alt,
@@ -1487,16 +1642,15 @@ fn visual_with_fit(
     source: VisualSource,
     width: u32,
     height: u32,
-    alt: String,
-    semantic_text: String,
-    links: Vec<OwnedLink>,
+    semantics: VisualSemantics,
     requested_width: Option<u32>,
+    geometry: PageGeometry,
 ) -> VisualBlock {
     let width_limit = requested_width
-        .unwrap_or(CONTENT_WIDTH)
-        .clamp(1, CONTENT_WIDTH);
+        .unwrap_or(geometry.content_width())
+        .clamp(1, geometry.content_width());
     let scale = (width_limit as f64 / width as f64)
-        .min(CONTENT_HEIGHT as f64 / height as f64)
+        .min(geometry.content_height() as f64 / height as f64)
         .min(1.0);
     let render_width = ((width as f64 * scale).round() as u32).max(1);
     let render_height = ((height as f64 * scale).round() as u32).max(1);
@@ -1506,13 +1660,18 @@ fn visual_with_fit(
         natural_height: height,
         render_width,
         render_height,
-        alt,
-        semantic_text,
-        links,
+        alt: semantics.alt,
+        semantic_text: semantics.text,
+        links: semantics.links,
     }
 }
 
-fn render_placeholder(alt: &str, message: &str, theme: &RenderTheme) -> RgbaImage {
+fn render_placeholder(
+    alt: &str,
+    message: &str,
+    theme: &RenderTheme,
+    geometry: PageGeometry,
+) -> RgbaImage {
     let spans = vec![
         TextSpan {
             text: if alt.is_empty() {
@@ -1533,7 +1692,10 @@ fn render_placeholder(alt: &str, message: &str, theme: &RenderTheme) -> RgbaImag
             },
         },
     ];
-    TextRenderer::new().render_text_block(&spans, &text_options(TextBlockStyle::Error, theme))
+    TextRenderer::new().render_text_block(
+        &spans,
+        &text_options(TextBlockStyle::Error, theme, geometry),
+    )
 }
 
 fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
@@ -1793,15 +1955,15 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
     !needle.is_empty() && haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
-fn prose_char_budget() -> usize {
-    (CONTENT_WIDTH as f32 / (PROSE_FONT_SIZE * 0.62)) as usize
+fn prose_char_budget(geometry: PageGeometry) -> usize {
+    (geometry.content_width() as f32 / (PROSE_FONT_SIZE * 0.62)) as usize
 }
 
-fn code_char_budget() -> usize {
-    (CONTENT_WIDTH as f32 / (CODE_FONT_SIZE * 0.62)) as usize
+fn code_char_budget(geometry: PageGeometry) -> usize {
+    (geometry.content_width() as f32 / (CODE_FONT_SIZE * 0.62)) as usize
 }
 
-fn heading_char_budget(level: u8) -> usize {
+fn heading_char_budget(level: u8, geometry: PageGeometry) -> usize {
     let size = match level {
         1 => 57.0,
         2 => 48.0,
@@ -1809,7 +1971,7 @@ fn heading_char_budget(level: u8) -> usize {
         4 => 35.0,
         _ => 31.0,
     };
-    (CONTENT_WIDTH as f32 / (size * 0.62)) as usize
+    (geometry.content_width() as f32 / (size * 0.62)) as usize
 }
 
 fn parse_markdown_image_spec(raw: &str) -> ImageSpec {
@@ -2038,18 +2200,48 @@ mod tests {
             "test",
             MarkupKind::Markdown,
             ThemeMode::Light,
+            false,
         )
         .unwrap()
     }
 
     #[test]
     fn letter_geometry_and_empty_document_are_stable() {
-        assert_eq!((PAGE_WIDTH, PAGE_HEIGHT, PAGE_MARGIN), (2040, 2640, 180));
+        assert_eq!(
+            (
+                PageGeometry::PORTRAIT.width,
+                PageGeometry::PORTRAIT.height,
+                PageGeometry::PORTRAIT.margin
+            ),
+            (2040, 2640, 180)
+        );
         let document = document("");
         assert_eq!(document.page_count(), 1);
         assert_eq!(
             document.render_page(0, None).unwrap().image.dimensions(),
-            (PAGE_WIDTH, PAGE_HEIGHT)
+            (PageGeometry::PORTRAIT.width, PageGeometry::PORTRAIT.height)
+        );
+    }
+
+    #[test]
+    fn landscape_swaps_the_letter_page_and_widens_the_content_box() {
+        let document = MarkupDocument::parse(
+            "# Wide\n\ntext",
+            Path::new("."),
+            "test",
+            MarkupKind::Markdown,
+            ThemeMode::Light,
+            true,
+        )
+        .unwrap();
+        assert_eq!(document.geometry, PageGeometry::LANDSCAPE);
+        assert_eq!(document.geometry.content_width(), 2_640 - 180 * 2);
+        assert_eq!(
+            document.render_page(0, None).unwrap().image.dimensions(),
+            (
+                PageGeometry::LANDSCAPE.width,
+                PageGeometry::LANDSCAPE.height
+            )
         );
     }
 
@@ -2073,6 +2265,7 @@ mod tests {
             "guide",
             MarkupKind::Markdown,
             ThemeMode::Light,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -2129,7 +2322,7 @@ mod tests {
         assert_eq!(document.page_count(), 1);
         assert_eq!(
             document.render_page(0, None).unwrap().image.dimensions(),
-            (PAGE_WIDTH, PAGE_HEIGHT)
+            (PageGeometry::PORTRAIT.width, PageGeometry::PORTRAIT.height)
         );
     }
 
@@ -2148,7 +2341,8 @@ mod tests {
                 Path::new("."),
                 "bad",
                 MarkupKind::Mermaid,
-                ThemeMode::Light
+                ThemeMode::Light,
+                false
             )
             .is_err()
         );
@@ -2163,6 +2357,7 @@ mod tests {
             "test",
             MarkupKind::Markdown,
             ThemeMode::Dark,
+            false,
         )
         .unwrap()
         .render_page(0, None)
@@ -2208,10 +2403,14 @@ mod tests {
             "assets",
             MarkupKind::Markdown,
             ThemeMode::Light,
+            false,
         )
         .unwrap();
         let page = document.render_page(0, None).unwrap();
-        assert_eq!(page.image.dimensions(), (PAGE_WIDTH, PAGE_HEIGHT));
+        assert_eq!(
+            page.image.dimensions(),
+            (PageGeometry::PORTRAIT.width, PageGeometry::PORTRAIT.height)
+        );
         assert!(
             document
                 .blocks
@@ -2222,7 +2421,10 @@ mod tests {
                     };
                     Some((visual.render_width, visual.render_height))
                 })
-                .all(|(width, height)| width <= CONTENT_WIDTH && height <= CONTENT_HEIGHT)
+                .all(|(width, height)| {
+                    width <= document.geometry.content_width()
+                        && height <= document.geometry.content_height()
+                })
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -2235,6 +2437,7 @@ mod tests {
             "diagram",
             MarkupKind::Mermaid,
             ThemeMode::Light,
+            false,
         )
         .unwrap();
         assert!(document.page_text(0).contains("Alpha"));
@@ -2245,7 +2448,10 @@ mod tests {
                 .any(|link| link.uri == "https://example.com")
         );
         let item = &document.pages[0].items[0];
-        assert_eq!(item.y, PAGE_HEIGHT.saturating_sub(item.height) / 2);
+        assert_eq!(
+            item.y,
+            document.geometry.height.saturating_sub(item.height) / 2
+        );
     }
 
     #[test]
@@ -2256,7 +2462,8 @@ mod tests {
                 Path::new("."),
                 "large",
                 MarkupKind::Markdown,
-                ThemeMode::Light
+                ThemeMode::Light,
+                false
             )
             .is_err()
         );

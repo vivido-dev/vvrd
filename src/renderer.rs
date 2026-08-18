@@ -32,6 +32,9 @@ const MAX_MARKUP_PAGE_PIXELS: u64 = 16_700_000;
 const EPUB_LAYOUT_MIN_W: f32 = 260.0;
 const EPUB_LAYOUT_MAX_W: f32 = 396.0;
 const EPUB_LAYOUT_ASPECT: f32 = 595.0 / 420.0;
+const EPUB_LANDSCAPE_MIN_W: f32 = 420.0;
+const EPUB_LANDSCAPE_MAX_W: f32 = 595.0;
+const EPUB_LANDSCAPE_ASPECT: f32 = 420.0 / 595.0;
 const SLOW_RENDER_WARN: Duration = Duration::from_secs(5);
 pub const MUPDF_BLACK: i32 = 0;
 pub const MUPDF_WHITE: i32 = i32::from_be_bytes([0, 0xff, 0xff, 0xff]);
@@ -67,6 +70,15 @@ pub fn detect_backend(path: &Path) -> RenderBackend {
         Some("pptx" | "docx" | "odp" | "odt") => RenderBackend::Office,
         _ => RenderBackend::MuPdf,
     }
+}
+
+/// Paper choices shared by every open: markup paper theme and page orientation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaperStyle {
+    /// Markup paper theme.
+    pub theme: ThemeMode,
+    /// Landscape orientation for markup pages and reflowable layout.
+    pub landscape: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -164,12 +176,12 @@ pub struct RenderThread {
 }
 
 impl RenderThread {
-    pub fn spawn(path: PathBuf, viewport: WindowSize, theme: ThemeMode) -> Self {
+    pub fn spawn(path: PathBuf, viewport: WindowSize, style: PaperStyle) -> Self {
         let (commands, command_rx) = flume::unbounded();
         let (event_tx, events) = flume::unbounded();
         let join = thread::Builder::new()
             .name("vvrd-render".to_owned())
-            .spawn(move || run_render_thread(path, viewport, theme, command_rx, event_tx))
+            .spawn(move || run_render_thread(path, viewport, style, command_rx, event_tx))
             .expect("failed to spawn document render thread");
         Self {
             commands,
@@ -209,11 +221,11 @@ impl BackendDocument {
         path: &Path,
         viewport: WindowSize,
         epub_font_size: f32,
-        theme: ThemeMode,
+        style: PaperStyle,
     ) -> Result<Self, RenderError> {
         match detect_backend(path) {
             RenderBackend::MuPdf => {
-                let document = open_document(path, viewport, epub_font_size)?;
+                let document = open_document(path, viewport, epub_font_size, style.landscape)?;
                 let kind = document_kind(&document);
                 let layout = matches!(kind, DocumentKind::Reflowable).then_some((
                     viewport.page_area_width_px() as f32,
@@ -231,7 +243,7 @@ impl BackendDocument {
             // from the source content, so reloading picks up source edits.
             RenderBackend::Office => {
                 let pdf = office::ensure_pdf(path)?;
-                let document = open_document(&pdf, viewport, epub_font_size)?;
+                let document = open_document(&pdf, viewport, epub_font_size, style.landscape)?;
                 Ok(Self::MuPdf {
                     kind: document_kind(&document),
                     document,
@@ -244,7 +256,7 @@ impl BackendDocument {
                     RenderBackend::Mermaid => MarkupKind::Mermaid,
                     RenderBackend::MuPdf | RenderBackend::Office => unreachable!(),
                 };
-                MarkupDocument::open(path, kind, theme)
+                MarkupDocument::open(path, kind, style.theme, style.landscape)
                     .map(Self::Markup)
                     .map_err(|error| RenderError::Markup(error.to_string()))
             }
@@ -280,7 +292,11 @@ impl BackendDocument {
         }
     }
 
-    fn update_layout(&mut self, options: &RenderOptions) -> Result<bool, RenderError> {
+    fn update_layout(
+        &mut self,
+        options: &RenderOptions,
+        landscape: bool,
+    ) -> Result<bool, RenderError> {
         let Self::MuPdf {
             document,
             kind,
@@ -296,7 +312,7 @@ impl BackendDocument {
         if *layout == Some(next) {
             return Ok(false);
         }
-        let (width, height, em) = epub_layout_for_area(next.0, next.1, next.2);
+        let (width, height, em) = epub_layout_for_area(next.0, next.1, next.2, landscape);
         document.layout(width, height, em)?;
         *layout = Some(next);
         *kind = document_kind(document);
@@ -391,11 +407,12 @@ fn send_backend_opened(
 fn run_render_thread(
     path: PathBuf,
     viewport: WindowSize,
-    theme: ThemeMode,
+    style: PaperStyle,
     commands: Receiver<RenderCmd>,
     events: Sender<RenderEvent>,
 ) {
-    let mut document = match BackendDocument::open(&path, viewport, 11.0, theme) {
+    let landscape = style.landscape;
+    let mut document = match BackendDocument::open(&path, viewport, 11.0, style) {
         Ok(document) => document,
         Err(error) => {
             let _ = events.send(RenderEvent::Error(error.to_string()));
@@ -415,7 +432,7 @@ fn run_render_thread(
         let mut prerender_request = None;
         let result = match command {
             RenderCmd::Render { page, options } => {
-                match document.update_layout(&options) {
+                match document.update_layout(&options, landscape) {
                     Ok(true) => {
                         cache.clear();
                         let _ = send_backend_opened(&document, document_revision, false, &events);
@@ -450,7 +467,7 @@ fn run_render_thread(
             }
             RenderCmd::Search(term) => document.search(&term).map(RenderEvent::SearchComplete),
             RenderCmd::Reload => {
-                match BackendDocument::open(&path, viewport, document.epub_font_size(), theme) {
+                match BackendDocument::open(&path, viewport, document.epub_font_size(), style) {
                     Ok(replacement) => {
                         document = replacement;
                         document_revision = document_revision.saturating_add(1);
@@ -716,6 +733,7 @@ fn open_document(
     path: &Path,
     viewport: WindowSize,
     epub_font_size: f32,
+    landscape: bool,
 ) -> Result<Document, RenderError> {
     #[cfg(windows)]
     let path = path.to_string_lossy();
@@ -726,6 +744,7 @@ fn open_document(
             viewport.page_area_width_px() as f32,
             viewport.page_area_height_px() as f32,
             epub_font_size,
+            landscape,
         );
         document.layout(width, height, em)?;
     }
@@ -753,9 +772,9 @@ pub fn render_page(
     path: &Path,
     requested_page: usize,
     viewport: WindowSize,
-    theme: ThemeMode,
+    style: PaperStyle,
 ) -> Result<RenderedDocument, RenderError> {
-    let document = BackendDocument::open(path, viewport, 11.0, theme)?;
+    let document = BackendDocument::open(path, viewport, 11.0, style)?;
     let n_pages = document.page_count();
     if n_pages == 0 {
         return Err(RenderError::EmptyDocument);
@@ -780,9 +799,9 @@ pub fn export_document_page(
     options: &RenderOptions,
     output: &Path,
     auto_crop: bool,
-    theme: ThemeMode,
+    style: PaperStyle,
 ) -> Result<(), RenderError> {
-    let document = BackendDocument::open(path, viewport, options.epub_font_size, theme)?;
+    let document = BackendDocument::open(path, viewport, options.epub_font_size, style)?;
     document.export_page(page, options, output, auto_crop)
 }
 
@@ -790,9 +809,9 @@ pub fn document_page_count(
     path: &Path,
     viewport: WindowSize,
     epub_font_size: f32,
-    theme: ThemeMode,
+    style: PaperStyle,
 ) -> Result<usize, RenderError> {
-    Ok(BackendDocument::open(path, viewport, epub_font_size, theme)?.page_count())
+    Ok(BackendDocument::open(path, viewport, epub_font_size, style)?.page_count())
 }
 
 fn render_markup_page(
@@ -1066,9 +1085,23 @@ fn scale_fit((width, height): (f32, f32), (area_w, area_h): (f32, f32)) -> (f32,
     (width * scale, height * scale, scale)
 }
 
-fn epub_layout_for_area(area_w_px: f32, area_h_px: f32, em: f32) -> (f32, f32, f32) {
-    let layout_width = (area_w_px * 0.45).clamp(EPUB_LAYOUT_MIN_W, EPUB_LAYOUT_MAX_W);
-    let layout_height = (layout_width * EPUB_LAYOUT_ASPECT).min(area_h_px.max(layout_width));
+fn epub_layout_for_area(
+    area_w_px: f32,
+    area_h_px: f32,
+    em: f32,
+    landscape: bool,
+) -> (f32, f32, f32) {
+    let (min_w, max_w, aspect) = if landscape {
+        (
+            EPUB_LANDSCAPE_MIN_W,
+            EPUB_LANDSCAPE_MAX_W,
+            EPUB_LANDSCAPE_ASPECT,
+        )
+    } else {
+        (EPUB_LAYOUT_MIN_W, EPUB_LAYOUT_MAX_W, EPUB_LAYOUT_ASPECT)
+    };
+    let layout_width = (area_w_px * 0.45).clamp(min_w, max_w);
+    let layout_height = (layout_width * aspect).min(area_h_px.max(layout_width));
     (layout_width, layout_height, em.clamp(9.0, 18.0))
 }
 
@@ -1091,6 +1124,13 @@ mod tests {
             TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed),
             extension
         ))
+    }
+
+    fn paper_style(theme: ThemeMode) -> PaperStyle {
+        PaperStyle {
+            theme,
+            landscape: false,
+        }
     }
 
     #[test]
@@ -1126,6 +1166,7 @@ mod tests {
             "paper",
             MarkupKind::Markdown,
             ThemeMode::Light,
+            false,
         )
         .unwrap();
         let viewport = WindowSize::from_cells(80, 24, 10, 20);
@@ -1139,6 +1180,27 @@ mod tests {
     }
 
     #[test]
+    fn markup_landscape_swaps_letter_dimensions_until_rotation() {
+        let document = MarkupDocument::parse(
+            "# Paper\n\ntext",
+            Path::new("."),
+            "paper",
+            MarkupKind::Markdown,
+            ThemeMode::Light,
+            true,
+        )
+        .unwrap();
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let mut options = RenderOptions::for_viewport(viewport, 1);
+        let page = render_markup_page(&document, 0, &options).unwrap();
+        assert_eq!((page.width, page.height), (2_640, 2_040));
+
+        options.rotation = 90;
+        let page = render_markup_page(&document, 0, &options).unwrap();
+        assert_eq!((page.width, page.height), (2_040, 2_640));
+    }
+
+    #[test]
     fn markup_export_writes_the_full_current_letter_page() {
         let document = MarkupDocument::parse(
             "# Export\n\npage",
@@ -1146,6 +1208,7 @@ mod tests {
             "export",
             MarkupKind::Markdown,
             ThemeMode::Light,
+            false,
         )
         .unwrap();
         let output = temp_file("png");
@@ -1162,7 +1225,7 @@ mod tests {
         let path = temp_file("md");
         fs::write(&path, "# One\n").unwrap();
         let viewport = WindowSize::from_cells(80, 24, 10, 20);
-        let renderer = RenderThread::spawn(path.clone(), viewport, ThemeMode::Light);
+        let renderer = RenderThread::spawn(path.clone(), viewport, paper_style(ThemeMode::Light));
         let opened = renderer
             .events
             .recv_timeout(Duration::from_secs(5))
@@ -1200,7 +1263,7 @@ mod tests {
         let path = temp_file("mmd");
         fs::write(&path, "flowchart LR\nA-->B").unwrap();
         let viewport = WindowSize::from_cells(80, 24, 10, 20);
-        let renderer = RenderThread::spawn(path.clone(), viewport, ThemeMode::Light);
+        let renderer = RenderThread::spawn(path.clone(), viewport, paper_style(ThemeMode::Light));
         assert!(matches!(
             renderer
                 .events
@@ -1251,7 +1314,8 @@ mod tests {
         )
         .unwrap();
         let viewport = WindowSize::from_cells(80, 24, 10, 20);
-        let renderer = RenderThread::spawn(markdown.clone(), viewport, ThemeMode::Light);
+        let renderer =
+            RenderThread::spawn(markdown.clone(), viewport, paper_style(ThemeMode::Light));
         let _ = renderer
             .events
             .recv_timeout(Duration::from_secs(10))
@@ -1341,7 +1405,7 @@ mod tests {
         }
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/office/demo.pptx");
         let viewport = WindowSize::from_cells(80, 24, 10, 20);
-        let renderer = RenderThread::spawn(fixture, viewport, ThemeMode::Light);
+        let renderer = RenderThread::spawn(fixture, viewport, paper_style(ThemeMode::Light));
         // The first conversion of a deck pays for LibreOffice cold start plus profile creation.
         match renderer
             .events
@@ -1378,10 +1442,14 @@ mod tests {
 
     #[test]
     fn epub_layout_is_book_shaped_and_bounded() {
-        let (width, height, em) = epub_layout_for_area(1200.0, 800.0, 30.0);
+        let (width, height, em) = epub_layout_for_area(1200.0, 800.0, 30.0, false);
         assert!((EPUB_LAYOUT_MIN_W..=EPUB_LAYOUT_MAX_W).contains(&width));
         assert!(height > width);
         assert_eq!(em, 18.0);
+
+        let (width, height, _) = epub_layout_for_area(1200.0, 800.0, 30.0, true);
+        assert!((EPUB_LANDSCAPE_MIN_W..=EPUB_LANDSCAPE_MAX_W).contains(&width));
+        assert!(width > height);
     }
 
     #[test]
