@@ -200,11 +200,18 @@ Pagination also creates heading slugs/outline entries, page-scoped text and link
 semantics, and search geometry. Source is capped at 16 MiB, encoded assets at 32 MiB, visuals at
 16,384 pixels per axis and 16.7 MP, blocks at 100,000, and pages at 10,000.
 
-`R`/F5 constructs a complete replacement document before swapping it into the render thread.
-Success clears page rasters, clamps the current page, rereads local assets, and advances the
-document content revision. Failure reports an error while the previous plan and visible frame
-remain active. The revision is included in `PresentCmd::UpdateContent`, so a same-page reload
-updates the surface descriptor without changing the surface generation, node, track, or channel.
+Interactive `.md`, `.markdown`, `.mkd`, `.docx`, and `.pptx` views watch the opened source's parent
+directory non-recursively. Source notifications are bounded and debounced for 300 ms so editor
+write bursts and atomic replacements produce one reload; symlink paths and their canonical targets
+are both covered. A temporarily removed source is ignored until a later create event. `R`/F5
+remains the manual reload path for every backend and for linked Markdown assets.
+
+Automatic and manual reloads construct a complete replacement document before swapping it into
+the render thread. Success clears page rasters, clamps the current page, rereads local assets, and
+advances the document content revision. Failure reports an error while the previous plan and
+visible frame remain active. The revision is included in `PresentCmd::UpdateContent`, so a
+same-page reload updates the surface descriptor without changing the surface generation, node,
+track, or channel. Watcher failures are nonfatal and leave the manual reload path available.
 
 ### D6 — Input is pure PTY stdin
 Running under Vivido, vvrd is an ordinary terminal app from the PTY's view. Keyboard/mouse come
@@ -310,6 +317,7 @@ Modeled on kitpdf, with the Kitty layer swapped for a Vivid presenter layer.
 | `main.rs` | CLI parse, env/config, terminal guard, thread wiring, event loop | port of kitpdf `main.rs` (de-tokio-fied) |
 | `app.rs` | App state: page, scroll/zoom/pan, input mode, search, transforms, pixmap residency | port of kitpdf `app.rs` (near-verbatim; drops Kitty `ImageId`) |
 | `renderer.rs` | Backend dispatch and render thread: cache, search, TOC, metadata, links, reload, EPUB reflow, export, watchdog | MuPDF path from kitpdf plus native backend |
+| `source_watch.rs` | Bounded source notifications, path matching, and reload debounce for Markdown/DOCX/PPTX | New |
 | `office.rs` | Office conversion: LibreOffice discovery, content-hash PDF cache, bounded headless `soffice` subprocess with isolated profile | New for PPTX/DOCX/ODP/ODT viewing |
 | `markup/` | Owned Markdown IR, Letter pagination, text/image/SVG raster helpers, bundled Mona Sans/Monaspace fonts | adapted from Kitmd `45cb75f` |
 | `mermaid_engine/` | Complete Rust Mermaid parser, validation, layout, and SVG renderer | copied from Kitmd `45cb75f` |
@@ -444,6 +452,10 @@ frame, never a blank one.
 **Overlay (TOC/metadata/links/help/search/goto)** — UI sends `PresentCmd::HideNode`, draws text over
 the full screen; on exit `PresentCmd::ShowView` re-shows and re-sends the page.
 
+**Source change** — the UI drains bounded watcher events, extends a 300 ms debounce on each
+matching mutation, and sends the existing transactional `Reload` command once the source exists
+and the debounce settles. The refreshed current page follows the normal render/present path.
+
 **Search / links / export** — reuse kitpdf's renderer-side flows verbatim (`Search`, `GetLinks`,
 `ExportPage`); results flow back as `RenderInfo`. External links open via the system opener.
 
@@ -541,7 +553,7 @@ core design; §Verification calls out explicit tiled/floating-pane test cases.
 | State persistence (XDG) | `state.rs` (unchanged) |
 | Export page to PNG (`-e`, `e`) | `export.rs` (unchanged) |
 | Light/dark paper theme | `--theme light|dark`, markup only |
-| Source refresh | Atomic backend reload/repagination; old document survives failure |
+| Source refresh | Automatic debounced Markdown/DOCX/PPTX watch plus manual `R`/F5; atomic backend reload keeps the old document on failure |
 | Loading indicator w/ delay | Same UI timer; text drawn while node hidden |
 | Panic isolation + slow-render watchdog | Ported into the render thread |
 | Clean exit / Ctrl-C / panic cleanup | Terminal restore **+ Vivid node/track/surface teardown** |

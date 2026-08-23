@@ -28,7 +28,8 @@ without a live presenter. `--trace DIR` writes Vivid control and raster streams 
 
 | Key | Action |
 |---|---|
-| Left/Right, Space | Previous/next page |
+| Left | Previous page |
+| Right, Space | next page |
 | Up/Down | Scroll; turn at the page boundary |
 | `j`/`k` | Next/previous page without scrolling |
 | `h`/`l` | Page turn, or horizontal pan in zoom mode |
@@ -40,7 +41,7 @@ without a live presenter. `--trace DIR` writes Vivid control and raster streams 
 | `/`, `n`/`N` | Search; next/previous matching page |
 | `t`, `M`, `f`, `?` | TOC, metadata, links, help |
 | `e` | Export the current page as PNG |
-| `R` or F5 | Atomically reread and repaginate the document and local assets |
+| `R` or F5 | Manually reread and repaginate the document and local assets |
 | `q`, Esc, Ctrl-C | Quit |
 
 Reader state is saved per document in the platform cache directory. See
@@ -53,10 +54,14 @@ paper theme (default: `light`); `-l`/`--landscape` paginates Markdown and Mermai
 2640×2040 Letter pages and lays out reflowable HTML/EPUB wider than tall. The existing invert,
 tint, colour mapping, rotation, crop, search, TOC, links, zoom/pan, state restore, and PNG export
 controls apply to markup pages too. A failed reload leaves the previous document visible.
+During interactive viewing, vvrd watches Markdown (`.md`, `.markdown`, `.mkd`), DOCX, and PPTX
+sources and automatically performs the same transactional reload after a short save debounce.
+Only the opened source is watched; use `R`/F5 after changing a linked local asset.
 
 PPTX, DOCX, ODP, and ODT documents require LibreOffice. vvrd locates the `soffice` launcher on
 `PATH` or in the standard install location per platform (override with `VVRD_SOFFICE`), prints a
 warning and exits when it is unavailable, and otherwise converts headlessly to a PDF cached under
 the platform cache directory keyed by the source content hash (override with `VVRD_OFFICE_CACHE`).
 Converted documents support the full fixed-layout feature set — search, TOC, links, zoom, rotation,
-export — and `R` reconverts when the source file changes.
+export — and DOCX/PPTX sources are reconverted automatically when they change. `R`/F5 remains
+available as a manual fallback; ODP and ODT sources require it.

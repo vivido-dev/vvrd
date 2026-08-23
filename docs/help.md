@@ -36,7 +36,10 @@ pages with 180-pixel margins (landscape 2640×2040 with `-l`). `.mmd` and `.merm
 contain-fitted and centred on one Letter page. Markdown includes GFM tables/task
 lists/autolinks/strikethrough, local raster/SVG/data
 URI images, and fenced Mermaid; it never fetches remote images. `R`/F5 atomically rereads source
-and local assets. If parsing or pagination fails, the prior document remains visible.
+and local assets. Interactive Markdown, DOCX, and PPTX views also watch the opened source and
+perform that reload automatically after a short save debounce. Linked Markdown assets and
+ODP/ODT sources still require `R`/F5. If parsing or pagination fails, the prior document remains
+visible.
 
 In vvmux, moving a floating pane changes only the outer projection; vvrd continues using local
 `(0,0)` coordinates. Resizing a pane recreates its one raster source after a 120 ms debounce.

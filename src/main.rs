@@ -9,6 +9,7 @@ mod office;
 mod presenter;
 mod renderer;
 mod semantic;
+mod source_watch;
 mod state;
 mod terminal;
 mod vivid_thread;
@@ -34,6 +35,7 @@ use crossterm::event::{
 use geometry::{TargetViewport, WindowSize};
 use markup::ThemeMode;
 use renderer::{RenderCmd, RenderEvent, RenderOptions, RenderThread};
+use source_watch::{ReloadDebouncer, SourceWatchEvent, SourceWatcher};
 use vivid_sdk::{
     CORE_CONTROL, LIVE_MEDIA, OBSERVABILITY, POLICY_DENY_CAPTURE, POLICY_DENY_DESCRIPTOR_EXPORT,
     POLICY_DENY_IMAGE_CACHE, POLICY_DENY_POSTER_RETENTION, ProducerAuthentication, ProducerConfig,
@@ -262,6 +264,24 @@ fn main() -> anyhow::Result<()> {
         terminal::clear_page_area(viewport)?;
     }
 
+    // Arm hot reload before opening the renderer so platform watcher backends have completed
+    // their startup by the time the first page is displayed. Events received during document
+    // startup remain queued for the interactive loop.
+    let source_watcher = if interactive && source_watch::supports_hot_reload(&cli.document) {
+        match SourceWatcher::new(&cli.document) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                log::warn!("hot reload unavailable: {error:#}");
+                runtime
+                    .app
+                    .show_info(format!("hot reload unavailable: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let descriptor = SurfaceDescriptor {
         role: SurfaceRole::Document,
         title,
@@ -284,7 +304,15 @@ fn main() -> anyhow::Result<()> {
     request_render(&render, &vivid, &mut runtime, black, white, interactive)?;
 
     if interactive {
-        run_event_loop(&cli.document, &render, &vivid, &mut runtime, black, white)?;
+        run_event_loop(
+            &cli.document,
+            source_watcher.as_ref(),
+            &render,
+            &vivid,
+            &mut runtime,
+            black,
+            white,
+        )?;
     } else {
         wait_for_noninteractive_frame(&render, &vivid, &mut runtime, black, white)?;
     }
@@ -304,6 +332,7 @@ fn main() -> anyhow::Result<()> {
             .then_some(runtime.app.epub_font_size),
         },
     );
+    drop(source_watcher);
     render.shutdown();
     vivid.shutdown();
     Ok(())
@@ -602,13 +631,33 @@ fn wait_for_noninteractive_frame(
 
 fn run_event_loop(
     document: &Path,
+    source_watcher: Option<&SourceWatcher>,
     render: &RenderThread,
     vivid: &VividThread,
     runtime: &mut Runtime,
     black: i32,
     white: i32,
 ) -> anyhow::Result<()> {
+    let mut reload_debouncer = ReloadDebouncer::default();
     loop {
+        if let Some(watcher) = source_watcher {
+            while let Ok(event) = watcher.events.try_recv() {
+                match event {
+                    SourceWatchEvent::Changed => reload_debouncer.note_change(Instant::now()),
+                    SourceWatchEvent::Error(error) => {
+                        runtime
+                            .app
+                            .show_info(format!("hot reload watcher error: {error}"));
+                        draw_status(runtime)?;
+                    }
+                }
+            }
+            if reload_debouncer.take_due(Instant::now(), document.is_file()) {
+                render.commands.send(RenderCmd::Reload)?;
+                runtime.app.show_info("reloading changed source...");
+                draw_status(runtime)?;
+            }
+        }
         while let Ok(render_event) = render.events.try_recv() {
             handle_render_event(document, render, vivid, runtime, render_event, black, white)?;
         }
