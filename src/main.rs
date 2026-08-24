@@ -123,6 +123,12 @@ impl From<ThemeArg> for ThemeMode {
 struct Runtime {
     app: App,
     viewport: WindowSize,
+    /// Last presentation-target generation the UI has observed from the Vivid thread.
+    ///
+    /// Local PTY resize events are only a fallback for presenters that do not announce target
+    /// changes. Carrying this generation with that fallback prevents an old queued PTY resize from
+    /// undoing a newer authoritative target change after detach/reattach.
+    target_generation: u64,
     current_image: Option<(usize, u64, Arc<PageImage>)>,
     pending_resize: Option<(u16, u16, Instant)>,
     interactive: bool,
@@ -226,6 +232,7 @@ fn main() -> anyhow::Result<()> {
             WindowSize::from_terminal()?
         }
     };
+    let target_generation = session.info().target_generation.get();
 
     let mut app = App::new(initial_page);
     app.rotation = saved.rotation;
@@ -242,6 +249,7 @@ fn main() -> anyhow::Result<()> {
     let mut runtime = Runtime {
         app,
         viewport,
+        target_generation,
         current_image: None,
         pending_resize: None,
         interactive,
@@ -678,6 +686,7 @@ fn run_event_loop(
             vivid.commands.send(PresentCmd::Resize {
                 viewport: runtime.viewport,
                 settled: true,
+                observed_target_generation: runtime.target_generation,
             })?;
             show_current(vivid, runtime)?;
             request_render(render, vivid, runtime, black, white, true)?;
@@ -871,7 +880,12 @@ fn handle_present_event(
                 .app
                 .set_rendered_size(content_width, content_height, runtime.viewport);
         }
-        PresentEvent::TargetChanged { viewport, settled } => {
+        PresentEvent::TargetChanged {
+            viewport,
+            settled,
+            target_generation,
+        } => {
+            runtime.target_generation = target_generation;
             // A target that shrank below what a page needs left the node hidden and the viewport
             // unchanged, so growing back to the same geometry still has to redraw.
             if settled && (viewport != runtime.viewport || !runtime.target_presentable) {
@@ -883,7 +897,12 @@ fn handle_present_event(
                 request_render(render, vivid, runtime, black, white, true)?;
             }
         }
-        PresentEvent::TargetTooSmall { cols, rows } => {
+        PresentEvent::TargetTooSmall {
+            cols,
+            rows,
+            target_generation,
+        } => {
+            runtime.target_generation = target_generation;
             log::debug!("terminal is {cols}x{rows}: nothing to present until it grows");
             runtime.target_presentable = false;
             runtime.pending_resize = None;

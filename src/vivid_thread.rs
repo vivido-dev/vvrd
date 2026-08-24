@@ -32,6 +32,8 @@ pub enum PresentCmd {
     Resize {
         viewport: WindowSize,
         settled: bool,
+        /// Target generation the UI had observed when its PTY fallback planned this resize.
+        observed_target_generation: u64,
     },
     UpdateContent {
         page: usize,
@@ -52,12 +54,14 @@ pub enum PresentEvent {
     TargetChanged {
         viewport: WindowSize,
         settled: bool,
+        target_generation: u64,
     },
     /// The terminal is too small to host a page and its status row. Nothing can be presented until
     /// it grows, but the session and every object in it stay valid.
     TargetTooSmall {
         cols: u16,
         rows: u16,
+        target_generation: u64,
     },
     /// The raster track was lost and replaced. The document surface and its placement survived.
     TrackLost(String),
@@ -193,9 +197,17 @@ fn run(
                     Ok(Some(event))
                 }),
             PresentCmd::SetVisible(visible) => presenter.set_visible(visible).map(|()| None),
-            PresentCmd::Resize { viewport, settled } => {
-                presenter.resize(viewport, settled).map(|()| None)
-            }
+            PresentCmd::Resize {
+                viewport,
+                settled,
+                observed_target_generation,
+            } => apply_fallback_resize(
+                &mut presenter,
+                viewport,
+                settled,
+                observed_target_generation,
+            )
+            .map(|()| None),
             PresentCmd::UpdateContent {
                 page,
                 search_term,
@@ -299,6 +311,7 @@ fn service_presenter_signals(
 }
 
 fn apply_target_change(presenter: &mut VividPresenter, events: &Sender<PresentEvent>) {
+    let target_generation = presenter.target_generation();
     let (target, settled) = match presenter.target_viewport() {
         Ok(target) => target,
         Err(error) => {
@@ -313,18 +326,48 @@ fn apply_target_change(presenter: &mut VividPresenter, events: &Sender<PresentEv
     let viewport = match target {
         TargetViewport::Presentable(viewport) => viewport,
         TargetViewport::TooSmall { cols, rows } => {
-            let _ = events.send(PresentEvent::TargetTooSmall { cols, rows });
+            let _ = events.send(PresentEvent::TargetTooSmall {
+                cols,
+                rows,
+                target_generation,
+            });
             return;
         }
     };
     match presenter.resize(viewport, settled) {
         Ok(()) => {
-            let _ = events.send(PresentEvent::TargetChanged { viewport, settled });
+            let _ = events.send(PresentEvent::TargetChanged {
+                viewport,
+                settled,
+                target_generation,
+            });
         }
         Err(error) => {
             let _ = events.send(PresentEvent::Error(error.to_string()));
         }
     }
+}
+
+/// Apply the local PTY-size fallback only while it still describes the current Vivid target.
+///
+/// On reattach, vvmux updates the PTY and publishes `TARGET_CHANGED` together. Replacing a raster
+/// track through the nested presenter can outlast the UI's resize debounce, leaving the old local
+/// fallback queued behind the authoritative replacement. Without the generation check, that stale
+/// command replaces the correct track a second time using the previous presenter's cell pixels.
+fn apply_fallback_resize(
+    presenter: &mut VividPresenter,
+    viewport: WindowSize,
+    settled: bool,
+    observed_target_generation: u64,
+) -> std::io::Result<()> {
+    let current_target_generation = presenter.target_generation();
+    if observed_target_generation != current_target_generation {
+        log::debug!(
+            "dropped PTY resize planned for target generation {observed_target_generation}; current generation is {current_target_generation}"
+        );
+        return Ok(());
+    }
+    presenter.resize(viewport, settled)
 }
 
 fn resend_full_frame(
@@ -393,6 +436,27 @@ mod tests {
         Session::connect(ProducerConfig::offline()).unwrap()
     }
 
+    fn live_session(fake: &vivid_sdk::testing::TestPresenter) -> Session {
+        Session::connect(ProducerConfig {
+            endpoint_control: Some(fake.endpoint().to_owned()),
+            endpoint_bulk: Some(fake.endpoint().to_owned()),
+            authentication: vivid_sdk::ProducerAuthentication::root_hex(
+                vivid_sdk::testing::ROOT_SECRET_HEX,
+            )
+            .unwrap(),
+            producer_name: "vvrd-vivid-thread-test".to_owned(),
+            target_profile: vivid_sdk::TERMINAL_SURFACE.to_owned(),
+            required_profiles: vec![
+                vivid_sdk::LIVE_MEDIA.to_owned(),
+                vivid_sdk::TERMINAL_SURFACE.to_owned(),
+                vivid_sdk::CORE_CONTROL.to_owned(),
+            ],
+            optional_profiles: Vec::new(),
+            ..ProducerConfig::default()
+        })
+        .unwrap()
+    }
+
     fn test_page() -> Arc<PageImage> {
         Arc::new(PageImage {
             pixels: vec![255; 3 * 4 * 4],
@@ -424,6 +488,7 @@ mod tests {
             .send(PresentCmd::Resize {
                 viewport: WindowSize::from_cells(80, 24, 10, 20),
                 settled: true,
+                observed_target_generation: 1,
             })
             .unwrap();
         sender.send(view(3)).unwrap();
@@ -462,6 +527,7 @@ mod tests {
             .send(PresentCmd::Resize {
                 viewport: after,
                 settled: true,
+                observed_target_generation: 1,
             })
             .unwrap();
         vivid.commands.send(show_view(before)).unwrap();
@@ -476,6 +542,55 @@ mod tests {
             Ok(PresentEvent::FrameShown { .. })
         ));
         vivid.shutdown();
+    }
+
+    #[test]
+    fn a_queued_pty_resize_cannot_undo_a_newer_authoritative_target() {
+        let before = WindowSize::from_cells(20, 6, 10, 20);
+        let after = WindowSize::from_cells(40, 12, 10, 20);
+        let fake = vivid_sdk::testing::TestPresenter::start(20, 6).unwrap();
+        let mut presenter =
+            VividPresenter::new(live_session(&fake), before, 0, test_descriptor(), 0).unwrap();
+        let stale_generation = presenter.target_generation();
+
+        fake.resize_terminal(40, 12, true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if matches!(
+                presenter.take_signal(),
+                Some(PresenterSignal::TargetChanged)
+            ) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "authoritative target change did not reach vvrd"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let (event_sender, events) = flume::unbounded();
+        apply_target_change(&mut presenter, &event_sender);
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)),
+            Ok(PresentEvent::TargetChanged {
+                viewport,
+                target_generation,
+                ..
+            }) if viewport == after && target_generation > stale_generation
+        ));
+        assert_eq!(presenter.track_viewport(), after);
+
+        // This is the PTY fallback that the UI can queue while the authoritative replacement is
+        // still priming through vvmux. It was planned against the old Mac-era target and must not
+        // replace the correct Windows-sized raster a second time.
+        apply_fallback_resize(&mut presenter, before, true, stale_generation).unwrap();
+        assert_eq!(
+            presenter.track_viewport(),
+            after,
+            "a stale local resize undid the authoritative target replacement"
+        );
+        presenter.teardown().unwrap();
     }
 
     #[test]

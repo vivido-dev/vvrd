@@ -449,6 +449,11 @@ frame** — the visible regression of the 1.1 source-replacement path. A failure
 the half-built replacement and leaves the current track active, so the worst case is a stale-size
 frame, never a blank one.
 
+The local PTY resize is only a fallback for presenters that do not announce `TARGET_CHANGED`. Each
+fallback command names the last target generation observed by the UI; if an authoritative target
+change advances while a nested replacement is still priming, the queued older fallback is dropped
+instead of replacing the correct track again with the previous presenter's cell-pixel geometry.
+
 **Overlay (TOC/metadata/links/help/search/goto)** — UI sends `PresentCmd::HideNode`, draws text over
 the full screen; on exit `PresentCmd::ShowView` re-shows and re-sends the page.
 

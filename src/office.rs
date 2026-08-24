@@ -291,7 +291,6 @@ mod tests {
         fs,
         sync::Mutex,
         sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
-        time::Instant,
     };
 
     use super::*;

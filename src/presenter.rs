@@ -305,6 +305,11 @@ impl VividPresenter {
         self.track_viewport
     }
 
+    /// Authoritative target generation currently cached from `WELCOME`/`TARGET_CHANGED`.
+    pub fn target_generation(&self) -> u64 {
+        self.session.info().target_generation.get()
+    }
+
     /// Current terminal target and settle state, from the presenter's target descriptor.
     pub fn target_viewport(&self) -> io::Result<(TargetViewport, bool)> {
         WindowSize::from_target_descriptor(&self.session.info().target_descriptor)
