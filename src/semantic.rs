@@ -8,6 +8,7 @@ use crate::renderer::{LinkInfo, TocEntry};
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SemanticSnapshot {
     pub revision: u64,
+    pub document_revision: u64,
     pub title: String,
     pub page: usize,
     pub search_term: Option<String>,
@@ -63,6 +64,7 @@ mod platform {
                 title,
                 page,
                 revision: 1,
+                document_revision: 1,
                 ..SemanticSnapshot::default()
             }));
             let shutdown = Arc::new(AtomicBool::new(false));
@@ -241,6 +243,7 @@ impl SemanticControl {
                 title,
                 page,
                 revision: 1,
+                document_revision: 1,
                 ..SemanticSnapshot::default()
             }),
         })

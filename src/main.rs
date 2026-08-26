@@ -3,14 +3,18 @@ mod compositor;
 mod error;
 mod export;
 mod geometry;
+mod markup;
+mod mermaid_engine;
+mod mupdf_fonts;
+mod office;
 mod presenter;
 mod renderer;
 mod semantic;
+mod source_watch;
 mod state;
 mod terminal;
 mod vivid_thread;
 
-#[cfg(not(windows))]
 extern crate mupdf_crates_io as mupdf;
 
 use std::{
@@ -21,21 +25,33 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, bail};
+use anyhow::{Context as _, bail, ensure};
 use app::{App, InputMode, ScrollAction, StatusMsg};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use compositor::{PageImage, ViewTransform};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use geometry::WindowSize;
+use geometry::{TargetViewport, WindowSize};
+use markup::ThemeMode;
 use renderer::{RenderCmd, RenderEvent, RenderOptions, RenderThread};
-use vivid_protocol::messages;
-use vivid_sdk::{ProducerConfig, ProducerSession, SourceDescriptor};
+use source_watch::{ReloadDebouncer, SourceWatchEvent, SourceWatcher};
+use vivid_sdk::{
+    CORE_CONTROL, LIVE_MEDIA, OBSERVABILITY, POLICY_DENY_CAPTURE, POLICY_DENY_DESCRIPTOR_EXPORT,
+    POLICY_DENY_IMAGE_CACHE, POLICY_DENY_POSTER_RETENTION, ProducerAuthentication, ProducerConfig,
+    Session, SurfaceDescriptor, SurfaceRole, TERMINAL_SURFACE,
+};
 use vivid_thread::{PresentCmd, PresentEvent, VividThread};
 
-// Fallback for presenters that never emit DISPLAY_CHANGED. Vivido's settled timer is shorter, so
+/// Vivid 1.5 bounds a surface descriptor title at 256 UTF-8 bytes.
+const MAX_SURFACE_TITLE_BYTES: usize = 256;
+/// Availability bits: extracted text (0), structure (1), links (2), outline (3), actions (4).
+const SEMANTIC_AVAILABLE_TEXT: u64 = 1 << 0;
+const SEMANTIC_AVAILABLE_LINKS: u64 = 1 << 2;
+const SEMANTIC_AVAILABLE_OUTLINE: u64 = 1 << 3;
+
+// Fallback for presenters that never emit TARGET_CHANGED. Vivido's settled timer is shorter, so
 // negotiated settled geometry normally wins and cancels this local terminal-size fallback.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 const LOADING_DELAY: Duration = Duration::from_millis(90);
@@ -43,7 +59,7 @@ const LOADING_DELAY: Duration = Duration::from_millis(90);
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// PDF or EPUB document to read.
+    /// PDF, EPUB, Markdown, Mermaid, PPTX, DOCX, ODP, or ODT document to read.
     document: PathBuf,
 
     /// Page number to open (one-based; overrides saved state).
@@ -57,6 +73,10 @@ struct Cli {
     /// Start with inverted colours.
     #[arg(short = 'i', long)]
     invert: bool,
+
+    /// Landscape pages for Markdown, Mermaid, HTML, and EPUB documents.
+    #[arg(short = 'l', long)]
+    landscape: bool,
 
     /// Custom document black colour.
     #[arg(short = 'b', long = "black-color", default_value = "#000000")]
@@ -78,19 +98,48 @@ struct Cli {
     #[arg(short, long)]
     verbose: bool,
 
+    /// Paper theme for Markdown and Mermaid documents.
+    #[arg(long, value_enum, default_value_t = ThemeArg::Light)]
+    theme: ThemeArg,
+
     #[arg(long, hide = true)]
     probe_document: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ThemeArg {
+    Light,
+    Dark,
+}
+
+impl From<ThemeArg> for ThemeMode {
+    fn from(value: ThemeArg) -> Self {
+        match value {
+            ThemeArg::Light => ThemeMode::Light,
+            ThemeArg::Dark => ThemeMode::Dark,
+        }
+    }
 }
 
 struct Runtime {
     app: App,
     viewport: WindowSize,
+    /// Last presentation-target generation the UI has observed from the Vivid thread.
+    ///
+    /// Local PTY resize events are only a fallback for presenters that do not announce target
+    /// changes. Carrying this generation with that fallback prevents an old queued PTY resize from
+    /// undoing a newer authoritative target change after detach/reattach.
+    target_generation: u64,
     current_image: Option<(usize, u64, Arc<PageImage>)>,
     pending_resize: Option<(u16, u16, Instant)>,
     interactive: bool,
+    /// Whether the terminal currently has room for a page and its status row. While it does not,
+    /// the document stays loaded and the session stays open with nothing drawn.
+    target_presentable: bool,
     node_visible: bool,
     loading_deadline: Option<Instant>,
     semantic: Arc<semantic::SemanticControl>,
+    document_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,16 +152,34 @@ enum LoadingPolicy {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     validate_cli(&cli)?;
+    // Before any document is opened: MuPDF caches resolved fonts per context, so a loader
+    // installed later would not be consulted for faces already looked up.
+    mupdf_fonts::install();
+    if matches!(
+        renderer::detect_backend(&cli.document),
+        renderer::RenderBackend::Office
+    ) && office::find_soffice().is_none()
+    {
+        eprintln!(
+            "warning: LibreOffice (soffice) not found; PPTX/DOCX/ODP/ODT viewing requires LibreOffice"
+        );
+        std::process::exit(1);
+    }
     if cli.probe_document {
+        if renderer::is_epub(&cli.document) {
+            renderer::probe_epub(&cli.document)?;
+            return Ok(());
+        }
         let rendered = renderer::render_page(
             &cli.document,
             cli.page.unwrap_or(1) - 1,
             WindowSize::from_cells(80, 24, 10, 20),
+            paper_style(&cli),
         )?;
         let _ = (rendered.page.width, rendered.page_num, rendered.n_pages);
         return Ok(());
     }
-    probe_document(&cli.document)?;
+    probe_document(&cli.document, cli.theme, cli.landscape)?;
 
     let black = parse_color(&cli.black)?;
     let white = parse_color(&cli.white)?;
@@ -128,8 +195,12 @@ fn main() -> anyhow::Result<()> {
         options.black = black;
         options.white = white;
         options.epub_font_size = saved.epub_font_size.unwrap_or(11.0);
-        let n_pages =
-            renderer::document_page_count(&cli.document, viewport, options.epub_font_size)?;
+        let n_pages = renderer::document_page_count(
+            &cli.document,
+            viewport,
+            options.epub_font_size,
+            paper_style(&cli),
+        )?;
         let page = initial_page.min(n_pages.saturating_sub(1));
         let output = export::next_export_path(&cli.document, page, n_pages)?;
         renderer::export_document_page(
@@ -139,6 +210,7 @@ fn main() -> anyhow::Result<()> {
             &options,
             &output,
             saved.auto_crop,
+            paper_style(&cli),
         )?;
         println!("{}", output.display());
         return Ok(());
@@ -150,9 +222,25 @@ fn main() -> anyhow::Result<()> {
     }
     let _logger =
         flexi_logger::Logger::try_with_str(if cli.verbose { "debug" } else { "warn" })?.start()?;
-    let session = ProducerSession::connect(&producer_config(&cli))
+    let session = Session::connect(producer_config(&cli))
         .map_err(|error| anyhow::anyhow!("cannot connect to Vivid presenter: {error}"))?;
-    let viewport = WindowSize::current(session.display_state())?;
+    ensure!(
+        session.info().target_profile == TERMINAL_SURFACE,
+        "presenter did not select terminal-surface-v1"
+    );
+    let viewport = match WindowSize::from_target_descriptor(&session.info().target_descriptor) {
+        Ok((TargetViewport::Presentable(viewport), _)) => viewport,
+        Ok((TargetViewport::TooSmall { cols, rows }, _)) => bail!(
+            "the terminal is {cols}x{rows}; vvrd needs at least two rows for a page and its status"
+        ),
+        Err(error) => {
+            log::debug!(
+                "presenter target descriptor unusable ({error}); using local terminal size"
+            );
+            WindowSize::from_terminal()?
+        }
+    };
+    let target_generation = session.info().target_generation.get();
 
     let mut app = App::new(initial_page);
     app.rotation = saved.rotation;
@@ -169,12 +257,15 @@ fn main() -> anyhow::Result<()> {
     let mut runtime = Runtime {
         app,
         viewport,
+        target_generation,
         current_image: None,
         pending_resize: None,
         interactive,
+        target_presentable: true,
         node_visible: true,
         loading_deadline: None,
         semantic: semantic.clone(),
+        document_revision: 1,
     };
 
     let old_hook = std::panic::take_hook();
@@ -189,14 +280,32 @@ fn main() -> anyhow::Result<()> {
         terminal::clear_page_area(viewport)?;
     }
 
-    let descriptor = SourceDescriptor {
-        role: messages::SOURCE_ROLE_DOCUMENT,
+    // Arm hot reload before opening the renderer so platform watcher backends have completed
+    // their startup by the time the first page is displayed. Events received during document
+    // startup remain queued for the interactive loop.
+    let source_watcher = if interactive && source_watch::supports_hot_reload(&cli.document) {
+        match SourceWatcher::new(&cli.document) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                log::warn!("hot reload unavailable: {error:#}");
+                runtime
+                    .app
+                    .show_info(format!("hot reload unavailable: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let descriptor = SurfaceDescriptor {
+        role: SurfaceRole::Document,
         title,
-        content_revision: 1,
-        semantic_availability: messages::SEMANTIC_AVAILABLE_TEXT
-            | messages::SEMANTIC_AVAILABLE_LINKS
-            | messages::SEMANTIC_AVAILABLE_OUTLINE,
-        locator: semantic.locator().to_owned(),
+        semantic_content_revision: 1,
+        semantic_availability: SEMANTIC_AVAILABLE_TEXT
+            | SEMANTIC_AVAILABLE_LINKS
+            | SEMANTIC_AVAILABLE_OUTLINE,
+        locator_hint: semantic.locator().to_owned(),
     };
     let vivid = VividThread::spawn(
         session,
@@ -206,12 +315,20 @@ fn main() -> anyhow::Result<()> {
         initial_page,
     )?;
     wait_for_presenter(&vivid)?;
-    let render = RenderThread::spawn(cli.document.clone(), viewport);
+    let render = RenderThread::spawn(cli.document.clone(), viewport, paper_style(&cli));
     wait_for_document(&render, &mut runtime)?;
     request_render(&render, &vivid, &mut runtime, black, white, interactive)?;
 
     if interactive {
-        run_event_loop(&cli.document, &render, &vivid, &mut runtime, black, white)?;
+        run_event_loop(
+            &cli.document,
+            source_watcher.as_ref(),
+            &render,
+            &vivid,
+            &mut runtime,
+            black,
+            white,
+        )?;
     } else {
         wait_for_noninteractive_frame(&render, &vivid, &mut runtime, black, white)?;
     }
@@ -231,6 +348,7 @@ fn main() -> anyhow::Result<()> {
             .then_some(runtime.app.epub_font_size),
         },
     );
+    drop(source_watcher);
     render.shutdown();
     vivid.shutdown();
     Ok(())
@@ -246,50 +364,67 @@ fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn probe_document(path: &Path) -> anyhow::Result<()> {
-    let status = Command::new(std::env::current_exe()?)
+fn paper_style(cli: &Cli) -> renderer::PaperStyle {
+    renderer::PaperStyle {
+        theme: cli.theme.into(),
+        landscape: cli.landscape,
+    }
+}
+
+fn probe_document(path: &Path, theme: ThemeArg, landscape: bool) -> anyhow::Result<()> {
+    // The preflight child never talks Vivid, so it inherits no session material or endpoints.
+    // VIVID_TOKEN is the retired 1.1 name and is scrubbed too, so a stale variable cannot leak.
+    let mut command = Command::new(std::env::current_exe()?);
+    command
         .arg("--probe-document")
+        .arg("--theme")
+        .arg(match theme {
+            ThemeArg::Light => "light",
+            ThemeArg::Dark => "dark",
+        });
+    if landscape {
+        command.arg("--landscape");
+    }
+    let status = command
         .arg(path)
+        .env_remove("VIVID_ROOT_SECRET")
         .env_remove("VIVID_TOKEN")
+        .env_remove("VIVID_ENDPOINT_CONTROL")
+        .env_remove("VIVID_ENDPOINT_INTERACTIVE")
+        .env_remove("VIVID_ENDPOINT_REALTIME")
+        .env_remove("VIVID_ENDPOINT_BULK")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .context("cannot start document preflight")?;
     if !status.success() {
-        bail!("MuPDF could not open {}", path.display());
+        bail!("document preflight failed for {}", path.display());
     }
     Ok(())
 }
 
+/// Vivid 1.5 negotiates coherent named profiles, not feature-ID sets.
+///
+/// Raster delta and zstd are no longer session features: they are per-track configuration that the
+/// presenter accepts or rejects through `PROBE_TRACK_CONFIG`.
 fn producer_config(cli: &Cli) -> ProducerConfig {
     ProducerConfig {
-        endpoint: std::env::var("VIVID_ENDPOINT").ok(),
-        bulk_endpoint: std::env::var("VIVID_ENDPOINT_BULK").ok(),
-        token: std::env::var("VIVID_TOKEN").ok(),
+        endpoint_control: std::env::var("VIVID_ENDPOINT_CONTROL").ok(),
+        endpoint_bulk: std::env::var("VIVID_ENDPOINT_BULK").ok(),
+        authentication: ProducerAuthentication::RootFromEnvironment,
+        producer_name: "vvrd".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        target_profile: TERMINAL_SURFACE.to_owned(),
+        required_profiles: vec![
+            LIVE_MEDIA.to_owned(),
+            TERMINAL_SURFACE.to_owned(),
+            CORE_CONTROL.to_owned(),
+        ],
+        optional_profiles: vec![OBSERVABILITY.to_owned()],
         dry_run: cli.dry_run,
         trace_dir: cli.trace.clone(),
-        verbose: cli.verbose,
-        producer: "vvrd".to_owned(),
-        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
-        required_features: vec![
-            messages::FEATURE_RASTER_RGBA8,
-            messages::FEATURE_SCENE_TRANSACTIONS,
-            messages::FEATURE_GRID_CELL_NODES,
-            messages::FEATURE_CREDIT_FLOW_CONTROL,
-        ],
-        optional_features: vec![
-            messages::FEATURE_ENCODED_IMAGE_V1,
-            messages::FEATURE_RASTER_ZSTD_V1,
-            messages::FEATURE_VISIBILITY_EVENTS_V1,
-            messages::FEATURE_NODE_CLIP_RECT_V1,
-            messages::FEATURE_OBSERVABILITY_CORE_V1,
-            messages::FEATURE_SOURCE_DESCRIPTOR_V1,
-            messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
-            messages::FEATURE_RASTER_DELTA_V1,
-        ],
-        authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
-        allow_version_retry: false,
+        ..ProducerConfig::default()
     }
 }
 
@@ -305,7 +440,11 @@ fn document_capture_policy(path: &Path) -> u64 {
             || path.starts_with("/private/etc")
             || path.starts_with("/var/db"));
     if sensitive_component || sensitive_system_path {
-        messages::CAPTURE_POLICY_MASK
+        // Effective surface policy is a strictest union, so these can never be relaxed later.
+        POLICY_DENY_CAPTURE
+            | POLICY_DENY_POSTER_RETENTION
+            | POLICY_DENY_IMAGE_CACHE
+            | POLICY_DENY_DESCRIPTOR_EXPORT
     } else {
         0
     }
@@ -318,7 +457,7 @@ fn document_title(path: &Path) -> String {
         .to_string_lossy();
     let mut output = String::new();
     for character in title.chars() {
-        if output.len() + character.len_utf8() > messages::MAX_SOURCE_DESCRIPTOR_TITLE_BYTES {
+        if output.len() + character.len_utf8() > MAX_SURFACE_TITLE_BYTES {
             break;
         }
         output.push(character);
@@ -344,6 +483,7 @@ fn render_options(app: &App, viewport: WindowSize, black: i32, white: i32) -> Re
         black,
         white,
         epub_font_size: app.epub_font_size,
+        zoom_factor: app.zoom_factor(),
         search_term: app.search_term.clone(),
         generation: app.generation,
     }
@@ -357,7 +497,6 @@ fn request_render(
     white: i32,
     draw_loading: bool,
 ) -> anyhow::Result<()> {
-    sync_semantic_descriptor(vivid, runtime)?;
     match loading_policy(
         draw_loading,
         runtime.current_image.is_some(),
@@ -387,18 +526,29 @@ fn request_render(
 fn sync_semantic_descriptor(vivid: &VividThread, runtime: &Runtime) -> anyhow::Result<()> {
     let page = runtime.app.page;
     let search_term = runtime.app.search_term.clone();
+    let document_revision = runtime.document_revision;
+    let mut changed = false;
     runtime.semantic.update(|state| {
-        if state.page != page || state.search_term != search_term {
+        if state.page != page
+            || state.search_term != search_term
+            || state.document_revision != document_revision
+        {
+            changed = true;
             state.revision = state.revision.saturating_add(1);
             state.page = page;
             state.search_term = search_term.clone();
+            state.document_revision = document_revision;
             state.text.clear();
             state.links.clear();
         }
     });
-    vivid
-        .commands
-        .send(PresentCmd::UpdateContent { page, search_term })?;
+    if changed {
+        vivid.commands.send(PresentCmd::UpdateContent {
+            page,
+            search_term,
+            document_revision,
+        })?;
+    }
     Ok(())
 }
 
@@ -436,7 +586,7 @@ fn hide_node(vivid: &VividThread, runtime: &mut Runtime) -> anyhow::Result<()> {
 fn wait_for_presenter(vivid: &VividThread) -> anyhow::Result<()> {
     match vivid.events.recv_timeout(Duration::from_secs(10))? {
         PresentEvent::Ready => Ok(()),
-        PresentEvent::Error(error) | PresentEvent::SourceLost(error) => bail!("{error}"),
+        PresentEvent::Error(error) | PresentEvent::TrackLost(error) => bail!("{error}"),
         event => bail!("presenter stopped during startup: {event:?}"),
     }
 }
@@ -448,13 +598,18 @@ fn wait_for_document(render: &RenderThread, runtime: &mut Runtime) -> anyhow::Re
             n_pages,
             toc,
             metadata,
+            document_revision,
+            pagination_complete,
+            ..
         } => {
-            runtime.app.set_document(kind, n_pages);
+            if pagination_complete {
+                runtime.app.set_document(kind, n_pages);
+            } else {
+                runtime.app.set_document_kind(kind);
+            }
             runtime.app.toc = toc;
             runtime.app.metadata = metadata;
-            runtime.semantic.update(|state| {
-                state.outline = runtime.app.toc.clone();
-            });
+            runtime.document_revision = document_revision;
             runtime.semantic.update(|state| {
                 state.outline = runtime.app.toc.clone();
             });
@@ -497,13 +652,33 @@ fn wait_for_noninteractive_frame(
 
 fn run_event_loop(
     document: &Path,
+    source_watcher: Option<&SourceWatcher>,
     render: &RenderThread,
     vivid: &VividThread,
     runtime: &mut Runtime,
     black: i32,
     white: i32,
 ) -> anyhow::Result<()> {
+    let mut reload_debouncer = ReloadDebouncer::default();
     loop {
+        if let Some(watcher) = source_watcher {
+            while let Ok(event) = watcher.events.try_recv() {
+                match event {
+                    SourceWatchEvent::Changed => reload_debouncer.note_change(Instant::now()),
+                    SourceWatchEvent::Error(error) => {
+                        runtime
+                            .app
+                            .show_info(format!("hot reload watcher error: {error}"));
+                        draw_status(runtime)?;
+                    }
+                }
+            }
+            if reload_debouncer.take_due(Instant::now(), document.is_file()) {
+                render.commands.send(RenderCmd::Reload)?;
+                runtime.app.show_info("reloading changed source...");
+                draw_status(runtime)?;
+            }
+        }
         while let Ok(render_event) = render.events.try_recv() {
             handle_render_event(document, render, vivid, runtime, render_event, black, white)?;
         }
@@ -524,6 +699,7 @@ fn run_event_loop(
             vivid.commands.send(PresentCmd::Resize {
                 viewport: runtime.viewport,
                 settled: true,
+                observed_target_generation: runtime.target_generation,
             })?;
             show_current(vivid, runtime)?;
             request_render(render, vivid, runtime, black, white, true)?;
@@ -534,6 +710,7 @@ fn run_event_loop(
             runtime.loading_deadline = None;
             if !current_image_is_ready(runtime)
                 && matches!(runtime.app.input_mode, InputMode::Normal)
+                && runtime.target_presentable
             {
                 hide_node(vivid, runtime)?;
                 terminal::draw_loading(runtime.viewport)?;
@@ -610,10 +787,41 @@ fn handle_render_event(
             n_pages,
             toc,
             metadata,
+            document_revision,
+            reloaded,
+            pagination_complete,
         } => {
-            runtime.app.set_document(kind, n_pages);
+            let previous_page = runtime.app.page;
+            if pagination_complete {
+                runtime.app.set_document(kind, n_pages);
+            } else {
+                runtime.app.set_document_kind(kind);
+            }
             runtime.app.toc = toc;
             runtime.app.metadata = metadata;
+            runtime.document_revision = document_revision;
+            runtime.semantic.update(|state| {
+                state.outline = runtime.app.toc.clone();
+            });
+            if reloaded {
+                runtime.app.invalidate();
+                runtime.app.clear_search_results();
+                runtime.app.show_info(format!(
+                    "reloaded ({} page{})",
+                    runtime.app.n_pages,
+                    if runtime.app.n_pages == 1 { "" } else { "s" }
+                ));
+                request_render(render, vivid, runtime, black, white, false)?;
+                if let Some(term) = runtime.app.search_term.clone() {
+                    render.commands.send(RenderCmd::Search(term))?;
+                }
+            } else if pagination_complete {
+                draw_status(runtime)?;
+                if runtime.app.page != previous_page {
+                    runtime.app.invalidate();
+                    request_render(render, vivid, runtime, black, white, true)?;
+                }
+            }
         }
         RenderEvent::Page {
             page,
@@ -622,6 +830,10 @@ fn handle_render_event(
             text,
             links,
         } if page == runtime.app.page && generation == runtime.app.generation => {
+            // Publish semantic identity only for a page that survived render coalescing. Rapid
+            // navigation can skip many requested pages, and serializing their descriptor updates
+            // ahead of the one visible frame needlessly stalls the Vivid control lane.
+            sync_semantic_descriptor(vivid, runtime)?;
             runtime.semantic.update(|state| {
                 state.text = text;
                 state.links = links;
@@ -693,28 +905,35 @@ fn handle_present_event(
                 .app
                 .set_rendered_size(content_width, content_height, runtime.viewport);
         }
-        PresentEvent::Visibility(visible) => {
-            if runtime.node_visible || visible {
-                runtime.app.visible = visible;
-            }
-            if visible && matches!(runtime.app.input_mode, InputMode::Normal) {
-                if runtime.current_image.is_some() {
-                    show_current(vivid, runtime)?;
-                } else {
-                    request_render(render, vivid, runtime, black, white, true)?;
-                }
-            }
-        }
-        PresentEvent::DisplayChanged { viewport, settled } => {
-            if settled && viewport != runtime.viewport {
+        PresentEvent::TargetChanged {
+            viewport,
+            settled,
+            target_generation,
+        } => {
+            runtime.target_generation = target_generation;
+            // A target that shrank below what a page needs left the node hidden and the viewport
+            // unchanged, so growing back to the same geometry still has to redraw.
+            if settled && (viewport != runtime.viewport || !runtime.target_presentable) {
                 runtime.pending_resize = None;
+                runtime.target_presentable = true;
                 runtime.viewport = viewport;
                 runtime.app.invalidate();
                 show_current(vivid, runtime)?;
                 request_render(render, vivid, runtime, black, white, true)?;
             }
         }
-        PresentEvent::SourceLost(error) => {
+        PresentEvent::TargetTooSmall {
+            cols,
+            rows,
+            target_generation,
+        } => {
+            runtime.target_generation = target_generation;
+            log::debug!("terminal is {cols}x{rows}: nothing to present until it grows");
+            runtime.target_presentable = false;
+            runtime.pending_resize = None;
+            hide_node(vivid, runtime)?;
+        }
+        PresentEvent::TrackLost(error) => {
             runtime.app.show_info(format!("display recovered: {error}"));
             show_current(vivid, runtime)?;
             request_render(render, vivid, runtime, black, white, true)?;
@@ -726,10 +945,7 @@ fn handle_present_event(
 }
 
 fn show_current(vivid: &VividThread, runtime: &mut Runtime) -> anyhow::Result<()> {
-    if !matches!(runtime.app.input_mode, InputMode::Normal) {
-        return Ok(());
-    }
-    if !runtime.app.visible {
+    if !matches!(runtime.app.input_mode, InputMode::Normal) || !runtime.target_presentable {
         return Ok(());
     }
     let Some((_, _, image)) = &runtime.current_image else {
@@ -750,6 +966,7 @@ fn show_current(vivid: &VividThread, runtime: &mut Runtime) -> anyhow::Result<()
             offset_x: runtime.app.pan_x,
             offset_y: runtime.app.scroll_y,
             auto_crop: runtime.app.auto_crop,
+            fit_to_viewport: !runtime.app.zoom_mode,
         },
     })?;
     draw_status(runtime)
@@ -761,10 +978,12 @@ fn draw_status(runtime: &Runtime) -> anyhow::Result<()> {
     }
     terminal::draw_status(
         runtime.viewport,
-        &runtime
-            .app
-            .msg
-            .text(runtime.app.page, runtime.app.n_pages, runtime.app.zoom_mode),
+        &runtime.app.msg.text(
+            runtime.app.page,
+            runtime.app.n_pages,
+            runtime.app.pagination_complete,
+            runtime.app.zoom_mode,
+        ),
     )
 }
 
@@ -1099,9 +1318,9 @@ fn handle_key(
             draw_status(runtime)?;
         }
         KeyCode::Char('R') | KeyCode::F(5) => {
-            runtime.app.invalidate();
-            render.commands.send(RenderCmd::ClearCache)?;
-            rerender = true;
+            render.commands.send(RenderCmd::Reload)?;
+            runtime.app.show_info("reloading...");
+            draw_status(runtime)?;
         }
         KeyCode::Char('?') => {
             runtime.app.input_mode = InputMode::Help;
@@ -1124,7 +1343,12 @@ fn open_url(url: &str) {
     let command = "xdg-open";
     let _ = Command::new(command)
         .arg(url)
+        .env_remove("VIVID_ROOT_SECRET")
         .env_remove("VIVID_TOKEN")
+        .env_remove("VIVID_ENDPOINT_CONTROL")
+        .env_remove("VIVID_ENDPOINT_INTERACTIVE")
+        .env_remove("VIVID_ENDPOINT_REALTIME")
+        .env_remove("VIVID_ENDPOINT_BULK")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1144,52 +1368,51 @@ mod tests {
     }
 
     #[test]
-    fn producer_advertises_canonical_feature_sets() {
+    fn producer_advertises_a_closed_and_validated_profile_set() {
         let cli = Cli::try_parse_from(["vvrd", "--dry-run", "doc.pdf"]).unwrap();
         let config = producer_config(&cli);
+        assert_eq!(config.target_profile, TERMINAL_SURFACE);
         assert_eq!(
-            config.required_features,
-            vec![
-                messages::FEATURE_RASTER_RGBA8,
-                messages::FEATURE_SCENE_TRANSACTIONS,
-                messages::FEATURE_GRID_CELL_NODES,
-                messages::FEATURE_CREDIT_FLOW_CONTROL,
-            ]
+            config.required_profiles,
+            vec![LIVE_MEDIA, TERMINAL_SURFACE, CORE_CONTROL]
         );
-        assert_eq!(
-            config.optional_features,
-            vec![
-                messages::FEATURE_ENCODED_IMAGE_V1,
-                messages::FEATURE_RASTER_ZSTD_V1,
-                messages::FEATURE_VISIBILITY_EVENTS_V1,
-                messages::FEATURE_NODE_CLIP_RECT_V1,
-                messages::FEATURE_OBSERVABILITY_CORE_V1,
-                messages::FEATURE_SOURCE_DESCRIPTOR_V1,
-                messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
-                messages::FEATURE_RASTER_DELTA_V1,
-            ]
-        );
-        for features in [&config.required_features, &config.optional_features] {
-            assert!(features.windows(2).all(|pair| pair[0] < pair[1]));
-        }
-        assert!(
-            config
-                .required_features
-                .iter()
-                .all(|feature| config.optional_features.binary_search(feature).is_err())
-        );
+        assert_eq!(config.optional_profiles, vec![OBSERVABILITY]);
+        // Profile validation covers sorting, uniqueness, prerequisite closure, and the rule that
+        // required profiles contain both core control and the selected target.
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn a_1_1_feature_style_required_profile_is_rejected() {
+        let cli = Cli::try_parse_from(["vvrd", "--dry-run", "doc.pdf"]).unwrap();
+        let mut config = producer_config(&cli);
+        // The 1.1 feature registry does not extend into 1.5: a required profile must be a name the
+        // 1.5 registry governs, not a feature repackaged as one.
+        config.required_profiles.push("raster-delta-v1".to_owned());
+        assert!(config.validate().is_err());
     }
 
     #[test]
     fn sensitive_document_paths_start_with_policy_before_first_frame() {
         assert_eq!(
             document_capture_policy(Path::new("/home/alice/.ssh/private-notes.pdf")),
-            messages::CAPTURE_POLICY_MASK
+            POLICY_DENY_CAPTURE
+                | POLICY_DENY_POSTER_RETENTION
+                | POLICY_DENY_IMAGE_CACHE
+                | POLICY_DENY_DESCRIPTOR_EXPORT
         );
         assert_eq!(
             document_capture_policy(Path::new("/home/alice/books/novel.epub")),
             0
         );
+    }
+
+    #[test]
+    fn a_bounded_title_never_splits_a_character() {
+        let long = "é".repeat(300);
+        let title = document_title(Path::new(&format!("/tmp/{long}.pdf")));
+        assert!(title.len() <= MAX_SURFACE_TITLE_BYTES);
+        assert!(title.chars().all(|character| character == 'é'));
     }
 
     #[test]

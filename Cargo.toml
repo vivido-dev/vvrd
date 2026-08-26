@@ -1,24 +1,52 @@
 [package]
 name = "vvrd"
-version = "0.2.0"
+version = "0.3.1"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
-rust-version = "1.86"
+rust-version = "1.89"
 repository = "https://github.com/vivido-dev/vvrd"
-description = "A terminal PDF and EPUB reader for the Vivido terminal"
+description = "A terminal PDF, EPUB, Markdown, and Mermaid reader for the Vivido terminal"
 license = "AGPL-3.0"
+
+[features]
+default = []
+mermaid_engine_internal_tests = []
+png = []
 
 [[bin]]
 name = "vvrd"
 path = "src/main.rs"
 
 [dependencies]
-vivid_sdk = { version = "0.2", path = "../vivid_sdk" }
-vivid_protocol = { version = "1.4", path = "../vivid_protocol" }
+vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
+vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 
 crossterm = "0.29"
-image = { version = "0.25", features = ["png", "rayon"], default-features = false }
+image = { version = "0.25", features = [
+  "bmp",
+  "gif",
+  "ico",
+  "jpeg",
+  "png",
+  "pnm",
+  "qoi",
+  "rayon",
+  "tga",
+  "tiff",
+  "webp",
+], default-features = false }
 rayon = { version = "1", default-features = false }
+base64 = "0.22"
+comrak = "0.52"
+cosmic-text = "0.19"
+dagre = "0.1.1"
+fontdb = "0.23"
+json5 = "1.3"
+once_cell = "1.21"
+regex = "1.12"
+resvg = "0.47"
+roxmltree = "0.21"
+ttf-parser = "0.25"
 
 clap = { version = "4", features = ["derive", "env"] }
 csscolorparser = { version = "0.8", default-features = false }
@@ -33,14 +61,20 @@ thiserror = "2"
 log = "0.4"
 flexi_logger = "0.31"
 libc = "0.2"
+notify = "8"
 
-[target.'cfg(not(windows))'.dependencies]
-mupdf_crates_io = { package = "mupdf", version = "0.8.0", default-features = false, features = ["svg", "system-fonts", "base14-fonts", "img", "html", "epub"] }
-
-[target.'cfg(windows)'.dependencies]
-# mupdf 0.8.0 assumes that bindgen exports C11's max_align_t, but MSVC's C
-# headers do not define it. Keep this patch until upstream ships the MSVC fix.
-mupdf = { version = "0.8.0", path = "vendor/mupdf-0.8.0", default-features = false, features = ["svg", "system-fonts", "base14-fonts", "img", "html", "epub"] }
+# `system-fonts` is deliberately absent. It adds mupdf's built-in font-kit loader, which runs an
+# uncached system-wide font enumeration per lookup; MuPDF repeats a failed lookup once per
+# character, so a book in an uninstalled script spends minutes there. `src/mupdf_fonts.rs` installs
+# a cached fontdb-backed loader instead, and it can only end a failing lookup if it is the only
+# loader in the chain.
+mupdf_crates_io = { package = "mupdf", version = "0.8.0", default-features = false, features = [
+  "svg",
+  "base14-fonts",
+  "img",
+  "html",
+  "epub",
+] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal"] }
@@ -48,3 +82,14 @@ nix = { version = "0.31", features = ["signal"] }
 [profile.production]
 inherits = "release"
 lto = "fat"
+
+# mupdf 0.8.0 assumes that bindgen exports C11's max_align_t, but MSVC's C
+# headers do not define it. The vendored copy carries the MSVC fix. This patch
+# section is local-only (stripped on publish), so the published crate still
+# depends on the plain crates.io mupdf 0.8.0. Keep until upstream ships the fix.
+[patch.crates-io]
+mupdf = { path = "vendor/mupdf-0.8.0" }
+
+[dev-dependencies]
+# The shared in-process presenter every producer in this tree tests against.
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", features = ["testing"] }

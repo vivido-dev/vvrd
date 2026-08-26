@@ -24,11 +24,22 @@ pub enum StatusMsg {
 }
 
 impl StatusMsg {
-    pub fn text(&self, page: usize, n_pages: usize, zoom_mode: bool) -> String {
+    pub fn text(
+        &self,
+        page: usize,
+        n_pages: usize,
+        pagination_complete: bool,
+        zoom_mode: bool,
+    ) -> String {
+        let page_count = if pagination_complete {
+            n_pages.max(1).to_string()
+        } else {
+            "?".to_owned()
+        };
         let prefix = format!(
             "{}/{}  {}",
             page + 1,
-            n_pages.max(1),
+            page_count,
             if zoom_mode { "[ZOOM] " } else { "" }
         );
         match self {
@@ -51,6 +62,7 @@ pub enum ScrollAction {
 pub struct App {
     pub page: usize,
     pub n_pages: usize,
+    pub pagination_complete: bool,
     pub document_kind: DocumentKind,
     pub input_mode: InputMode,
     pub msg: StatusMsg,
@@ -69,7 +81,6 @@ pub struct App {
     pub metadata: Vec<(String, String)>,
     pub search_term: Option<String>,
     pub search_counts: Vec<Option<usize>>,
-    pub visible: bool,
     pub generation: u64,
 }
 
@@ -78,6 +89,7 @@ impl App {
         Self {
             page,
             n_pages: 1,
+            pagination_complete: true,
             document_kind: DocumentKind::Fixed,
             input_mode: InputMode::Normal,
             msg: StatusMsg::Hint,
@@ -96,16 +108,21 @@ impl App {
             metadata: Vec::new(),
             search_term: None,
             search_counts: vec![None],
-            visible: true,
             generation: 1,
         }
     }
 
     pub fn set_document(&mut self, kind: DocumentKind, n_pages: usize) {
-        self.document_kind = kind;
+        self.set_document_kind(kind);
         self.n_pages = n_pages.max(1);
+        self.pagination_complete = true;
         self.page = self.page.min(self.n_pages - 1);
         self.search_counts.resize(self.n_pages, None);
+    }
+
+    pub fn set_document_kind(&mut self, kind: DocumentKind) {
+        self.document_kind = kind;
+        self.pagination_complete = false;
         if matches!(kind, DocumentKind::Reflowable) {
             self.zoom_mode = false;
             self.zoom_level = 0;
@@ -129,7 +146,10 @@ impl App {
     }
 
     pub fn supports_zoom(&self) -> bool {
-        matches!(self.document_kind, DocumentKind::Fixed)
+        matches!(
+            self.document_kind,
+            DocumentKind::Fixed | DocumentKind::Markdown | DocumentKind::Mermaid
+        )
     }
 
     pub fn invalidate(&mut self) {
@@ -137,10 +157,17 @@ impl App {
     }
 
     pub fn go_to_page(&mut self, page: usize) -> bool {
-        if page >= self.n_pages || page == self.page {
+        if page == self.page || self.pagination_complete && page >= self.n_pages {
             return false;
         }
         self.page = page;
+        if !self.pagination_complete {
+            // Reflowable documents are navigable before MuPDF finishes its whole-book page count.
+            // Treat successfully requested pages as a growing lower bound until pagination reports
+            // the exact count.
+            self.n_pages = self.n_pages.max(page.saturating_add(1));
+            self.search_counts.resize(self.n_pages, None);
+        }
         self.scroll_y = 0;
         self.pan_x = 0;
         self.invalidate();
@@ -180,7 +207,7 @@ impl App {
         if self.scroll_y < max {
             self.scroll_y = self.scroll_y.saturating_add(amount).min(max);
             ScrollAction::Scrolled
-        } else if self.page + 1 < self.n_pages {
+        } else if !self.pagination_complete || self.page.saturating_add(1) < self.n_pages {
             ScrollAction::TurnNext
         } else {
             ScrollAction::Nothing
@@ -325,6 +352,42 @@ mod tests {
         app.set_document(DocumentKind::Reflowable, 10);
         assert!(!app.zoom_mode);
         assert_eq!(app.zoom_level, 0);
+    }
+
+    #[test]
+    fn reflowable_page_count_stays_unknown_until_pagination_completes() {
+        let mut app = App::new(999);
+        app.set_document_kind(DocumentKind::Reflowable);
+        assert!(!app.pagination_complete);
+        assert_eq!(app.page, 999);
+        assert!(
+            app.msg
+                .text(app.page, app.n_pages, false, false)
+                .starts_with("1000/?")
+        );
+
+        app.set_document(DocumentKind::Reflowable, 962);
+        assert!(app.pagination_complete);
+        assert_eq!(app.page, 961);
+        assert!(
+            app.msg
+                .text(app.page, app.n_pages, true, false)
+                .starts_with("962/962")
+        );
+    }
+
+    #[test]
+    fn reflowable_navigation_does_not_wait_for_page_count() {
+        let mut app = App::new(0);
+        app.set_document_kind(DocumentKind::Reflowable);
+
+        assert!(app.next_page());
+        assert_eq!(app.page, 1);
+        assert_eq!(app.n_pages, 2);
+        assert_eq!(app.scroll_down(viewport(), 1_000), ScrollAction::TurnNext);
+        assert!(app.next_page());
+        assert_eq!(app.page, 2);
+        assert!(!app.pagination_complete);
     }
 
     #[test]

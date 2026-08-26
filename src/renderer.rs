@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -20,12 +20,21 @@ use crate::{
     compositor::{HighlightRect, PageImage, crop_whitespace_image},
     error::RenderError,
     geometry::WindowSize,
+    markup::{
+        ThemeMode,
+        markdown::{MarkupDocument, MarkupKind},
+    },
+    office,
 };
 
 const MAX_RENDER_DIMENSION: f32 = 16_384.0;
+const MAX_MARKUP_PAGE_PIXELS: u64 = 16_700_000;
 const EPUB_LAYOUT_MIN_W: f32 = 260.0;
 const EPUB_LAYOUT_MAX_W: f32 = 396.0;
 const EPUB_LAYOUT_ASPECT: f32 = 595.0 / 420.0;
+const EPUB_LANDSCAPE_MIN_W: f32 = 420.0;
+const EPUB_LANDSCAPE_MAX_W: f32 = 595.0;
+const EPUB_LANDSCAPE_ASPECT: f32 = 420.0 / 595.0;
 const SLOW_RENDER_WARN: Duration = Duration::from_secs(5);
 pub const MUPDF_BLACK: i32 = 0;
 pub const MUPDF_WHITE: i32 = i32::from_be_bytes([0, 0xff, 0xff, 0xff]);
@@ -36,6 +45,46 @@ pub const TINT_WHITE: i32 = i32::from_be_bytes([0, 0xF5, 0xE6, 0xC8]);
 pub enum DocumentKind {
     Fixed,
     Reflowable,
+    Markdown,
+    Mermaid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderBackend {
+    MuPdf,
+    Markdown,
+    Mermaid,
+    /// Office documents (PPTX/DOCX/ODP/ODT) converted to PDF by LibreOffice before opening.
+    Office,
+}
+
+pub fn detect_backend(path: &Path) -> RenderBackend {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("md" | "markdown" | "mkd") => RenderBackend::Markdown,
+        Some("mmd" | "mermaid") => RenderBackend::Mermaid,
+        Some("pptx" | "docx" | "odp" | "odt") => RenderBackend::Office,
+        _ => RenderBackend::MuPdf,
+    }
+}
+
+pub fn is_epub(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+}
+
+/// Paper choices shared by every open: markup paper theme and page orientation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaperStyle {
+    /// Markup paper theme.
+    pub theme: ThemeMode,
+    /// Landscape orientation for markup pages and reflowable layout.
+    pub landscape: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -52,6 +101,13 @@ pub struct TocEntry {
     pub level: usize,
 }
 
+#[derive(Debug)]
+struct PaginationResult {
+    n_pages: usize,
+    toc: Vec<TocEntry>,
+    metadata: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RenderOptions {
     pub width_px: f32,
@@ -62,6 +118,7 @@ pub struct RenderOptions {
     pub black: i32,
     pub white: i32,
     pub epub_font_size: f32,
+    pub zoom_factor: f32,
     pub search_term: Option<String>,
     pub generation: u64,
 }
@@ -77,6 +134,7 @@ impl RenderOptions {
             black: MUPDF_BLACK,
             white: MUPDF_WHITE,
             epub_font_size: 11.0,
+            zoom_factor: 1.0,
             search_term: None,
             generation,
         }
@@ -89,7 +147,7 @@ pub enum RenderCmd {
         options: RenderOptions,
     },
     Search(String),
-    ClearCache,
+    Reload,
     GetLinks(usize),
     Export {
         page: usize,
@@ -106,6 +164,9 @@ pub enum RenderEvent {
         n_pages: usize,
         toc: Vec<TocEntry>,
         metadata: Vec<(String, String)>,
+        document_revision: u64,
+        reloaded: bool,
+        pagination_complete: bool,
     },
     Page {
         page: usize,
@@ -129,12 +190,12 @@ pub struct RenderThread {
 }
 
 impl RenderThread {
-    pub fn spawn(path: PathBuf, viewport: WindowSize) -> Self {
+    pub fn spawn(path: PathBuf, viewport: WindowSize, style: PaperStyle) -> Self {
         let (commands, command_rx) = flume::unbounded();
         let (event_tx, events) = flume::unbounded();
         let join = thread::Builder::new()
             .name("vvrd-render".to_owned())
-            .spawn(move || run_render_thread(path, viewport, command_rx, event_tx))
+            .spawn(move || run_render_thread(path, viewport, style, command_rx, event_tx))
             .expect("failed to spawn document render thread");
         Self {
             commands,
@@ -160,13 +221,416 @@ impl Drop for RenderThread {
     }
 }
 
+enum BackendDocument {
+    MuPdf {
+        document: Document,
+        kind: DocumentKind,
+        layout: Option<(f32, f32, f32)>,
+    },
+    Markup(MarkupDocument),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReflowLayout {
+    width_px: f32,
+    height_px: f32,
+    font_size: f32,
+}
+
+impl BackendDocument {
+    fn open(
+        path: &Path,
+        viewport: WindowSize,
+        epub_font_size: f32,
+        style: PaperStyle,
+    ) -> Result<Self, RenderError> {
+        match detect_backend(path) {
+            RenderBackend::MuPdf => {
+                let document = open_document(path, viewport, epub_font_size, style.landscape)?;
+                let kind = document_kind(&document);
+                let layout = matches!(kind, DocumentKind::Reflowable).then_some((
+                    viewport.page_area_width_px() as f32,
+                    viewport.page_area_height_px() as f32,
+                    epub_font_size,
+                ));
+                Ok(Self::MuPdf {
+                    document,
+                    kind,
+                    layout,
+                })
+            }
+            // Office documents become ordinary fixed-layout PDFs; every later stage (cache,
+            // search, export, reload) works on the converted file, which `ensure_pdf` re-derives
+            // from the source content, so reloading picks up source edits.
+            RenderBackend::Office => {
+                let pdf = office::ensure_pdf(path)?;
+                let document = open_document(&pdf, viewport, epub_font_size, style.landscape)?;
+                Ok(Self::MuPdf {
+                    kind: document_kind(&document),
+                    document,
+                    layout: None,
+                })
+            }
+            RenderBackend::Markdown | RenderBackend::Mermaid => {
+                let kind = match detect_backend(path) {
+                    RenderBackend::Markdown => MarkupKind::Markdown,
+                    RenderBackend::Mermaid => MarkupKind::Mermaid,
+                    RenderBackend::MuPdf | RenderBackend::Office => unreachable!(),
+                };
+                MarkupDocument::open(path, kind, style.theme, style.landscape)
+                    .map(Self::Markup)
+                    .map_err(|error| RenderError::Markup(error.to_string()))
+            }
+        }
+    }
+
+    fn kind(&self) -> DocumentKind {
+        match self {
+            Self::MuPdf { kind, .. } => *kind,
+            Self::Markup(document) => match document.kind() {
+                MarkupKind::Markdown => DocumentKind::Markdown,
+                MarkupKind::Mermaid => DocumentKind::Mermaid,
+            },
+        }
+    }
+
+    fn page_count(&self) -> usize {
+        match self {
+            Self::MuPdf { document, .. } => usize::try_from(document.page_count().unwrap_or(0))
+                .unwrap_or(0)
+                .max(1),
+            Self::Markup(document) => document.page_count(),
+        }
+    }
+
+    fn epub_font_size(&self) -> f32 {
+        match self {
+            Self::MuPdf {
+                layout: Some((_, _, size)),
+                ..
+            } => *size,
+            _ => 11.0,
+        }
+    }
+
+    fn reflow_layout(&self) -> Option<ReflowLayout> {
+        match self {
+            Self::MuPdf {
+                layout: Some((width_px, height_px, font_size)),
+                ..
+            } => Some(ReflowLayout {
+                width_px: *width_px,
+                height_px: *height_px,
+                font_size: *font_size,
+            }),
+            _ => None,
+        }
+    }
+
+    fn update_layout(
+        &mut self,
+        options: &RenderOptions,
+        landscape: bool,
+    ) -> Result<bool, RenderError> {
+        let Self::MuPdf {
+            document,
+            kind,
+            layout,
+        } = self
+        else {
+            return Ok(false);
+        };
+        if !matches!(kind, DocumentKind::Reflowable) {
+            return Ok(false);
+        }
+        let next = (options.width_px, options.height_px, options.epub_font_size);
+        if *layout == Some(next) {
+            return Ok(false);
+        }
+        let (width, height, em) = epub_layout_for_area(next.0, next.1, next.2, landscape);
+        document.layout(width, height, em)?;
+        *layout = Some(next);
+        *kind = document_kind(document);
+        Ok(true)
+    }
+
+    fn toc(&self) -> Vec<TocEntry> {
+        match self {
+            Self::MuPdf { document, .. } => {
+                let mut toc = Vec::new();
+                if let Ok(outlines) = document.outlines() {
+                    flatten_outlines(&outlines, 0, &mut toc);
+                }
+                toc
+            }
+            Self::Markup(document) => document.toc().to_vec(),
+        }
+    }
+
+    fn metadata(&self) -> Vec<(String, String)> {
+        match self {
+            Self::MuPdf { document, .. } => extract_metadata(document),
+            Self::Markup(document) => document.metadata().to_vec(),
+        }
+    }
+
+    fn page_text(&self, page: usize) -> String {
+        match self {
+            Self::MuPdf { document, .. } => extract_page_text(document, page),
+            Self::Markup(document) => document.page_text(page).to_owned(),
+        }
+    }
+
+    fn page_links(&self, page: usize) -> Vec<LinkInfo> {
+        match self {
+            Self::MuPdf { document, .. } => extract_links(document, page),
+            Self::Markup(document) => document.page_links(page),
+        }
+    }
+
+    fn search(&self, term: &str) -> Result<Vec<usize>, RenderError> {
+        match self {
+            Self::MuPdf { document, .. } => search_document(document, term),
+            Self::Markup(document) => Ok(document.search_counts(term)),
+        }
+    }
+
+    fn export_page(
+        &self,
+        page: usize,
+        options: &RenderOptions,
+        output: &Path,
+        auto_crop: bool,
+    ) -> Result<(), RenderError> {
+        let image = match self {
+            Self::MuPdf { document, .. } => render_loaded_page(document, page, options)?,
+            Self::Markup(document) => render_markup_page(document, page, options)?,
+        }
+        .into_rgb()
+        .map_err(|error| RenderError::Converting(error.to_string()))?;
+        let image = if auto_crop {
+            crop_whitespace_image(image)
+        } else {
+            image
+        };
+        image
+            .save_with_format(output, image::ImageFormat::Png)
+            .map_err(|error| {
+                RenderError::Converting(format!("cannot write {}: {error}", output.display()))
+            })
+    }
+}
+
+fn send_backend_opened(
+    document: &BackendDocument,
+    document_revision: u64,
+    reloaded: bool,
+    events: &Sender<RenderEvent>,
+) -> bool {
+    events
+        .send(RenderEvent::Opened {
+            kind: document.kind(),
+            n_pages: document.page_count(),
+            toc: document.toc(),
+            metadata: document.metadata(),
+            document_revision,
+            reloaded,
+            pagination_complete: true,
+        })
+        .is_ok()
+}
+
+fn send_reflowable_opened(
+    document: &BackendDocument,
+    document_revision: u64,
+    reloaded: bool,
+    events: &Sender<RenderEvent>,
+) -> bool {
+    events
+        .send(RenderEvent::Opened {
+            kind: document.kind(),
+            n_pages: 1,
+            toc: Vec::new(),
+            metadata: document.metadata(),
+            document_revision,
+            reloaded,
+            pagination_complete: false,
+        })
+        .is_ok()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PaginationRequest {
+    sequence: u64,
+    document_revision: u64,
+    layout: ReflowLayout,
+}
+
+#[derive(Default)]
+struct PaginationState {
+    pending: Option<PaginationRequest>,
+    latest_sequence: u64,
+    stopped: bool,
+}
+
+struct ReflowPaginator {
+    state: Arc<(Mutex<PaginationState>, Condvar)>,
+}
+
+impl ReflowPaginator {
+    fn spawn(path: PathBuf, landscape: bool, events: Sender<RenderEvent>) -> ReflowPaginator {
+        let state = Arc::new((Mutex::new(PaginationState::default()), Condvar::new()));
+        let worker_state = Arc::clone(&state);
+        thread::Builder::new()
+            .name("vvrd-epub-pagination".to_owned())
+            .spawn(move || run_pagination_thread(path, landscape, events, worker_state))
+            .expect("failed to spawn EPUB pagination thread");
+        Self { state }
+    }
+
+    fn request(&self, document_revision: u64, layout: ReflowLayout) {
+        let (state, ready) = &*self.state;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.latest_sequence = state.latest_sequence.wrapping_add(1).max(1);
+        state.pending = Some(PaginationRequest {
+            sequence: state.latest_sequence,
+            document_revision,
+            layout,
+        });
+        ready.notify_one();
+    }
+
+    fn stop(&self) {
+        let (state, ready) = &*self.state;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.stopped = true;
+        state.pending = None;
+        state.latest_sequence = state.latest_sequence.wrapping_add(1).max(1);
+        ready.notify_one();
+    }
+}
+
+impl Drop for ReflowPaginator {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn run_pagination_thread(
+    path: PathBuf,
+    landscape: bool,
+    events: Sender<RenderEvent>,
+    shared: Arc<(Mutex<PaginationState>, Condvar)>,
+) {
+    loop {
+        let request = {
+            let (state, ready) = &*shared;
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while state.pending.is_none() && !state.stopped {
+                state = ready
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            if state.stopped {
+                return;
+            }
+            state
+                .pending
+                .take()
+                .expect("pagination request disappeared")
+        };
+
+        // MuPDF cannot interrupt a layout pass once it starts, so check for a newer request
+        // before committing to one as well as after. A superseded pass is run to completion and
+        // its result discarded; `pending` holds only the newest request, so at most one pass is
+        // in flight and one is queued.
+        if superseded(&shared, request.sequence) {
+            continue;
+        }
+        let result = paginate_reflowable(&path, request.layout, landscape);
+        if superseded(&shared, request.sequence) {
+            continue;
+        }
+        let event = match result {
+            Ok(result) => RenderEvent::Opened {
+                kind: DocumentKind::Reflowable,
+                n_pages: result.n_pages,
+                toc: result.toc,
+                metadata: result.metadata,
+                document_revision: request.document_revision,
+                reloaded: false,
+                pagination_complete: true,
+            },
+            Err(error) => RenderEvent::Error(format!("EPUB pagination failed: {error}")),
+        };
+        if events.send(event).is_err() {
+            return;
+        }
+    }
+}
+
+/// Whether a newer pagination request (or shutdown) has replaced `sequence`.
+fn superseded(shared: &(Mutex<PaginationState>, Condvar), sequence: u64) -> bool {
+    let (state, _) = shared;
+    let state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.stopped || state.latest_sequence != sequence
+}
+
+/// Count pages and read the outline for a reflowable document.
+///
+/// Runs on the pagination thread against its own `Document`. A MuPDF document is single-threaded,
+/// but one cloned context per thread is MuPDF's supported model, so the render thread keeps
+/// serving page requests while this pass runs.
+fn paginate_reflowable(
+    path: &Path,
+    layout: ReflowLayout,
+    landscape: bool,
+) -> Result<PaginationResult, RenderError> {
+    let mut document = open_mupdf_document(path)?;
+    if !document.is_reflowable().unwrap_or(false) {
+        return Err(RenderError::InvalidDocument(
+            "document is no longer reflowable".to_owned(),
+        ));
+    }
+    let (width, height, em) = epub_layout_for_area(
+        layout.width_px,
+        layout.height_px,
+        layout.font_size,
+        landscape,
+    );
+    document.layout(width, height, em)?;
+    let n_pages = usize::try_from(document.page_count()?).unwrap_or(0);
+    if n_pages == 0 {
+        return Err(RenderError::EmptyDocument);
+    }
+    let mut toc = Vec::new();
+    if let Ok(outlines) = document.outlines() {
+        flatten_outlines(&outlines, 0, &mut toc);
+    }
+    Ok(PaginationResult {
+        n_pages,
+        toc,
+        metadata: extract_metadata(&document),
+    })
+}
+
 fn run_render_thread(
     path: PathBuf,
     viewport: WindowSize,
+    style: PaperStyle,
     commands: Receiver<RenderCmd>,
     events: Sender<RenderEvent>,
 ) {
-    let mut document = match open_document(&path, viewport, 11.0) {
+    let landscape = style.landscape;
+    let mut document = match BackendDocument::open(&path, viewport, 11.0, style) {
         Ok(document) => document,
         Err(error) => {
             let _ = events.send(RenderEvent::Error(error.to_string()));
@@ -174,13 +638,16 @@ fn run_render_thread(
             return;
         }
     };
-    let mut kind = document_kind(&document);
-    let mut layout = matches!(kind, DocumentKind::Reflowable).then_some((
-        viewport.page_area_width_px() as f32,
-        viewport.page_area_height_px() as f32,
-        11.0,
-    ));
-    if !send_opened(&document, kind, &events) {
+    let mut document_revision = 1u64;
+    let mut pagination_pending = matches!(document.kind(), DocumentKind::Reflowable);
+    let mut paginator =
+        pagination_pending.then(|| ReflowPaginator::spawn(path.clone(), landscape, events.clone()));
+    let opened = if pagination_pending {
+        send_reflowable_opened(&document, document_revision, false, &events)
+    } else {
+        send_backend_opened(&document, document_revision, false, &events)
+    };
+    if !opened {
         return;
     }
 
@@ -189,70 +656,95 @@ fn run_render_thread(
     let heartbeat = RenderHeartbeat::start(events.clone());
     while let Some(command) = next_render_command(&commands, &mut deferred) {
         let mut prerender_request = None;
+        let mut request_pagination_after_render = false;
         let result = match command {
             RenderCmd::Render { page, options } => {
-                if matches!(kind, DocumentKind::Reflowable) {
-                    let next = (options.width_px, options.height_px, options.epub_font_size);
-                    if layout != Some(next) {
-                        let (width, height, em) = epub_layout_for_area(next.0, next.1, next.2);
-                        match document.layout(width, height, em) {
-                            Ok(()) => {
-                                layout = Some(next);
-                                cache.clear();
-                                kind = document_kind(&document);
-                                let _ = send_opened(&document, kind, &events);
-                            }
-                            Err(error) => {
-                                let _ = events.send(RenderEvent::Error(error.to_string()));
-                                continue;
-                            }
+                request_pagination_after_render = pagination_pending;
+                match document.update_layout(&options, landscape) {
+                    Ok(true) => {
+                        cache.clear();
+                        if matches!(document.kind(), DocumentKind::Reflowable) {
+                            pagination_pending = true;
+                            request_pagination_after_render = true;
+                            let _ = send_reflowable_opened(
+                                &document,
+                                document_revision,
+                                false,
+                                &events,
+                            );
+                        } else {
+                            let _ =
+                                send_backend_opened(&document, document_revision, false, &events);
                         }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        let _ = events.send(RenderEvent::Error(error.to_string()));
+                        continue;
                     }
                 }
                 let key = CacheKey::new(page, &options);
                 let image = if let Some(image) = cache.get(&key) {
                     Ok(image)
                 } else {
-                    render_with_isolation(&document, page, &options, &heartbeat).inspect(|image| {
-                        cache.insert(key, image.clone());
-                    })
+                    render_backend_with_isolation(&document, page, &options, &heartbeat).inspect(
+                        |image| {
+                            cache.insert(key, image.clone());
+                        },
+                    )
                 };
                 let event = image.map(|image| RenderEvent::Page {
                     page,
                     generation: options.generation,
                     image,
-                    text: extract_page_text(&document, page),
-                    links: extract_links(&document, page),
+                    text: document.page_text(page),
+                    links: document.page_links(page),
                 });
                 if event.is_ok() {
                     prerender_request = Some((page, options));
                 }
                 event
             }
-            RenderCmd::Search(term) => {
-                search_document(&document, &term).map(RenderEvent::SearchComplete)
-            }
-            RenderCmd::ClearCache => {
-                cache.clear();
+            RenderCmd::Search(term) => document.search(&term).map(RenderEvent::SearchComplete),
+            RenderCmd::Reload => {
+                match BackendDocument::open(&path, viewport, document.epub_font_size(), style) {
+                    Ok(replacement) => {
+                        document = replacement;
+                        document_revision = document_revision.saturating_add(1);
+                        cache.clear();
+                        if matches!(document.kind(), DocumentKind::Reflowable) {
+                            pagination_pending = true;
+                            if paginator.is_none() {
+                                paginator = Some(ReflowPaginator::spawn(
+                                    path.clone(),
+                                    landscape,
+                                    events.clone(),
+                                ));
+                            }
+                            let _ =
+                                send_reflowable_opened(&document, document_revision, true, &events);
+                        } else {
+                            let _ =
+                                send_backend_opened(&document, document_revision, true, &events);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = events.send(RenderEvent::Error(format!(
+                            "reload failed; keeping the previous document: {error}"
+                        )));
+                    }
+                }
                 continue;
             }
-            RenderCmd::GetLinks(page) => Ok(RenderEvent::Links(extract_links(&document, page))),
+            RenderCmd::GetLinks(page) => Ok(RenderEvent::Links(document.page_links(page))),
             RenderCmd::Export {
                 page,
                 output,
                 options,
                 auto_crop,
-            } => export_page(&document, page, &options, &output).and_then(|()| {
-                if auto_crop {
-                    let image = render_loaded_page(&document, page, &options)?
-                        .into_rgb()
-                        .map_err(|error| RenderError::Converting(error.to_string()))?;
-                    crop_whitespace_image(image)
-                        .save_with_format(&output, image::ImageFormat::Png)
-                        .map_err(|error| RenderError::Converting(error.to_string()))?;
-                }
-                Ok(RenderEvent::Exported(output))
-            }),
+            } => document
+                .export_page(page, &options, &output, auto_crop)
+                .map(|()| RenderEvent::Exported(output)),
             RenderCmd::Shutdown => break,
         };
         match result {
@@ -265,12 +757,22 @@ fn run_render_thread(
                 let _ = events.send(RenderEvent::Error(error.to_string()));
             }
         }
+        if request_pagination_after_render
+            && let (Some(paginator), Some(layout)) = (&paginator, document.reflow_layout())
+        {
+            // Finish and publish the requested page before the helper process begins the
+            // whole-book pass. Process isolation keeps MuPDF's global state out of this renderer,
+            // so arrow-key page requests remain responsive while pagination runs.
+            paginator.request(document_revision, layout);
+            pagination_pending = false;
+        }
         if let Some((page, options)) = prerender_request
             && commands.is_empty()
         {
-            prerender_neighbors(&document, page, &options, &mut cache);
+            prerender_backend_neighbors(&document, page, &options, &mut cache, &commands);
         }
     }
+    drop(paginator);
     heartbeat.stop();
     let _ = events.send(RenderEvent::Stopped);
 }
@@ -339,15 +841,16 @@ impl RenderHeartbeat {
     }
 }
 
-fn render_with_isolation(
-    document: &Document,
+fn render_backend_with_isolation(
+    document: &BackendDocument,
     page: usize,
     options: &RenderOptions,
     heartbeat: &RenderHeartbeat,
 ) -> Result<PageImage, RenderError> {
     heartbeat.begin(page);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        render_loaded_page(document, page, options)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match document {
+        BackendDocument::MuPdf { document, .. } => render_loaded_page(document, page, options),
+        BackendDocument::Markup(document) => render_markup_page(document, page, options),
     }));
     heartbeat.end();
     match result {
@@ -441,25 +944,44 @@ impl RenderCache {
     }
 }
 
-fn prerender_neighbors(
-    document: &Document,
+fn prerender_backend_neighbors(
+    document: &BackendDocument,
     page: usize,
     options: &RenderOptions,
     cache: &mut RenderCache,
+    commands: &Receiver<RenderCmd>,
 ) {
-    let count = usize::try_from(document.page_count().unwrap_or(0)).unwrap_or(0);
+    let count = match document {
+        // Calling `page_count` for EPUB is a whole-book layout pass. A missing next page is cheap
+        // to discover through `load_page`, so speculative neighbor rendering must never paginate.
+        BackendDocument::MuPdf {
+            kind: DocumentKind::Reflowable,
+            ..
+        } => None,
+        _ => Some(document.page_count()),
+    };
     for neighbor in [
-        page.checked_add(1).filter(|value| *value < count),
+        page.checked_add(1)
+            .filter(|value| count.is_none_or(|count| *value < count)),
         page.checked_sub(1),
     ]
     .into_iter()
     .flatten()
     {
+        if !commands.is_empty() {
+            break;
+        }
         let key = CacheKey::new(neighbor, options);
         if cache.pages.contains_key(&key) {
             continue;
         }
-        if let Ok(image) = render_loaded_page(document, neighbor, options) {
+        let rendered = match document {
+            BackendDocument::MuPdf { document, .. } => {
+                render_loaded_page(document, neighbor, options)
+            }
+            BackendDocument::Markup(document) => render_markup_page(document, neighbor, options),
+        };
+        if let Ok(image) = rendered {
             cache.insert(key, image);
         }
     }
@@ -488,23 +1010,43 @@ fn open_document(
     path: &Path,
     viewport: WindowSize,
     epub_font_size: f32,
+    landscape: bool,
 ) -> Result<Document, RenderError> {
-    #[cfg(windows)]
-    let path = path.to_string_lossy();
-    #[cfg_attr(unix, allow(clippy::borrow_deref_ref))]
-    let mut document = Document::open(&*path)?;
+    let mut document = open_mupdf_document(path)?;
     if document.is_reflowable().unwrap_or(false) {
         let (width, height, em) = epub_layout_for_area(
             viewport.page_area_width_px() as f32,
             viewport.page_area_height_px() as f32,
             epub_font_size,
+            landscape,
         );
         document.layout(width, height, em)?;
     }
-    if document.page_count()? <= 0 {
+    if !document.is_reflowable().unwrap_or(false) && document.page_count()? <= 0 {
         return Err(RenderError::EmptyDocument);
     }
     Ok(document)
+}
+
+/// Verify that MuPDF can recognize an EPUB without forcing it to paginate the whole book.
+///
+/// EPUB pagination parses and lays out every chapter. The real renderer must do that work, so doing
+/// it in the crash-isolating preflight child as well can double startup time for large books.
+pub fn probe_epub(path: &Path) -> Result<(), RenderError> {
+    let document = open_mupdf_document(path)?;
+    if !document.is_reflowable().unwrap_or(false) {
+        return Err(RenderError::InvalidDocument(
+            "document is not a reflowable EPUB".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn open_mupdf_document(path: &Path) -> Result<Document, RenderError> {
+    #[cfg(windows)]
+    let path = path.to_string_lossy();
+    #[cfg_attr(unix, allow(clippy::borrow_deref_ref))]
+    Ok(Document::open(&*path)?)
 }
 
 fn document_kind(document: &Document) -> DocumentKind {
@@ -513,24 +1055,6 @@ fn document_kind(document: &Document) -> DocumentKind {
     } else {
         DocumentKind::Fixed
     }
-}
-
-fn send_opened(document: &Document, kind: DocumentKind, events: &Sender<RenderEvent>) -> bool {
-    let n_pages = usize::try_from(document.page_count().unwrap_or(0))
-        .unwrap_or(0)
-        .max(1);
-    let mut toc = Vec::new();
-    if let Ok(outlines) = document.outlines() {
-        flatten_outlines(&outlines, 0, &mut toc);
-    }
-    events
-        .send(RenderEvent::Opened {
-            kind,
-            n_pages,
-            toc,
-            metadata: extract_metadata(document),
-        })
-        .is_ok()
 }
 
 pub struct RenderedDocument {
@@ -543,18 +1067,19 @@ pub fn render_page(
     path: &Path,
     requested_page: usize,
     viewport: WindowSize,
+    style: PaperStyle,
 ) -> Result<RenderedDocument, RenderError> {
-    let document = open_document(path, viewport, 11.0)?;
-    let n_pages = usize::try_from(document.page_count()?).unwrap_or(0);
+    let document = BackendDocument::open(path, viewport, 11.0, style)?;
+    let n_pages = document.page_count();
     if n_pages == 0 {
         return Err(RenderError::EmptyDocument);
     }
     let page_num = requested_page.min(n_pages - 1);
-    let page = render_loaded_page(
-        &document,
-        page_num,
-        &RenderOptions::for_viewport(viewport, 1),
-    )?;
+    let options = RenderOptions::for_viewport(viewport, 1);
+    let page = match &document {
+        BackendDocument::MuPdf { document, .. } => render_loaded_page(document, page_num, &options),
+        BackendDocument::Markup(document) => render_markup_page(document, page_num, &options),
+    }?;
     Ok(RenderedDocument {
         page,
         page_num,
@@ -569,27 +1094,106 @@ pub fn export_document_page(
     options: &RenderOptions,
     output: &Path,
     auto_crop: bool,
+    style: PaperStyle,
 ) -> Result<(), RenderError> {
-    let document = open_document(path, viewport, options.epub_font_size)?;
-    if auto_crop {
-        let image = render_loaded_page(&document, page, options)?
-            .into_rgb()
-            .map_err(|error| RenderError::Converting(error.to_string()))?;
-        crop_whitespace_image(image)
-            .save_with_format(output, image::ImageFormat::Png)
-            .map_err(|error| RenderError::Converting(error.to_string()))
-    } else {
-        export_page(&document, page, options, output)
-    }
+    let document = BackendDocument::open(path, viewport, options.epub_font_size, style)?;
+    document.export_page(page, options, output, auto_crop)
 }
 
 pub fn document_page_count(
     path: &Path,
     viewport: WindowSize,
     epub_font_size: f32,
+    style: PaperStyle,
 ) -> Result<usize, RenderError> {
-    let document = open_document(path, viewport, epub_font_size)?;
-    Ok(usize::try_from(document.page_count()?).unwrap_or(0))
+    Ok(BackendDocument::open(path, viewport, epub_font_size, style)?.page_count())
+}
+
+fn render_markup_page(
+    document: &MarkupDocument,
+    page_num: usize,
+    options: &RenderOptions,
+) -> Result<PageImage, RenderError> {
+    let rendered = document
+        .render_page(page_num, options.search_term.as_deref())
+        .map_err(|error| RenderError::Markup(error.to_string()))?;
+    let mut image = rendered.image;
+    let mut highlights = rendered.highlights;
+
+    let requested_zoom = if options.zoom_factor.is_finite() {
+        options.zoom_factor.max(1.0)
+    } else {
+        1.0
+    };
+    let pixel_scale = (MAX_MARKUP_PAGE_PIXELS as f64
+        / (u64::from(image.width()) * u64::from(image.height())) as f64)
+        .sqrt() as f32;
+    let dimension_scale =
+        (MAX_RENDER_DIMENSION / image.width().max(image.height()) as f32).max(f32::EPSILON);
+    let scale = requested_zoom.min(pixel_scale).min(dimension_scale);
+    if scale > 1.0 + f32::EPSILON {
+        let width = (image.width() as f32 * scale).round().max(1.0) as u32;
+        let height = (image.height() as f32 * scale).round().max(1.0) as u32;
+        image =
+            image::imageops::resize(&image, width, height, image::imageops::FilterType::Lanczos3);
+        for rect in &mut highlights {
+            rect.x0 = (rect.x0 as f32 * scale).round() as u32;
+            rect.y0 = (rect.y0 as f32 * scale).round() as u32;
+            rect.x1 = (rect.x1 as f32 * scale).round() as u32;
+            rect.y1 = (rect.y1 as f32 * scale).round() as u32;
+        }
+    }
+
+    for _ in 0..((options.rotation % 360) / 90) {
+        let old_height = image.height();
+        image = image::imageops::rotate90(&image);
+        for rect in &mut highlights {
+            let previous = *rect;
+            rect.x0 = old_height.saturating_sub(previous.y1);
+            rect.y0 = previous.x0;
+            rect.x1 = old_height.saturating_sub(previous.y0);
+            rect.y1 = previous.x1;
+        }
+    }
+    apply_markup_colors(&mut image, options);
+
+    let width = image.width();
+    let height = image.height();
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 3);
+    for pixel in image.pixels() {
+        pixels.extend_from_slice(&pixel.0[..3]);
+    }
+    Ok(PageImage {
+        pixels,
+        width,
+        height,
+        row_stride: width as usize * 3,
+        highlights,
+    })
+}
+
+fn apply_markup_colors(image: &mut image::RgbaImage, options: &RenderOptions) {
+    let (mut black, mut white) = if options.tinted {
+        (TINT_BLACK, TINT_WHITE)
+    } else {
+        (options.black, options.white)
+    };
+    if options.inverted {
+        std::mem::swap(&mut black, &mut white);
+    }
+    if black == MUPDF_BLACK && white == MUPDF_WHITE {
+        return;
+    }
+    let black = black.to_be_bytes();
+    let white = white.to_be_bytes();
+    for pixel in image.pixels_mut() {
+        for channel in 0..3 {
+            let low = i32::from(black[channel + 1]);
+            let high = i32::from(white[channel + 1]);
+            pixel[channel] =
+                (low + (i32::from(pixel[channel]) * (high - low) / 255)).clamp(0, 255) as u8;
+        }
+    }
 }
 
 fn render_loaded_page(
@@ -597,15 +1201,17 @@ fn render_loaded_page(
     page_num: usize,
     options: &RenderOptions,
 ) -> Result<PageImage, RenderError> {
-    let count = usize::try_from(document.page_count()?).unwrap_or(0);
-    if count == 0 {
-        return Err(RenderError::EmptyDocument);
-    }
-    let page = document.load_page(page_num.min(count - 1) as i32)?;
+    let page_number = i32::try_from(page_num).map_err(|_| {
+        RenderError::InvalidDocument(format!(
+            "page number {} exceeds MuPDF's supported range",
+            page_num.saturating_add(1)
+        ))
+    })?;
+    let page = document.load_page(page_number)?;
     let bounds = page.bounds()?;
     let natural_width = (bounds.x1 - bounds.x0).max(1.0);
     let natural_height = (bounds.y1 - bounds.y0).max(1.0);
-    let rotated = options.rotation % 180 != 0;
+    let rotated = !options.rotation.is_multiple_of(180);
     let dimensions = if rotated {
         (natural_height, natural_width)
     } else {
@@ -699,22 +1305,6 @@ fn highlight_rect(quad: Quad, scale: f32) -> HighlightRect {
     }
 }
 
-fn export_page(
-    document: &Document,
-    page: usize,
-    options: &RenderOptions,
-    output: &Path,
-) -> Result<(), RenderError> {
-    let image = render_loaded_page(document, page, options)?
-        .into_rgb()
-        .map_err(|error| RenderError::Converting(error.to_string()))?;
-    image
-        .save_with_format(output, image::ImageFormat::Png)
-        .map_err(|error| {
-            RenderError::Converting(format!("cannot write {}: {error}", output.display()))
-        })
-}
-
 fn extract_metadata(document: &Document) -> Vec<(String, String)> {
     let keys = [
         ("Format", MetadataName::Format),
@@ -792,21 +1382,370 @@ fn scale_fit((width, height): (f32, f32), (area_w, area_h): (f32, f32)) -> (f32,
     (width * scale, height * scale, scale)
 }
 
-fn epub_layout_for_area(area_w_px: f32, area_h_px: f32, em: f32) -> (f32, f32, f32) {
-    let layout_width = (area_w_px * 0.45).clamp(EPUB_LAYOUT_MIN_W, EPUB_LAYOUT_MAX_W);
-    let layout_height = (layout_width * EPUB_LAYOUT_ASPECT).min(area_h_px.max(layout_width));
+fn epub_layout_for_area(
+    area_w_px: f32,
+    area_h_px: f32,
+    em: f32,
+    landscape: bool,
+) -> (f32, f32, f32) {
+    let (min_w, max_w, aspect) = if landscape {
+        (
+            EPUB_LANDSCAPE_MIN_W,
+            EPUB_LANDSCAPE_MAX_W,
+            EPUB_LANDSCAPE_ASPECT,
+        )
+    } else {
+        (EPUB_LAYOUT_MIN_W, EPUB_LAYOUT_MAX_W, EPUB_LAYOUT_ASPECT)
+    };
+    let layout_width = (area_w_px * 0.45).clamp(min_w, max_w);
+    let layout_height = (layout_width * aspect).min(area_h_px.max(layout_width));
     (layout_width, layout_height, em.clamp(9.0, 18.0))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+        time::Duration,
+    };
+
     use super::*;
+
+    static TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_file(extension: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "vvrd-renderer-test-{}-{}.{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed),
+            extension
+        ))
+    }
+
+    fn paper_style(theme: ThemeMode) -> PaperStyle {
+        PaperStyle {
+            theme,
+            landscape: false,
+        }
+    }
 
     #[test]
     fn scale_fit_preserves_aspect_ratio() {
         let (width, height, scale) = scale_fit((600.0, 800.0), (1200.0, 800.0));
         assert_eq!((width, height), (600.0, 800.0));
         assert_eq!(scale, 1.0);
+    }
+
+    #[test]
+    fn backend_detection_is_case_insensitive_and_defaults_to_mupdf() {
+        for path in ["a.md", "a.MARKDOWN", "a.MkD"] {
+            assert_eq!(detect_backend(Path::new(path)), RenderBackend::Markdown);
+        }
+        for path in ["a.mmd", "a.MERMAID"] {
+            assert_eq!(detect_backend(Path::new(path)), RenderBackend::Mermaid);
+        }
+        for path in ["a.pptx", "Deck.PPTX", "a.docx", "b.Odt", "c.odp"] {
+            assert_eq!(detect_backend(Path::new(path)), RenderBackend::Office);
+        }
+        assert_eq!(detect_backend(Path::new("a.pdf")), RenderBackend::MuPdf);
+        assert_eq!(
+            detect_backend(Path::new("no-extension")),
+            RenderBackend::MuPdf
+        );
+        assert!(is_epub(Path::new("book.epub")));
+        assert!(is_epub(Path::new("BOOK.EPUB")));
+        assert!(!is_epub(Path::new("book.epub.pdf")));
+    }
+
+    #[test]
+    fn markup_transform_keeps_letter_dimensions_until_rotation() {
+        let document = MarkupDocument::parse(
+            "# Paper\n\ntext",
+            Path::new("."),
+            "paper",
+            MarkupKind::Markdown,
+            ThemeMode::Light,
+            false,
+        )
+        .unwrap();
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let mut options = RenderOptions::for_viewport(viewport, 1);
+        let page = render_markup_page(&document, 0, &options).unwrap();
+        assert_eq!((page.width, page.height), (2_040, 2_640));
+
+        options.rotation = 90;
+        let page = render_markup_page(&document, 0, &options).unwrap();
+        assert_eq!((page.width, page.height), (2_640, 2_040));
+    }
+
+    #[test]
+    fn markup_landscape_swaps_letter_dimensions_until_rotation() {
+        let document = MarkupDocument::parse(
+            "# Paper\n\ntext",
+            Path::new("."),
+            "paper",
+            MarkupKind::Markdown,
+            ThemeMode::Light,
+            true,
+        )
+        .unwrap();
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let mut options = RenderOptions::for_viewport(viewport, 1);
+        let page = render_markup_page(&document, 0, &options).unwrap();
+        assert_eq!((page.width, page.height), (2_640, 2_040));
+
+        options.rotation = 90;
+        let page = render_markup_page(&document, 0, &options).unwrap();
+        assert_eq!((page.width, page.height), (2_040, 2_640));
+    }
+
+    #[test]
+    fn markup_export_writes_the_full_current_letter_page() {
+        let document = MarkupDocument::parse(
+            "# Export\n\npage",
+            Path::new("."),
+            "export",
+            MarkupKind::Markdown,
+            ThemeMode::Light,
+            false,
+        )
+        .unwrap();
+        let output = temp_file("png");
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        BackendDocument::Markup(document)
+            .export_page(0, &RenderOptions::for_viewport(viewport, 1), &output, false)
+            .unwrap();
+        assert_eq!(image::image_dimensions(&output).unwrap(), (2_040, 2_640));
+        fs::remove_file(output).unwrap();
+    }
+
+    #[test]
+    fn successful_reload_changes_page_count_and_document_revision() {
+        let path = temp_file("md");
+        fs::write(&path, "# One\n").unwrap();
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let renderer = RenderThread::spawn(path.clone(), viewport, paper_style(ThemeMode::Light));
+        let opened = renderer
+            .events
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            opened,
+            RenderEvent::Opened {
+                document_revision: 1,
+                reloaded: false,
+                ..
+            }
+        ));
+
+        fs::write(&path, format!("# Many\n\n{}", "line\n\n".repeat(500))).unwrap();
+        renderer.commands.send(RenderCmd::Reload).unwrap();
+        let opened = renderer
+            .events
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(
+            opened,
+            RenderEvent::Opened {
+                document_revision: 2,
+                reloaded: true,
+                n_pages,
+                ..
+            } if n_pages > 1
+        ));
+        renderer.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reflowable_pagination_completes_in_process_after_the_first_page() {
+        // MuPDF treats `.html` as reflowable, so this drives the same paginator path an EPUB does
+        // without needing a binary fixture. The count has to arrive from the pagination thread —
+        // vvrd no longer re-executes itself to compute it.
+        let path = temp_file("html");
+        fs::write(
+            &path,
+            format!(
+                "<html><body>{}</body></html>",
+                "<p>paragraph</p>".repeat(400)
+            ),
+        )
+        .unwrap();
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let renderer = RenderThread::spawn(path.clone(), viewport, paper_style(ThemeMode::Light));
+
+        // Opens with the count unknown so navigation never waits for the whole-book pass.
+        assert!(matches!(
+            renderer
+                .events
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            RenderEvent::Opened {
+                kind: DocumentKind::Reflowable,
+                pagination_complete: false,
+                ..
+            }
+        ));
+
+        // Pagination is requested only once a requested page has been published.
+        renderer
+            .commands
+            .send(RenderCmd::Render {
+                page: 0,
+                options: RenderOptions::for_viewport(viewport, 1),
+            })
+            .unwrap();
+
+        let mut counted = None;
+        while let Ok(event) = renderer.events.recv_timeout(Duration::from_secs(30)) {
+            if let RenderEvent::Opened {
+                pagination_complete: true,
+                n_pages,
+                ..
+            } = event
+            {
+                counted = Some(n_pages);
+                break;
+            }
+        }
+        assert!(
+            matches!(counted, Some(n_pages) if n_pages > 1),
+            "pagination never reported a count: {counted:?}"
+        );
+        renderer.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_reload_keeps_the_previous_standalone_mermaid() {
+        let path = temp_file("mmd");
+        fs::write(&path, "flowchart LR\nA-->B").unwrap();
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let renderer = RenderThread::spawn(path.clone(), viewport, paper_style(ThemeMode::Light));
+        assert!(matches!(
+            renderer
+                .events
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            RenderEvent::Opened { .. }
+        ));
+
+        fs::write(&path, "not a mermaid diagram").unwrap();
+        renderer.commands.send(RenderCmd::Reload).unwrap();
+        assert!(matches!(
+            renderer.events.recv_timeout(Duration::from_secs(10)).unwrap(),
+            RenderEvent::Error(message) if message.contains("keeping the previous")
+        ));
+        renderer
+            .commands
+            .send(RenderCmd::Render {
+                page: 0,
+                options: RenderOptions::for_viewport(viewport, 1),
+            })
+            .unwrap();
+        assert!(matches!(
+            renderer
+                .events
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            RenderEvent::Page { page: 0, .. }
+        ));
+        renderer.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reload_rereads_modified_local_assets() {
+        let markdown = temp_file("md");
+        let directory = markdown.parent().unwrap();
+        let asset = directory.join(format!(
+            "vvrd-renderer-asset-{}-{}.png",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        image::RgbaImage::from_pixel(12, 12, image::Rgba([255, 0, 0, 255]))
+            .save(&asset)
+            .unwrap();
+        fs::write(
+            &markdown,
+            format!("![asset]({})", asset.file_name().unwrap().to_string_lossy()),
+        )
+        .unwrap();
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let renderer =
+            RenderThread::spawn(markdown.clone(), viewport, paper_style(ThemeMode::Light));
+        let _ = renderer
+            .events
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        renderer
+            .commands
+            .send(RenderCmd::Render {
+                page: 0,
+                options: RenderOptions::for_viewport(viewport, 1),
+            })
+            .unwrap();
+        let first = match renderer
+            .events
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+        {
+            RenderEvent::Page { image, .. } => image,
+            event => panic!("expected first rendered page, got {}", event_name(&event)),
+        };
+        assert!(
+            first
+                .pixels
+                .chunks_exact(3)
+                .any(|pixel| pixel == [255, 0, 0])
+        );
+
+        image::RgbaImage::from_pixel(12, 12, image::Rgba([0, 0, 255, 255]))
+            .save(&asset)
+            .unwrap();
+        renderer.commands.send(RenderCmd::Reload).unwrap();
+        let _ = renderer
+            .events
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        renderer
+            .commands
+            .send(RenderCmd::Render {
+                page: 0,
+                options: RenderOptions::for_viewport(viewport, 2),
+            })
+            .unwrap();
+        let second = match renderer
+            .events
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+        {
+            RenderEvent::Page { image, .. } => image,
+            event => panic!("expected reloaded page, got {}", event_name(&event)),
+        };
+        assert!(
+            second
+                .pixels
+                .chunks_exact(3)
+                .any(|pixel| pixel == [0, 0, 255])
+        );
+        renderer.shutdown();
+        fs::remove_file(asset).unwrap();
+        fs::remove_file(markdown).unwrap();
+    }
+
+    fn event_name(event: &RenderEvent) -> &'static str {
+        match event {
+            RenderEvent::Opened { .. } => "Opened",
+            RenderEvent::Page { .. } => "Page",
+            RenderEvent::SearchComplete(_) => "SearchComplete",
+            RenderEvent::Links(_) => "Links",
+            RenderEvent::Exported(_) => "Exported",
+            RenderEvent::Notice(_) => "Notice",
+            RenderEvent::Error(_) => "Error",
+            RenderEvent::Stopped => "Stopped",
+        }
     }
 
     #[test]
@@ -817,11 +1756,59 @@ mod tests {
     }
 
     #[test]
+    fn office_document_converts_and_renders_pages() {
+        if office::find_soffice().is_none() {
+            // A skip is not a pass: this must run on any machine claiming office support.
+            eprintln!("SKIPPED, no LibreOffice (soffice) on this machine");
+            return;
+        }
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/office/demo.pptx");
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let renderer = RenderThread::spawn(fixture, viewport, paper_style(ThemeMode::Light));
+        // The first conversion of a deck pays for LibreOffice cold start plus profile creation.
+        match renderer
+            .events
+            .recv_timeout(Duration::from_secs(180))
+            .unwrap()
+        {
+            RenderEvent::Opened { kind, n_pages, .. } => {
+                assert_eq!(kind, DocumentKind::Fixed);
+                assert!(n_pages >= 1);
+            }
+            event => panic!("expected Opened, got {}", event_name(&event)),
+        }
+        renderer
+            .commands
+            .send(RenderCmd::Render {
+                page: 0,
+                options: RenderOptions::for_viewport(viewport, 1),
+            })
+            .unwrap();
+        match renderer
+            .events
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap()
+        {
+            RenderEvent::Page { page, image, .. } => {
+                assert_eq!(page, 0);
+                assert!(image.width > 0 && image.height > 0);
+                assert_eq!(image.pixels.len() % 3, 0);
+            }
+            event => panic!("expected Page, got {}", event_name(&event)),
+        }
+        renderer.shutdown();
+    }
+
+    #[test]
     fn epub_layout_is_book_shaped_and_bounded() {
-        let (width, height, em) = epub_layout_for_area(1200.0, 800.0, 30.0);
+        let (width, height, em) = epub_layout_for_area(1200.0, 800.0, 30.0, false);
         assert!((EPUB_LAYOUT_MIN_W..=EPUB_LAYOUT_MAX_W).contains(&width));
         assert!(height > width);
         assert_eq!(em, 18.0);
+
+        let (width, height, _) = epub_layout_for_area(1200.0, 800.0, 30.0, true);
+        assert!((EPUB_LANDSCAPE_MIN_W..=EPUB_LANDSCAPE_MAX_W).contains(&width));
+        assert!(width > height);
     }
 
     #[test]

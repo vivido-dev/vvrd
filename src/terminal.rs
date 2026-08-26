@@ -173,7 +173,7 @@ pub fn draw_help(size: WindowSize) -> anyhow::Result<()> {
         "z zoom mode; o/O zoom in/out; r rotate; i invert",
         "c auto-crop; d warm tint; </> EPUB font size",
         "/ search; n/N next/previous result; t table of contents",
-        "M metadata; f links; e export PNG; R/F5 refresh; q quit",
+        "M metadata; f links; e export PNG; R/F5 manual reload; q quit",
     ];
     for (row, line) in lines
         .into_iter()

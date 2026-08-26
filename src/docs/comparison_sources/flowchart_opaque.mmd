@@ -1,0 +1,5 @@
+flowchart LR
+    Baldr[Baldr client] -->|4. Sends challenge| Forseti[Forseti service]
+    Forseti -->|5. Check connectivity and verify the complete challenge response| Baldr
+    Forseti --> Store[(Connectivity store)]
+    Baldr --> Gateway[Gateway]
