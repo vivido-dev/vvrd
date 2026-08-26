@@ -1,9 +1,7 @@
 use std::{
     any::Any,
     collections::{HashMap, VecDeque},
-    io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -37,7 +35,6 @@ const EPUB_LAYOUT_ASPECT: f32 = 595.0 / 420.0;
 const EPUB_LANDSCAPE_MIN_W: f32 = 420.0;
 const EPUB_LANDSCAPE_MAX_W: f32 = 595.0;
 const EPUB_LANDSCAPE_ASPECT: f32 = 420.0 / 595.0;
-const MAX_PAGINATION_RESULT_BYTES: usize = 4 * 1024 * 1024;
 const SLOW_RENDER_WARN: Duration = Duration::from_secs(5);
 pub const MUPDF_BLACK: i32 = 0;
 pub const MUPDF_WHITE: i32 = i32::from_be_bytes([0, 0xff, 0xff, 0xff]);
@@ -97,18 +94,18 @@ pub struct LinkInfo {
     pub page: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TocEntry {
     pub title: String,
     pub page: usize,
     pub level: usize,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub struct PaginationResult {
-    pub n_pages: usize,
-    pub toc: Vec<TocEntry>,
-    pub metadata: Vec<(String, String)>,
+#[derive(Debug)]
+struct PaginationResult {
+    n_pages: usize,
+    toc: Vec<TocEntry>,
+    metadata: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -549,23 +546,19 @@ fn run_pagination_thread(
                 .expect("pagination request disappeared")
         };
 
-        let result = paginate_reflowable_in_subprocess(
-            &path,
-            request.layout,
-            landscape,
-            &shared,
-            request.sequence,
-        );
-        let (state, _) = &*shared;
-        let state = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.stopped || state.latest_sequence != request.sequence {
+        // MuPDF cannot interrupt a layout pass once it starts, so check for a newer request
+        // before committing to one as well as after. A superseded pass is run to completion and
+        // its result discarded; `pending` holds only the newest request, so at most one pass is
+        // in flight and one is queued.
+        if superseded(&shared, request.sequence) {
             continue;
         }
-        drop(state);
+        let result = paginate_reflowable(&path, request.layout, landscape);
+        if superseded(&shared, request.sequence) {
+            continue;
+        }
         let event = match result {
-            Ok(Some(result)) => RenderEvent::Opened {
+            Ok(result) => RenderEvent::Opened {
                 kind: DocumentKind::Reflowable,
                 n_pages: result.n_pages,
                 toc: result.toc,
@@ -574,7 +567,6 @@ fn run_pagination_thread(
                 reloaded: false,
                 pagination_complete: true,
             },
-            Ok(None) => continue,
             Err(error) => RenderEvent::Error(format!("EPUB pagination failed: {error}")),
         };
         if events.send(event).is_err() {
@@ -583,139 +575,23 @@ fn run_pagination_thread(
     }
 }
 
-fn paginate_reflowable_in_subprocess(
+/// Whether a newer pagination request (or shutdown) has replaced `sequence`.
+fn superseded(shared: &(Mutex<PaginationState>, Condvar), sequence: u64) -> bool {
+    let (state, _) = shared;
+    let state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.stopped || state.latest_sequence != sequence
+}
+
+/// Count pages and read the outline for a reflowable document.
+///
+/// Runs on the pagination thread against its own `Document`. A MuPDF document is single-threaded,
+/// but one cloned context per thread is MuPDF's supported model, so the render thread keeps
+/// serving page requests while this pass runs.
+fn paginate_reflowable(
     path: &Path,
     layout: ReflowLayout,
-    landscape: bool,
-    shared: &Arc<(Mutex<PaginationState>, Condvar)>,
-    sequence: u64,
-) -> Result<Option<PaginationResult>, RenderError> {
-    let executable = std::env::current_exe()
-        .map_err(|error| RenderError::Converting(format!("cannot locate vvrd: {error}")))?;
-    let mut command = Command::new(executable);
-    command
-        .arg("--paginate-document")
-        .arg("--pagination-width")
-        .arg(layout.width_px.to_string())
-        .arg("--pagination-height")
-        .arg(layout.height_px.to_string())
-        .arg("--pagination-font-size")
-        .arg(layout.font_size.to_string());
-    if landscape {
-        command.arg("--landscape");
-    }
-    let mut child = command
-        .arg(path)
-        .env_remove("VIVID_ROOT_SECRET")
-        .env_remove("VIVID_TOKEN")
-        .env_remove("VIVID_ENDPOINT_CONTROL")
-        .env_remove("VIVID_ENDPOINT_INTERACTIVE")
-        .env_remove("VIVID_ENDPOINT_REALTIME")
-        .env_remove("VIVID_ENDPOINT_BULK")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| {
-            RenderError::Converting(format!("cannot start EPUB pagination helper: {error}"))
-        })?;
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(RenderError::Converting(
-            "EPUB pagination helper has no output pipe".to_owned(),
-        ));
-    };
-    let output_reader = match thread::Builder::new()
-        .name("vvrd-epub-pagination-output".to_owned())
-        .spawn(move || read_pagination_output(stdout))
-    {
-        Ok(reader) => reader,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(RenderError::Converting(format!(
-                "cannot read EPUB pagination helper output: {error}"
-            )));
-        }
-    };
-
-    loop {
-        let status = match child.try_wait() {
-            Ok(status) => status,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = output_reader.join();
-                return Err(RenderError::Converting(format!(
-                    "cannot wait for EPUB pagination helper: {error}"
-                )));
-            }
-        };
-        if let Some(status) = status {
-            let output = output_reader
-                .join()
-                .map_err(|_| {
-                    RenderError::Converting("EPUB pagination output reader panicked".to_owned())
-                })?
-                .map_err(|error| {
-                    RenderError::Converting(format!(
-                        "cannot read EPUB pagination helper output: {error}"
-                    ))
-                })?;
-            if !status.success() {
-                return Err(RenderError::InvalidDocument(
-                    "background pagination helper failed".to_owned(),
-                ));
-            }
-            return serde_json::from_slice(&output).map(Some).map_err(|error| {
-                RenderError::Converting(format!("invalid EPUB pagination helper output: {error}"))
-            });
-        }
-
-        let (state, _) = &**shared;
-        let state = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cancelled = state.stopped || state.latest_sequence != sequence;
-        drop(state);
-        if cancelled {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = output_reader.join();
-            return Ok(None);
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn read_pagination_output(mut stdout: impl Read) -> io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    let mut buffer = [0_u8; 16 * 1024];
-    let mut overflowed = false;
-    loop {
-        let count = stdout.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        let retained = count.min(MAX_PAGINATION_RESULT_BYTES.saturating_sub(output.len()));
-        output.extend_from_slice(&buffer[..retained]);
-        overflowed |= retained != count;
-    }
-    if overflowed {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "EPUB pagination result exceeds the 4 MiB limit",
-        ));
-    }
-    Ok(output)
-}
-
-pub fn paginate_reflowable(
-    path: &Path,
-    width_px: f32,
-    height_px: f32,
-    font_size: f32,
     landscape: bool,
 ) -> Result<PaginationResult, RenderError> {
     let mut document = open_mupdf_document(path)?;
@@ -724,7 +600,12 @@ pub fn paginate_reflowable(
             "document is no longer reflowable".to_owned(),
         ));
     }
-    let (width, height, em) = epub_layout_for_area(width_px, height_px, font_size, landscape);
+    let (width, height, em) = epub_layout_for_area(
+        layout.width_px,
+        layout.height_px,
+        layout.font_size,
+        landscape,
+    );
     document.layout(width, height, em)?;
     let n_pages = usize::try_from(document.page_count()?).unwrap_or(0);
     if n_pages == 0 {
@@ -1673,6 +1554,65 @@ mod tests {
                 ..
             } if n_pages > 1
         ));
+        renderer.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reflowable_pagination_completes_in_process_after_the_first_page() {
+        // MuPDF treats `.html` as reflowable, so this drives the same paginator path an EPUB does
+        // without needing a binary fixture. The count has to arrive from the pagination thread —
+        // vvrd no longer re-executes itself to compute it.
+        let path = temp_file("html");
+        fs::write(
+            &path,
+            format!(
+                "<html><body>{}</body></html>",
+                "<p>paragraph</p>".repeat(400)
+            ),
+        )
+        .unwrap();
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let renderer = RenderThread::spawn(path.clone(), viewport, paper_style(ThemeMode::Light));
+
+        // Opens with the count unknown so navigation never waits for the whole-book pass.
+        assert!(matches!(
+            renderer
+                .events
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            RenderEvent::Opened {
+                kind: DocumentKind::Reflowable,
+                pagination_complete: false,
+                ..
+            }
+        ));
+
+        // Pagination is requested only once a requested page has been published.
+        renderer
+            .commands
+            .send(RenderCmd::Render {
+                page: 0,
+                options: RenderOptions::for_viewport(viewport, 1),
+            })
+            .unwrap();
+
+        let mut counted = None;
+        while let Ok(event) = renderer.events.recv_timeout(Duration::from_secs(30)) {
+            if let RenderEvent::Opened {
+                pagination_complete: true,
+                n_pages,
+                ..
+            } = event
+            {
+                counted = Some(n_pages);
+                break;
+            }
+        }
+        assert!(
+            matches!(counted, Some(n_pages) if n_pages > 1),
+            "pagination never reported a count: {counted:?}"
+        );
         renderer.shutdown();
         fs::remove_file(path).unwrap();
     }

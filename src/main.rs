@@ -104,18 +104,6 @@ struct Cli {
 
     #[arg(long, hide = true)]
     probe_document: bool,
-
-    #[arg(long, hide = true)]
-    paginate_document: bool,
-
-    #[arg(long, hide = true, requires = "paginate_document")]
-    pagination_width: Option<f32>,
-
-    #[arg(long, hide = true, requires = "paginate_document")]
-    pagination_height: Option<f32>,
-
-    #[arg(long, hide = true, requires = "paginate_document")]
-    pagination_font_size: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -167,10 +155,6 @@ fn main() -> anyhow::Result<()> {
     // Before any document is opened: MuPDF caches resolved fonts per context, so a loader
     // installed later would not be consulted for faces already looked up.
     mupdf_fonts::install();
-    if cli.paginate_document {
-        run_pagination_helper(&cli)?;
-        return Ok(());
-    }
     if matches!(
         renderer::detect_backend(&cli.document),
         renderer::RenderBackend::Office
@@ -367,39 +351,6 @@ fn main() -> anyhow::Result<()> {
     drop(source_watcher);
     render.shutdown();
     vivid.shutdown();
-    Ok(())
-}
-
-fn run_pagination_helper(cli: &Cli) -> anyhow::Result<()> {
-    let width = cli
-        .pagination_width
-        .context("pagination helper is missing its width")?;
-    let height = cli
-        .pagination_height
-        .context("pagination helper is missing its height")?;
-    let font_size = cli
-        .pagination_font_size
-        .context("pagination helper is missing its font size")?;
-    ensure!(
-        width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0,
-        "pagination helper dimensions must be finite and positive"
-    );
-    ensure!(
-        font_size.is_finite() && font_size > 0.0,
-        "pagination helper font size must be finite and positive"
-    );
-
-    #[cfg(unix)]
-    // SAFETY: `setpriority` receives constant selectors and affects only this disposable helper
-    // process. Failure is harmless; it merely leaves the child at its inherited priority.
-    unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
-    }
-
-    let result =
-        renderer::paginate_reflowable(&cli.document, width, height, font_size, cli.landscape)?;
-    serde_json::to_writer(std::io::stdout().lock(), &result)
-        .context("cannot write pagination helper result")?;
     Ok(())
 }
 
