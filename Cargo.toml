@@ -63,9 +63,13 @@ flexi_logger = "0.31"
 libc = "0.2"
 notify = "8"
 
+# `system-fonts` is deliberately absent. It adds mupdf's built-in font-kit loader, which runs an
+# uncached system-wide font enumeration per lookup; MuPDF repeats a failed lookup once per
+# character, so a book in an uninstalled script spends minutes there. `src/mupdf_fonts.rs` installs
+# a cached fontdb-backed loader instead, and it can only end a failing lookup if it is the only
+# loader in the chain.
 mupdf_crates_io = { package = "mupdf", version = "0.8.0", default-features = false, features = [
   "svg",
-  "system-fonts",
   "base14-fonts",
   "img",
   "html",

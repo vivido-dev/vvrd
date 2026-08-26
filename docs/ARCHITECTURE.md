@@ -176,13 +176,30 @@ serves search/TOC/metadata/links/export. Prerendering neighbours keeps page turn
 is **CPU-side pixmaps**, bounded to 24 pages and 256 MiB, feeding the compositor; markup pagination
 and semantics remain resident while only requested pages are rasterized.
 
-MuPDF's EPUB `page_count` is a non-interruptible whole-book layout pass, so it never runs in the
-interactive process. After the first requested page has been published, a low-priority, secret-free
-helper process opens its own MuPDF document, computes the exact count and outline, and returns bounded
-JSON to a supervising thread. Process isolation matters: separate MuPDF documents on Rust threads
-still contend on MuPDF-global resources and can stall page loading. Until the helper finishes, the UI
-treats the count as unknown and accepts speculative next-page requests; neither navigation nor
-neighbour prerendering calls `page_count`. A newer layout request or shutdown kills a stale helper.
+MuPDF's EPUB `page_count` lays out every chapter, so it stays off the interactive path. After the
+first requested page has been published, a low-priority, secret-free helper process opens its own
+MuPDF document, computes the exact count and outline, and returns bounded JSON to a supervising
+thread. Until the helper finishes, the UI treats the count as unknown and accepts speculative
+next-page requests; neither navigation nor neighbour prerendering calls `page_count`. A newer layout
+request or shutdown kills a stale helper.
+
+### D5a — vvrd owns MuPDF's system-font lookups
+MuPDF asks for a substitute font whenever it meets a character no loaded face covers, and it only
+remembers the answer when one is found. A script with no installed font therefore repeats the same
+failing lookup **once per character**. The `mupdf` crate's `system-fonts` feature answers each repeat
+by building a fresh `font-kit` `SystemSource`, so every one of them enumerates the whole system font
+collection over a synchronous CoreText/fontconfig round trip.
+
+That made laying out a single chapter of a Chinese EPUB take seconds and counting the whole book take
+**ten minutes**, of which ~99.9% was font enumeration — and the Chinese text never rendered, because
+no face was ever found. `src/mupdf_fonts.rs` replaces that path with one `fontdb` database plus a
+memo of every outcome, misses included, keyed by name / CJK ordering / (script, language). The
+`system-fonts` feature is off so this loader is the only one in the chain: a remembered miss has to
+be able to end the lookup, and a `None` from a user loader otherwise falls through to the built-in.
+
+The same 2 MB book now counts in ~0.3 s instead of 592 s, forty sequential page loads take 43 ms
+instead of stalling 2–7 s at every chapter boundary, and CJK glyphs render. Keep the memo negative:
+caching only hits would leave the pathological case exactly as slow as before.
 
 ### D10 — Fixed Letter markup backend and transactional reload
 
@@ -421,9 +438,11 @@ added.)
    the document in a subprocess (kitpdf pattern) to fail cleanly on corrupt files. EPUB preflight
    verifies that MuPDF can open a reflowable document without also paginating the full book. The
    renderer publishes the requested EPUB page first, then a low-priority helper process completes the
-   expensive full-book page count and outline pass in a separate MuPDF address space. Arrow-key
-   rendering continues in the parent while that helper is busy. Neither helper child inherits any
-   endpoint or secret variables.
+   full-book page count and outline pass in a separate MuPDF address space. Arrow-key rendering
+   continues in the parent while that helper is busy. Neither helper child inherits any endpoint or
+   secret variables. `mupdf_fonts::install()` runs before any document is opened — MuPDF caches
+   resolved fonts per context, so a loader installed later is never consulted for faces it already
+   looked up (D5a).
 2. `Session::connect` (HELLO with a transcript-bound root proof, WELCOME with a server confirmation);
    verify the selected target profile and read the authoritative grid from the target descriptor.
 3. Enter alt screen / raw mode / hide cursor (terminal guard). Install panic hook that restores the

@@ -5,6 +5,7 @@ mod export;
 mod geometry;
 mod markup;
 mod mermaid_engine;
+mod mupdf_fonts;
 mod office;
 mod presenter;
 mod renderer;
@@ -163,6 +164,9 @@ enum LoadingPolicy {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     validate_cli(&cli)?;
+    // Before any document is opened: MuPDF caches resolved fonts per context, so a loader
+    // installed later would not be consulted for faces already looked up.
+    mupdf_fonts::install();
     if cli.paginate_document {
         run_pagination_helper(&cli)?;
         return Ok(());
