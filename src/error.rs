@@ -6,6 +6,8 @@ pub enum RenderError {
     Mupdf(#[from] mupdf::error::Error),
     #[error("document has no pages")]
     EmptyDocument,
+    #[error("invalid document: {0}")]
+    InvalidDocument(String),
     #[error("conversion error: {0}")]
     Converting(String),
     #[error("markup error: {0}")]

@@ -1,9 +1,11 @@
 use std::{
     any::Any,
     collections::{HashMap, VecDeque},
+    io::{self, Read},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -35,6 +37,7 @@ const EPUB_LAYOUT_ASPECT: f32 = 595.0 / 420.0;
 const EPUB_LANDSCAPE_MIN_W: f32 = 420.0;
 const EPUB_LANDSCAPE_MAX_W: f32 = 595.0;
 const EPUB_LANDSCAPE_ASPECT: f32 = 420.0 / 595.0;
+const MAX_PAGINATION_RESULT_BYTES: usize = 4 * 1024 * 1024;
 const SLOW_RENDER_WARN: Duration = Duration::from_secs(5);
 pub const MUPDF_BLACK: i32 = 0;
 pub const MUPDF_WHITE: i32 = i32::from_be_bytes([0, 0xff, 0xff, 0xff]);
@@ -72,6 +75,12 @@ pub fn detect_backend(path: &Path) -> RenderBackend {
     }
 }
 
+pub fn is_epub(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+}
+
 /// Paper choices shared by every open: markup paper theme and page orientation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaperStyle {
@@ -88,11 +97,18 @@ pub struct LinkInfo {
     pub page: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct TocEntry {
     pub title: String,
     pub page: usize,
     pub level: usize,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct PaginationResult {
+    pub n_pages: usize,
+    pub toc: Vec<TocEntry>,
+    pub metadata: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +169,7 @@ pub enum RenderEvent {
         metadata: Vec<(String, String)>,
         document_revision: u64,
         reloaded: bool,
+        pagination_complete: bool,
     },
     Page {
         page: usize,
@@ -214,6 +231,13 @@ enum BackendDocument {
         layout: Option<(f32, f32, f32)>,
     },
     Markup(MarkupDocument),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReflowLayout {
+    width_px: f32,
+    height_px: f32,
+    font_size: f32,
 }
 
 impl BackendDocument {
@@ -289,6 +313,20 @@ impl BackendDocument {
                 ..
             } => *size,
             _ => 11.0,
+        }
+    }
+
+    fn reflow_layout(&self) -> Option<ReflowLayout> {
+        match self {
+            Self::MuPdf {
+                layout: Some((width_px, height_px, font_size)),
+                ..
+            } => Some(ReflowLayout {
+                width_px: *width_px,
+                height_px: *height_px,
+                font_size: *font_size,
+            }),
+            _ => None,
         }
     }
 
@@ -400,8 +438,307 @@ fn send_backend_opened(
             metadata: document.metadata(),
             document_revision,
             reloaded,
+            pagination_complete: true,
         })
         .is_ok()
+}
+
+fn send_reflowable_opened(
+    document: &BackendDocument,
+    document_revision: u64,
+    reloaded: bool,
+    events: &Sender<RenderEvent>,
+) -> bool {
+    events
+        .send(RenderEvent::Opened {
+            kind: document.kind(),
+            n_pages: 1,
+            toc: Vec::new(),
+            metadata: document.metadata(),
+            document_revision,
+            reloaded,
+            pagination_complete: false,
+        })
+        .is_ok()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PaginationRequest {
+    sequence: u64,
+    document_revision: u64,
+    layout: ReflowLayout,
+}
+
+#[derive(Default)]
+struct PaginationState {
+    pending: Option<PaginationRequest>,
+    latest_sequence: u64,
+    stopped: bool,
+}
+
+struct ReflowPaginator {
+    state: Arc<(Mutex<PaginationState>, Condvar)>,
+}
+
+impl ReflowPaginator {
+    fn spawn(path: PathBuf, landscape: bool, events: Sender<RenderEvent>) -> ReflowPaginator {
+        let state = Arc::new((Mutex::new(PaginationState::default()), Condvar::new()));
+        let worker_state = Arc::clone(&state);
+        thread::Builder::new()
+            .name("vvrd-epub-pagination".to_owned())
+            .spawn(move || run_pagination_thread(path, landscape, events, worker_state))
+            .expect("failed to spawn EPUB pagination thread");
+        Self { state }
+    }
+
+    fn request(&self, document_revision: u64, layout: ReflowLayout) {
+        let (state, ready) = &*self.state;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.latest_sequence = state.latest_sequence.wrapping_add(1).max(1);
+        state.pending = Some(PaginationRequest {
+            sequence: state.latest_sequence,
+            document_revision,
+            layout,
+        });
+        ready.notify_one();
+    }
+
+    fn stop(&self) {
+        let (state, ready) = &*self.state;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.stopped = true;
+        state.pending = None;
+        state.latest_sequence = state.latest_sequence.wrapping_add(1).max(1);
+        ready.notify_one();
+    }
+}
+
+impl Drop for ReflowPaginator {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn run_pagination_thread(
+    path: PathBuf,
+    landscape: bool,
+    events: Sender<RenderEvent>,
+    shared: Arc<(Mutex<PaginationState>, Condvar)>,
+) {
+    loop {
+        let request = {
+            let (state, ready) = &*shared;
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while state.pending.is_none() && !state.stopped {
+                state = ready
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            if state.stopped {
+                return;
+            }
+            state
+                .pending
+                .take()
+                .expect("pagination request disappeared")
+        };
+
+        let result = paginate_reflowable_in_subprocess(
+            &path,
+            request.layout,
+            landscape,
+            &shared,
+            request.sequence,
+        );
+        let (state, _) = &*shared;
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopped || state.latest_sequence != request.sequence {
+            continue;
+        }
+        drop(state);
+        let event = match result {
+            Ok(Some(result)) => RenderEvent::Opened {
+                kind: DocumentKind::Reflowable,
+                n_pages: result.n_pages,
+                toc: result.toc,
+                metadata: result.metadata,
+                document_revision: request.document_revision,
+                reloaded: false,
+                pagination_complete: true,
+            },
+            Ok(None) => continue,
+            Err(error) => RenderEvent::Error(format!("EPUB pagination failed: {error}")),
+        };
+        if events.send(event).is_err() {
+            return;
+        }
+    }
+}
+
+fn paginate_reflowable_in_subprocess(
+    path: &Path,
+    layout: ReflowLayout,
+    landscape: bool,
+    shared: &Arc<(Mutex<PaginationState>, Condvar)>,
+    sequence: u64,
+) -> Result<Option<PaginationResult>, RenderError> {
+    let executable = std::env::current_exe()
+        .map_err(|error| RenderError::Converting(format!("cannot locate vvrd: {error}")))?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--paginate-document")
+        .arg("--pagination-width")
+        .arg(layout.width_px.to_string())
+        .arg("--pagination-height")
+        .arg(layout.height_px.to_string())
+        .arg("--pagination-font-size")
+        .arg(layout.font_size.to_string());
+    if landscape {
+        command.arg("--landscape");
+    }
+    let mut child = command
+        .arg(path)
+        .env_remove("VIVID_ROOT_SECRET")
+        .env_remove("VIVID_TOKEN")
+        .env_remove("VIVID_ENDPOINT_CONTROL")
+        .env_remove("VIVID_ENDPOINT_INTERACTIVE")
+        .env_remove("VIVID_ENDPOINT_REALTIME")
+        .env_remove("VIVID_ENDPOINT_BULK")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            RenderError::Converting(format!("cannot start EPUB pagination helper: {error}"))
+        })?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(RenderError::Converting(
+            "EPUB pagination helper has no output pipe".to_owned(),
+        ));
+    };
+    let output_reader = match thread::Builder::new()
+        .name("vvrd-epub-pagination-output".to_owned())
+        .spawn(move || read_pagination_output(stdout))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RenderError::Converting(format!(
+                "cannot read EPUB pagination helper output: {error}"
+            )));
+        }
+    };
+
+    loop {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = output_reader.join();
+                return Err(RenderError::Converting(format!(
+                    "cannot wait for EPUB pagination helper: {error}"
+                )));
+            }
+        };
+        if let Some(status) = status {
+            let output = output_reader
+                .join()
+                .map_err(|_| {
+                    RenderError::Converting("EPUB pagination output reader panicked".to_owned())
+                })?
+                .map_err(|error| {
+                    RenderError::Converting(format!(
+                        "cannot read EPUB pagination helper output: {error}"
+                    ))
+                })?;
+            if !status.success() {
+                return Err(RenderError::InvalidDocument(
+                    "background pagination helper failed".to_owned(),
+                ));
+            }
+            return serde_json::from_slice(&output).map(Some).map_err(|error| {
+                RenderError::Converting(format!("invalid EPUB pagination helper output: {error}"))
+            });
+        }
+
+        let (state, _) = &**shared;
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cancelled = state.stopped || state.latest_sequence != sequence;
+        drop(state);
+        if cancelled {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = output_reader.join();
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_pagination_output(mut stdout: impl Read) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut overflowed = false;
+    loop {
+        let count = stdout.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let retained = count.min(MAX_PAGINATION_RESULT_BYTES.saturating_sub(output.len()));
+        output.extend_from_slice(&buffer[..retained]);
+        overflowed |= retained != count;
+    }
+    if overflowed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "EPUB pagination result exceeds the 4 MiB limit",
+        ));
+    }
+    Ok(output)
+}
+
+pub fn paginate_reflowable(
+    path: &Path,
+    width_px: f32,
+    height_px: f32,
+    font_size: f32,
+    landscape: bool,
+) -> Result<PaginationResult, RenderError> {
+    let mut document = open_mupdf_document(path)?;
+    if !document.is_reflowable().unwrap_or(false) {
+        return Err(RenderError::InvalidDocument(
+            "document is no longer reflowable".to_owned(),
+        ));
+    }
+    let (width, height, em) = epub_layout_for_area(width_px, height_px, font_size, landscape);
+    document.layout(width, height, em)?;
+    let n_pages = usize::try_from(document.page_count()?).unwrap_or(0);
+    if n_pages == 0 {
+        return Err(RenderError::EmptyDocument);
+    }
+    let mut toc = Vec::new();
+    if let Ok(outlines) = document.outlines() {
+        flatten_outlines(&outlines, 0, &mut toc);
+    }
+    Ok(PaginationResult {
+        n_pages,
+        toc,
+        metadata: extract_metadata(&document),
+    })
 }
 
 fn run_render_thread(
@@ -421,7 +758,15 @@ fn run_render_thread(
         }
     };
     let mut document_revision = 1u64;
-    if !send_backend_opened(&document, document_revision, false, &events) {
+    let mut pagination_pending = matches!(document.kind(), DocumentKind::Reflowable);
+    let mut paginator =
+        pagination_pending.then(|| ReflowPaginator::spawn(path.clone(), landscape, events.clone()));
+    let opened = if pagination_pending {
+        send_reflowable_opened(&document, document_revision, false, &events)
+    } else {
+        send_backend_opened(&document, document_revision, false, &events)
+    };
+    if !opened {
         return;
     }
 
@@ -430,12 +775,26 @@ fn run_render_thread(
     let heartbeat = RenderHeartbeat::start(events.clone());
     while let Some(command) = next_render_command(&commands, &mut deferred) {
         let mut prerender_request = None;
+        let mut request_pagination_after_render = false;
         let result = match command {
             RenderCmd::Render { page, options } => {
+                request_pagination_after_render = pagination_pending;
                 match document.update_layout(&options, landscape) {
                     Ok(true) => {
                         cache.clear();
-                        let _ = send_backend_opened(&document, document_revision, false, &events);
+                        if matches!(document.kind(), DocumentKind::Reflowable) {
+                            pagination_pending = true;
+                            request_pagination_after_render = true;
+                            let _ = send_reflowable_opened(
+                                &document,
+                                document_revision,
+                                false,
+                                &events,
+                            );
+                        } else {
+                            let _ =
+                                send_backend_opened(&document, document_revision, false, &events);
+                        }
                     }
                     Ok(false) => {}
                     Err(error) => {
@@ -472,7 +831,21 @@ fn run_render_thread(
                         document = replacement;
                         document_revision = document_revision.saturating_add(1);
                         cache.clear();
-                        let _ = send_backend_opened(&document, document_revision, true, &events);
+                        if matches!(document.kind(), DocumentKind::Reflowable) {
+                            pagination_pending = true;
+                            if paginator.is_none() {
+                                paginator = Some(ReflowPaginator::spawn(
+                                    path.clone(),
+                                    landscape,
+                                    events.clone(),
+                                ));
+                            }
+                            let _ =
+                                send_reflowable_opened(&document, document_revision, true, &events);
+                        } else {
+                            let _ =
+                                send_backend_opened(&document, document_revision, true, &events);
+                        }
                     }
                     Err(error) => {
                         let _ = events.send(RenderEvent::Error(format!(
@@ -503,12 +876,22 @@ fn run_render_thread(
                 let _ = events.send(RenderEvent::Error(error.to_string()));
             }
         }
+        if request_pagination_after_render
+            && let (Some(paginator), Some(layout)) = (&paginator, document.reflow_layout())
+        {
+            // Finish and publish the requested page before the helper process begins the
+            // whole-book pass. Process isolation keeps MuPDF's global state out of this renderer,
+            // so arrow-key page requests remain responsive while pagination runs.
+            paginator.request(document_revision, layout);
+            pagination_pending = false;
+        }
         if let Some((page, options)) = prerender_request
             && commands.is_empty()
         {
-            prerender_backend_neighbors(&document, page, &options, &mut cache);
+            prerender_backend_neighbors(&document, page, &options, &mut cache, &commands);
         }
     }
+    drop(paginator);
     heartbeat.stop();
     let _ = events.send(RenderEvent::Stopped);
 }
@@ -685,15 +1068,28 @@ fn prerender_backend_neighbors(
     page: usize,
     options: &RenderOptions,
     cache: &mut RenderCache,
+    commands: &Receiver<RenderCmd>,
 ) {
-    let count = document.page_count();
+    let count = match document {
+        // Calling `page_count` for EPUB is a whole-book layout pass. A missing next page is cheap
+        // to discover through `load_page`, so speculative neighbor rendering must never paginate.
+        BackendDocument::MuPdf {
+            kind: DocumentKind::Reflowable,
+            ..
+        } => None,
+        _ => Some(document.page_count()),
+    };
     for neighbor in [
-        page.checked_add(1).filter(|value| *value < count),
+        page.checked_add(1)
+            .filter(|value| count.is_none_or(|count| *value < count)),
         page.checked_sub(1),
     ]
     .into_iter()
     .flatten()
     {
+        if !commands.is_empty() {
+            break;
+        }
         let key = CacheKey::new(neighbor, options);
         if cache.pages.contains_key(&key) {
             continue;
@@ -735,10 +1131,7 @@ fn open_document(
     epub_font_size: f32,
     landscape: bool,
 ) -> Result<Document, RenderError> {
-    #[cfg(windows)]
-    let path = path.to_string_lossy();
-    #[cfg_attr(unix, allow(clippy::borrow_deref_ref))]
-    let mut document = Document::open(&*path)?;
+    let mut document = open_mupdf_document(path)?;
     if document.is_reflowable().unwrap_or(false) {
         let (width, height, em) = epub_layout_for_area(
             viewport.page_area_width_px() as f32,
@@ -748,10 +1141,31 @@ fn open_document(
         );
         document.layout(width, height, em)?;
     }
-    if document.page_count()? <= 0 {
+    if !document.is_reflowable().unwrap_or(false) && document.page_count()? <= 0 {
         return Err(RenderError::EmptyDocument);
     }
     Ok(document)
+}
+
+/// Verify that MuPDF can recognize an EPUB without forcing it to paginate the whole book.
+///
+/// EPUB pagination parses and lays out every chapter. The real renderer must do that work, so doing
+/// it in the crash-isolating preflight child as well can double startup time for large books.
+pub fn probe_epub(path: &Path) -> Result<(), RenderError> {
+    let document = open_mupdf_document(path)?;
+    if !document.is_reflowable().unwrap_or(false) {
+        return Err(RenderError::InvalidDocument(
+            "document is not a reflowable EPUB".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn open_mupdf_document(path: &Path) -> Result<Document, RenderError> {
+    #[cfg(windows)]
+    let path = path.to_string_lossy();
+    #[cfg_attr(unix, allow(clippy::borrow_deref_ref))]
+    Ok(Document::open(&*path)?)
 }
 
 fn document_kind(document: &Document) -> DocumentKind {
@@ -906,11 +1320,13 @@ fn render_loaded_page(
     page_num: usize,
     options: &RenderOptions,
 ) -> Result<PageImage, RenderError> {
-    let count = usize::try_from(document.page_count()?).unwrap_or(0);
-    if count == 0 {
-        return Err(RenderError::EmptyDocument);
-    }
-    let page = document.load_page(page_num.min(count - 1) as i32)?;
+    let page_number = i32::try_from(page_num).map_err(|_| {
+        RenderError::InvalidDocument(format!(
+            "page number {} exceeds MuPDF's supported range",
+            page_num.saturating_add(1)
+        ))
+    })?;
+    let page = document.load_page(page_number)?;
     let bounds = page.bounds()?;
     let natural_width = (bounds.x1 - bounds.x0).max(1.0);
     let natural_height = (bounds.y1 - bounds.y0).max(1.0);
@@ -1156,6 +1572,9 @@ mod tests {
             detect_backend(Path::new("no-extension")),
             RenderBackend::MuPdf
         );
+        assert!(is_epub(Path::new("book.epub")));
+        assert!(is_epub(Path::new("BOOK.EPUB")));
+        assert!(!is_epub(Path::new("book.epub.pdf")));
     }
 
     #[test]

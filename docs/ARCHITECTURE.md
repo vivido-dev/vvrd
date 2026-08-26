@@ -176,6 +176,14 @@ serves search/TOC/metadata/links/export. Prerendering neighbours keeps page turn
 is **CPU-side pixmaps**, bounded to 24 pages and 256 MiB, feeding the compositor; markup pagination
 and semantics remain resident while only requested pages are rasterized.
 
+MuPDF's EPUB `page_count` is a non-interruptible whole-book layout pass, so it never runs in the
+interactive process. After the first requested page has been published, a low-priority, secret-free
+helper process opens its own MuPDF document, computes the exact count and outline, and returns bounded
+JSON to a supervising thread. Process isolation matters: separate MuPDF documents on Rust threads
+still contend on MuPDF-global resources and can stall page loading. Until the helper finishes, the UI
+treats the count as unknown and accepts speculative next-page requests; neither navigation nor
+neighbour prerendering calls `page_count`. A newer layout request or shutdown kills a stale helper.
+
 ### D10 — Fixed Letter markup backend and transactional reload
 
 Extension dispatch is case-insensitive: `.md`, `.markdown`, and `.mkd` select Markdown; `.mmd` and
@@ -410,8 +418,12 @@ added.)
 
 **Startup**
 1. Parse CLI; read `VIVID_ENDPOINT_CONTROL`/`VIVID_ROOT_SECRET` (or dry-run/trace). Preflight-probe
-   the document in a subprocess (kitpdf pattern) to fail cleanly on corrupt files. The preflight
-   child inherits **no** endpoint or secret variables.
+   the document in a subprocess (kitpdf pattern) to fail cleanly on corrupt files. EPUB preflight
+   verifies that MuPDF can open a reflowable document without also paginating the full book. The
+   renderer publishes the requested EPUB page first, then a low-priority helper process completes the
+   expensive full-book page count and outline pass in a separate MuPDF address space. Arrow-key
+   rendering continues in the parent while that helper is busy. Neither helper child inherits any
+   endpoint or secret variables.
 2. `Session::connect` (HELLO with a transcript-bound root proof, WELCOME with a server confirmation);
    verify the selected target profile and read the authoritative grid from the target descriptor.
 3. Enter alt screen / raw mode / hide cursor (terminal guard). Install panic hook that restores the

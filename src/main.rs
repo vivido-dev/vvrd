@@ -103,6 +103,18 @@ struct Cli {
 
     #[arg(long, hide = true)]
     probe_document: bool,
+
+    #[arg(long, hide = true)]
+    paginate_document: bool,
+
+    #[arg(long, hide = true, requires = "paginate_document")]
+    pagination_width: Option<f32>,
+
+    #[arg(long, hide = true, requires = "paginate_document")]
+    pagination_height: Option<f32>,
+
+    #[arg(long, hide = true, requires = "paginate_document")]
+    pagination_font_size: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -151,6 +163,10 @@ enum LoadingPolicy {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     validate_cli(&cli)?;
+    if cli.paginate_document {
+        run_pagination_helper(&cli)?;
+        return Ok(());
+    }
     if matches!(
         renderer::detect_backend(&cli.document),
         renderer::RenderBackend::Office
@@ -162,6 +178,10 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     if cli.probe_document {
+        if renderer::is_epub(&cli.document) {
+            renderer::probe_epub(&cli.document)?;
+            return Ok(());
+        }
         let rendered = renderer::render_page(
             &cli.document,
             cli.page.unwrap_or(1) - 1,
@@ -343,6 +363,39 @@ fn main() -> anyhow::Result<()> {
     drop(source_watcher);
     render.shutdown();
     vivid.shutdown();
+    Ok(())
+}
+
+fn run_pagination_helper(cli: &Cli) -> anyhow::Result<()> {
+    let width = cli
+        .pagination_width
+        .context("pagination helper is missing its width")?;
+    let height = cli
+        .pagination_height
+        .context("pagination helper is missing its height")?;
+    let font_size = cli
+        .pagination_font_size
+        .context("pagination helper is missing its font size")?;
+    ensure!(
+        width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0,
+        "pagination helper dimensions must be finite and positive"
+    );
+    ensure!(
+        font_size.is_finite() && font_size > 0.0,
+        "pagination helper font size must be finite and positive"
+    );
+
+    #[cfg(unix)]
+    // SAFETY: `setpriority` receives constant selectors and affects only this disposable helper
+    // process. Failure is harmless; it merely leaves the child at its inherited priority.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+    }
+
+    let result =
+        renderer::paginate_reflowable(&cli.document, width, height, font_size, cli.landscape)?;
+    serde_json::to_writer(std::io::stdout().lock(), &result)
+        .context("cannot write pagination helper result")?;
     Ok(())
 }
 
@@ -591,9 +644,14 @@ fn wait_for_document(render: &RenderThread, runtime: &mut Runtime) -> anyhow::Re
             toc,
             metadata,
             document_revision,
+            pagination_complete,
             ..
         } => {
-            runtime.app.set_document(kind, n_pages);
+            if pagination_complete {
+                runtime.app.set_document(kind, n_pages);
+            } else {
+                runtime.app.set_document_kind(kind);
+            }
             runtime.app.toc = toc;
             runtime.app.metadata = metadata;
             runtime.document_revision = document_revision;
@@ -776,8 +834,14 @@ fn handle_render_event(
             metadata,
             document_revision,
             reloaded,
+            pagination_complete,
         } => {
-            runtime.app.set_document(kind, n_pages);
+            let previous_page = runtime.app.page;
+            if pagination_complete {
+                runtime.app.set_document(kind, n_pages);
+            } else {
+                runtime.app.set_document_kind(kind);
+            }
             runtime.app.toc = toc;
             runtime.app.metadata = metadata;
             runtime.document_revision = document_revision;
@@ -795,6 +859,12 @@ fn handle_render_event(
                 request_render(render, vivid, runtime, black, white, false)?;
                 if let Some(term) = runtime.app.search_term.clone() {
                     render.commands.send(RenderCmd::Search(term))?;
+                }
+            } else if pagination_complete {
+                draw_status(runtime)?;
+                if runtime.app.page != previous_page {
+                    runtime.app.invalidate();
+                    request_render(render, vivid, runtime, black, white, true)?;
                 }
             }
         }
@@ -953,10 +1023,12 @@ fn draw_status(runtime: &Runtime) -> anyhow::Result<()> {
     }
     terminal::draw_status(
         runtime.viewport,
-        &runtime
-            .app
-            .msg
-            .text(runtime.app.page, runtime.app.n_pages, runtime.app.zoom_mode),
+        &runtime.app.msg.text(
+            runtime.app.page,
+            runtime.app.n_pages,
+            runtime.app.pagination_complete,
+            runtime.app.zoom_mode,
+        ),
     )
 }
 
