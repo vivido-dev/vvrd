@@ -916,6 +916,9 @@ fn handle_present_event(
             if settled && (viewport != runtime.viewport || !runtime.target_presentable) {
                 runtime.pending_resize = None;
                 runtime.target_presentable = true;
+                // The page is about to be re-rendered at the new page area. Move the view offsets
+                // with it, or a zoomed reader lands somewhere else on the page.
+                runtime.app.rescale_offsets(runtime.viewport, viewport);
                 runtime.viewport = viewport;
                 runtime.app.invalidate();
                 show_current(vivid, runtime)?;
