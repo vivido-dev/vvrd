@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use fontdb::{Database, Source};
+use cosmic_text::fontdb::Source as CosmicTextFontSource;
+use fontdb::Database;
 #[cfg(test)]
 use fontdb::{Family, Query};
 
@@ -10,10 +11,10 @@ pub const CODE_FONT_FAMILY: &str = "Monaspace Neon";
 const MONA_SANS: &[u8] = include_bytes!("../../assets/fonts/MonaSans.ttf");
 const MONASPACE_NEON: &[u8] = include_bytes!("../../assets/fonts/MonaspaceNeon.otf");
 
-pub fn bundled_font_sources() -> Vec<Source> {
+pub fn bundled_font_sources() -> Vec<CosmicTextFontSource> {
     vec![
-        Source::Binary(Arc::new(MONA_SANS.to_vec())),
-        Source::Binary(Arc::new(MONASPACE_NEON.to_vec())),
+        CosmicTextFontSource::Binary(Arc::new(MONA_SANS.to_vec())),
+        CosmicTextFontSource::Binary(Arc::new(MONASPACE_NEON.to_vec())),
     ]
 }
 

@@ -13,7 +13,7 @@ use vivid_protocol::{
 use vivid_sdk::{
     ChannelEvent, CoordinateModel, Fit, GENERIC_CONTENT, MILESTONE_OUTPUT_READY, OBSERVABILITY,
     RasterConfiguration, RequestMetadata, SceneNode, SessionEvent, SlotBinding, Surface,
-    SurfaceDefinition, SurfaceDescriptor, Track, TrackChannel, TrackWaitCondition,
+    SurfaceDefinition, SurfaceDescriptor, Track, TrackChannel, TrackLostError, TrackWaitCondition,
 };
 
 use crate::{
@@ -844,7 +844,15 @@ fn create_and_prime_track(
 /// failure to report, and the surface it belonged to is unaffected either way.
 fn destroy_if_live(session: &mut vivid_sdk::Session, track: &Track) -> io::Result<()> {
     match session.destroy_track(track, &RequestMetadata::default()) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error
+                    .get_ref()
+                    .and_then(|cause| cause.downcast_ref::<TrackLostError>())
+                    .is_some() =>
+        {
+            Ok(())
+        }
         other => other,
     }
 }
