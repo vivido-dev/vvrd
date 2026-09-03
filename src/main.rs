@@ -152,19 +152,10 @@ enum LoadingPolicy {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     validate_cli(&cli)?;
+    validate_document_capabilities(&cli.document, office::find_soffice().is_some())?;
     // Before any document is opened: MuPDF caches resolved fonts per context, so a loader
     // installed later would not be consulted for faces already looked up.
     mupdf_fonts::install();
-    if matches!(
-        renderer::detect_backend(&cli.document),
-        renderer::RenderBackend::Office
-    ) && office::find_soffice().is_none()
-    {
-        eprintln!(
-            "warning: LibreOffice (soffice) not found; PPTX/DOCX/ODP/ODT viewing requires LibreOffice"
-        );
-        std::process::exit(1);
-    }
     if cli.probe_document {
         if renderer::is_epub(&cli.document) {
             renderer::probe_epub(&cli.document)?;
@@ -360,6 +351,20 @@ fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
     }
     if !cli.document.is_file() {
         bail!("document does not exist: {}", cli.document.display());
+    }
+    Ok(())
+}
+
+fn validate_document_capabilities(path: &Path, office_available: bool) -> anyhow::Result<()> {
+    if matches!(
+        renderer::detect_backend(path),
+        renderer::RenderBackend::Office
+    ) && !office_available
+    {
+        bail!(
+            "Office document support is disabled because LibreOffice (soffice) is not installed; \
+             PPTX, DOCX, ODP, and ODT files require LibreOffice"
+        );
     }
     Ok(())
 }
@@ -1368,6 +1373,20 @@ mod tests {
             parse_color("#123456").unwrap(),
             i32::from_be_bytes([0, 0x12, 0x34, 0x56])
         );
+    }
+
+    #[test]
+    fn office_formats_are_disabled_without_libreoffice() {
+        for path in ["deck.pptx", "report.docx", "slides.odp", "document.odt"] {
+            let error = validate_document_capabilities(Path::new(path), false).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Office document support is disabled")
+            );
+        }
+        assert!(validate_document_capabilities(Path::new("document.pdf"), false).is_ok());
+        assert!(validate_document_capabilities(Path::new("deck.pptx"), true).is_ok());
     }
 
     #[test]

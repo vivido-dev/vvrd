@@ -274,10 +274,17 @@ fn file_url(path: &Path) -> String {
     if !text.starts_with('/') {
         url.push('/');
     }
-    for byte in text.as_bytes() {
+    let bytes = text.as_bytes();
+    for (index, byte) in bytes.iter().copied().enumerate() {
         match byte {
+            b':' if cfg!(windows)
+                && index == 1
+                && bytes.first().is_some_and(|byte| byte.is_ascii_alphabetic()) =>
+            {
+                url.push(':');
+            }
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
-                url.push(*byte as char);
+                url.push(byte as char);
             }
             _ => write!(&mut url, "%{byte:02X}").expect("writing to String cannot fail"),
         }
@@ -312,6 +319,15 @@ mod tests {
         assert_eq!(
             file_url(Path::new("/tmp/a b/c-d_office")),
             "file:///tmp/a%20b/c-d_office"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_url_preserves_windows_drive_colon() {
+        assert_eq!(
+            file_url(Path::new(r"C:\Users\Example User\office")),
+            "file:///C:/Users/Example%20User/office"
         );
     }
 

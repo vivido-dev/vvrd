@@ -1,6 +1,6 @@
 # vvrd
 
-`vvrd` is a full-screen PDF, EPUB, Markdown, Mermaid, and office-document reader for the Vivido
+`vvrd` is a full-screen PDF, EPUB, Markdown, Mermaid, and optional office-document reader for the Vivido
 terminal. MuPDF handles PDF/EPUB; the built-in Markdown/Mermaid backend paginates markup onto fixed
 portrait Letter pages (2040×2640 pixels at 240 DPI, with 180-pixel margins); PPTX, DOCX, ODP, and
 ODT files are converted to PDF once per distinct content by a headless LibreOffice and then read
@@ -58,9 +58,10 @@ During interactive viewing, vvrd watches Markdown (`.md`, `.markdown`, `.mkd`), 
 sources and automatically performs the same transactional reload after a short save debounce.
 Only the opened source is watched; use `R`/F5 after changing a linked local asset.
 
-PPTX, DOCX, ODP, and ODT documents require LibreOffice. vvrd locates the `soffice` launcher on
-`PATH` or in the standard install location per platform (override with `VVRD_SOFFICE`), prints a
-warning and exits when it is unavailable, and otherwise converts headlessly to a PDF cached under
+PPTX, DOCX, ODP, and ODT documents require LibreOffice. The Vivido installer does not bundle or
+require LibreOffice; vvrd reports that Office document support is disabled when LibreOffice is not
+installed. When it is available, vvrd locates the `soffice` launcher on `PATH` or in the standard
+install location per platform (override with `VVRD_SOFFICE`) and converts headlessly to a PDF cached under
 the platform cache directory keyed by the source content hash (override with `VVRD_OFFICE_CACHE`).
 Converted documents support the full fixed-layout feature set — search, TOC, links, zoom, rotation,
 export — and DOCX/PPTX sources are reconverted automatically when they change. `R`/F5 remains
