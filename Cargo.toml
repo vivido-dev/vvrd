@@ -1,6 +1,6 @@
 [package]
 name = "vvrd"
-version = "0.3.2"
+version = "0.3.3"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.89"
