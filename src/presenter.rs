@@ -914,6 +914,7 @@ fn raster_track(
         .checked_mul(u64::from(height))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "raster pixels overflow"))?;
     Ok(TrackConfiguration {
+        direction: Default::default(),
         context_id: surface.context_id(),
         surface_id: surface.id(),
         track_id,
