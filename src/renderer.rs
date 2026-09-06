@@ -1257,7 +1257,7 @@ fn copy_pixmap_rgb(
         3 => pixmap.samples().to_vec(),
         4 => {
             let mut rgb = Vec::with_capacity(row_stride * height as usize);
-            for pixel in pixmap.samples().chunks_exact(4) {
+            for pixel in pixmap.samples().as_chunks::<4>().0 {
                 rgb.extend_from_slice(&pixel[..3]);
             }
             rgb
@@ -1701,12 +1701,7 @@ mod tests {
             RenderEvent::Page { image, .. } => image,
             event => panic!("expected first rendered page, got {}", event_name(&event)),
         };
-        assert!(
-            first
-                .pixels
-                .chunks_exact(3)
-                .any(|pixel| pixel == [255, 0, 0])
-        );
+        assert!(first.pixels.as_chunks::<3>().0.contains(&[255, 0, 0]));
 
         image::RgbaImage::from_pixel(12, 12, image::Rgba([0, 0, 255, 255]))
             .save(&asset)
@@ -1731,12 +1726,7 @@ mod tests {
             RenderEvent::Page { image, .. } => image,
             event => panic!("expected reloaded page, got {}", event_name(&event)),
         };
-        assert!(
-            second
-                .pixels
-                .chunks_exact(3)
-                .any(|pixel| pixel == [0, 0, 255])
-        );
+        assert!(second.pixels.as_chunks::<3>().0.contains(&[0, 0, 255]));
         renderer.shutdown();
         fs::remove_file(asset).unwrap();
         fs::remove_file(markdown).unwrap();

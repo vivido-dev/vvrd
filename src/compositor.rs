@@ -320,8 +320,10 @@ fn changed_bounds(previous: &[u8], current: &[u8], width: u32, height: u32) -> O
     let mut max_y = 0;
     let mut changed = false;
     for (index, (before, after)) in previous
-        .chunks_exact(4)
-        .zip(current.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(current.as_chunks::<4>().0.iter())
         .enumerate()
     {
         if before != after {
@@ -520,7 +522,7 @@ mod tests {
             .rgba;
         assert_eq!(frame.len(), 4 * 4 * 4);
         assert_eq!(&frame[0..4], &[0, 0, 0, 0]);
-        assert!(frame.chunks_exact(4).any(|pixel| pixel == [255, 0, 0, 255]));
+        assert!(frame.as_chunks::<4>().0.contains(&[255, 0, 0, 255]));
     }
 
     #[test]
@@ -567,7 +569,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!((frame.content_width, frame.content_height), (4, 4));
-        assert!(frame.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(
+            frame
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 255)
+        );
     }
 
     fn composed_rgba(width: u32, height: u32, values: &[u8]) -> ComposedFrame {
