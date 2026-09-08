@@ -3,6 +3,7 @@
 
 use std::{
     fmt::Write as _,
+    io::Read as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -188,7 +189,8 @@ fn run_soffice(
     let stderr = std::fs::File::create(&stderr_log).map_err(|error| {
         RenderError::Converting(format!("cannot create {}: {error}", stderr_log.display()))
     })?;
-    let mut child = Command::new(soffice)
+    let mut command = Command::new(soffice);
+    let mut child = crate::child_process::scrub(&mut command)
         .arg("--headless")
         .arg("--norestore")
         .arg("--nolockcheck")
@@ -245,11 +247,22 @@ fn run_soffice(
 }
 
 fn source_digest(source: &Path) -> Result<String, RenderError> {
-    let bytes = std::fs::read(source).map_err(|error| {
+    let mut file = std::fs::File::open(source).map_err(|error| {
         RenderError::Converting(format!("cannot read {}: {error}", source.display()))
     })?;
+    let mut hash = Md5::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| RenderError::Converting(error.to_string()))?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
     let mut digest = String::with_capacity(32);
-    for byte in Md5::digest(&bytes) {
+    for byte in hash.finalize() {
         write!(&mut digest, "{byte:02x}").expect("writing to String cannot fail");
     }
     Ok(digest)

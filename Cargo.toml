@@ -50,7 +50,9 @@ ttf-parser = "0.25"
 
 clap = { version = "4", features = ["derive", "env"] }
 csscolorparser = { version = "0.8", default-features = false }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
+unicode-width = "0.2"
+unicode-segmentation = "1"
 serde_json = "1"
 directories = "6"
 md-5 = "0.11"

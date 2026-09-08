@@ -1,5 +1,7 @@
+use crate::compositor::{ComposedFrame, Composer, PageImage, ViewTransform};
 use std::collections::VecDeque;
 use std::io;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -79,12 +81,17 @@ pub struct VividPresenter {
     node_id: u64,
     track: Track,
     channel: Option<TrackChannel>,
+    active_io: Arc<Mutex<Option<TrackChannel>>>,
     /// Geometry the active raster track was configured for. Raster dimensions are immutable, so
     /// this only changes when the track is replaced.
     track_viewport: WindowSize,
     /// Geometry the scene node currently claims, in terminal cells.
     node_viewport: WindowSize,
     visible: bool,
+    desired_visible: bool,
+    has_content: bool,
+    composer: Composer,
+    retained_view: Option<(Arc<PageImage>, ViewTransform)>,
     epoch: u32,
     /// Last media ID accepted by the active track. Media IDs increase across channel generations
     /// and restart only with a replacement track.
@@ -96,6 +103,8 @@ pub struct VividPresenter {
     descriptor: SurfaceDescriptor,
     semantic_state: (usize, Option<String>, u64),
     signals: VecDeque<PresenterSignal>,
+    #[cfg(test)]
+    replacement_fault: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,15 +149,18 @@ impl VividPresenter {
             &RequestMetadata::default(),
         )?;
 
-        let (track, channel) = match create_and_prime_track(&mut session, &surface, viewport) {
-            Ok(primed) => primed,
-            Err(error) => {
-                let _ = session.destroy_surface(&surface, &RequestMetadata::default());
-                return Err(error);
-            }
-        };
+        let active_io = Arc::new(Mutex::new(None));
+        let (track, channel) =
+            match create_and_prime_track(&mut session, &surface, viewport, None, &active_io) {
+                Ok(primed) => primed,
+                Err(error) => {
+                    let _ = session.destroy_surface(&surface, &RequestMetadata::default());
+                    return Err(error);
+                }
+            };
         if let Err(error) = activate_raster_slot(&mut session, &surface, &track) {
             let _ = session.destroy_track(&track, &RequestMetadata::default());
+            let _ = channel.close();
             drop(channel);
             let _ = session.destroy_surface(&surface, &RequestMetadata::default());
             return Err(error);
@@ -159,10 +171,11 @@ impl VividPresenter {
             &track,
             &mut signals,
             NodeCommit::Create(&terminal_node(
-                context_id, node_id, &surface, viewport, true,
+                context_id, node_id, &surface, viewport, false,
             )),
         ) {
             let _ = session.destroy_track(&track, &RequestMetadata::default());
+            let _ = channel.close();
             drop(channel);
             let _ = session.destroy_surface(&surface, &RequestMetadata::default());
             return Err(error);
@@ -174,9 +187,14 @@ impl VividPresenter {
             node_id,
             track,
             channel: Some(channel),
+            active_io,
             track_viewport: viewport,
             node_viewport: viewport,
-            visible: true,
+            visible: false,
+            desired_visible: true,
+            has_content: false,
+            composer: Composer::default(),
+            retained_view: None,
             epoch: 1,
             // The priming full frame already used media ID one.
             frame_id: 1,
@@ -187,6 +205,8 @@ impl VividPresenter {
             descriptor,
             semantic_state: (initial_page, None, 1),
             signals,
+            #[cfg(test)]
+            replacement_fault: None,
         })
     }
 
@@ -200,61 +220,148 @@ impl VividPresenter {
         track_viewport: WindowSize,
         node_viewport: WindowSize,
     ) -> io::Result<()> {
-        let (track, channel) =
-            create_and_prime_track(&mut self.session, &self.surface, track_viewport)?;
-
-        if track_viewport != self.track_viewport {
-            let mut replacement = self.surface.definition()?;
+        let original = self.surface.definition()?;
+        let seed = self
+            .retained_view
+            .as_ref()
+            .map(|(image, transform)| {
+                self.composer
+                    .compose(image.clone(), track_viewport, *transform)
+            })
+            .transpose()
+            .map_err(io::Error::other)?;
+        let (track, channel) = create_and_prime_track(
+            &mut self.session,
+            &self.surface,
+            track_viewport,
+            seed.as_ref().map(|frame| frame.rgba.as_slice()),
+            &self.active_io,
+        )?;
+        let geometry_changed = track_viewport != self.track_viewport;
+        if geometry_changed {
+            let mut replacement = original.clone();
             replacement.logical_width = u64::from(track_viewport.page_area_width_px());
             replacement.logical_height = u64::from(track_viewport.page_area_height_px());
-            if let Err(error) =
+            if let Err(error) = self.replacement_gate("surface").and_then(|()| {
                 self.session
                     .update_surface(&self.surface, replacement, &RequestMetadata::default())
-            {
-                let _ = self
+                    .map(|_| ())
+            }) {
+                if self
                     .session
-                    .destroy_track(&track, &RequestMetadata::default());
+                    .update_surface(&self.surface, original.clone(), &RequestMetadata::default())
+                    .is_err()
+                {
+                    (self.cancel_handle())();
+                }
+                let _ = destroy_if_live(&mut self.session, &track);
+                let _ = channel.close();
                 drop(channel);
                 return Err(error);
             }
         }
-
-        if let Err(error) = activate_raster_slot(&mut self.session, &self.surface, &track) {
-            let _ = self
-                .session
-                .destroy_track(&track, &RequestMetadata::default());
+        if let Err(error) = self
+            .replacement_gate("activation")
+            .and_then(|()| activate_raster_slot(&mut self.session, &self.surface, &track))
+        {
+            let rollback = if geometry_changed {
+                self.session
+                    .update_surface(&self.surface, original, &RequestMetadata::default())
+                    .map(|_| ())
+            } else {
+                Ok(())
+            };
+            let rollback = rollback
+                .and_then(|()| activate_raster_slot(&mut self.session, &self.surface, &self.track));
+            let _ = destroy_if_live(&mut self.session, &track);
+            let _ = channel.close();
             drop(channel);
+            if rollback.is_err() {
+                (self.session.cancel_handle())();
+            }
             return Err(error);
         }
-
-        if node_viewport != self.node_viewport {
-            let context_id = self.session.info().root_context_id;
+        // Activation is the commit point. Adopt it before any fallible scene or cleanup work.
+        let retired_track = std::mem::replace(&mut self.track, track);
+        let retired_channel = self.channel.replace(channel);
+        self.track_viewport = track_viewport;
+        self.epoch = 1;
+        self.frame_id = 1;
+        self.force_full_frame = seed.is_none();
+        self.accumulated_damage_pixels = 0;
+        self.recovery_reason = None;
+        let node_result = if node_viewport != self.node_viewport {
             let node = terminal_node(
-                context_id,
+                self.session.info().root_context_id,
                 self.node_id,
                 &self.surface,
                 node_viewport,
                 self.visible,
             );
-            self.commit_node(NodeCommit::Update(&node))?;
-            self.node_viewport = node_viewport;
+            self.replacement_gate("node")
+                .and_then(|()| self.commit_node(NodeCommit::Update(&node)))
+                .map(|()| {
+                    self.node_viewport = node_viewport;
+                })
+        } else {
+            Ok(())
+        };
+        let retired_result = destroy_if_live(&mut self.session, &retired_track);
+        if let Some(channel) = &retired_channel {
+            let _ = channel.close();
         }
-
-        let retired_track = std::mem::replace(&mut self.track, track);
-        let retired_channel = self.channel.replace(channel);
-        self.track_viewport = track_viewport;
-        self.epoch = 1;
-        // A replacement track owns a fresh media-ID space; the priming frame consumed ID one.
-        self.frame_id = 1;
-        self.force_full_frame = false;
-        self.accumulated_damage_pixels = 0;
-        self.recovery_reason = None;
-        // The track transport must outlive the ordered DESTROY_TRACK request: a relay that sees
-        // the media connection close first removes the track on EOF and then rejects the destroy
-        // because the track no longer exists.
-        let result = destroy_if_live(&mut self.session, &retired_track);
         drop(retired_channel);
-        result
+        if let Some(seed) = seed {
+            self.composer.recycle(seed);
+        }
+        node_result.and(retired_result)
+    }
+
+    pub fn cancel_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let cancel = self.session.cancel_handle();
+        let active = self.active_io.clone();
+        Arc::new(move || {
+            cancel();
+            let channel = active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(channel) = channel {
+                let _ = channel.close();
+            }
+        })
+    }
+
+    fn replacement_gate(&mut self, _stage: &str) -> io::Result<()> {
+        #[cfg(test)]
+        if self.replacement_fault == Some(_stage) {
+            self.replacement_fault = None;
+            return Err(io::Error::other("injected replacement failure"));
+        }
+        Ok(())
+    }
+
+    pub fn compose(
+        &mut self,
+        image: Arc<PageImage>,
+        viewport: WindowSize,
+        transform: ViewTransform,
+    ) -> io::Result<ComposedFrame> {
+        let frame = self
+            .composer
+            .compose(image.clone(), viewport, transform)
+            .map_err(io::Error::other)?;
+        self.retained_view = Some((image, transform));
+        Ok(frame)
+    }
+    pub fn recycle(&mut self, frame: ComposedFrame) {
+        self.composer.recycle(frame);
+    }
+    pub fn needs_full_frame(&self) -> bool {
+        self.force_full_frame
+    }
+    pub fn current_frame_id(&self) -> u64 {
+        self.frame_id
     }
 
     fn commit_node(&mut self, commit: NodeCommit<'_>) -> io::Result<()> {
@@ -313,15 +420,6 @@ impl VividPresenter {
     /// Current terminal target and settle state, from the presenter's target descriptor.
     pub fn target_viewport(&self) -> io::Result<(TargetViewport, bool)> {
         WindowSize::from_target_descriptor(&self.session.info().target_descriptor)
-    }
-
-    pub fn command_queue_capacity(&self) -> usize {
-        let inflight = self
-            .track
-            .configuration()
-            .map(|configuration| configuration.maximum_inflight_body_bytes)
-            .unwrap_or(1);
-        command_queue_capacity(inflight, self.expected_frame_len().unwrap_or(usize::MAX))
     }
 
     pub fn update_content_descriptor(
@@ -447,6 +545,9 @@ fn commit_node_following_target(
             }
             Err(error) => return Err(error),
         };
+        if Instant::now() >= deadline {
+            return Err(stale);
+        }
         if !drain_session_events(session, track, signals)? {
             // The announcement that explains the rejection has not arrived yet.
             if Instant::now() >= deadline {
@@ -523,11 +624,6 @@ fn record_signal(
     false
 }
 
-fn command_queue_capacity(maximum_inflight_body_bytes: u64, frame_bytes: usize) -> usize {
-    let frames = maximum_inflight_body_bytes / (frame_bytes.max(1) as u64);
-    usize::try_from(frames).unwrap_or(usize::MAX).max(1)
-}
-
 impl Presenter for VividPresenter {
     fn show_frame(&mut self, rgba: &[u8], delta: Option<&FrameDelta>) -> io::Result<u64> {
         if rgba.len() != self.expected_frame_len()? {
@@ -544,6 +640,10 @@ impl Presenter for VividPresenter {
             .channel
             .as_ref()
             .ok_or_else(|| io::Error::other("raster track channel is unavailable"))?;
+        *self
+            .active_io
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(channel.clone());
         let zstd_enabled = matches!(
             self.track.configuration()?.kind,
             KindConfiguration::Raster(raster) if raster.zstd_enabled
@@ -672,10 +772,14 @@ impl Presenter for VividPresenter {
             },
             self.accumulated_damage_pixels
         );
+        self.has_content = true;
+        self.set_visible(self.desired_visible)?;
         Ok(self.frame_id)
     }
 
     fn set_visible(&mut self, visible: bool) -> io::Result<()> {
+        self.desired_visible = visible;
+        let visible = visible && self.has_content;
         if visible == self.visible {
             return Ok(());
         }
@@ -719,7 +823,9 @@ impl Presenter for VividPresenter {
     fn recover_channel(&mut self, reason: u64) -> io::Result<()> {
         // Dropping the old transport before ADVANCE_CHANNEL is correct here, unlike track destroy:
         // the track survives, and the presenter expects the previous generation to be gone.
-        self.channel = None;
+        if let Some(channel) = self.channel.take() {
+            let _ = channel.close();
+        }
         self.session
             .advance_channel(&self.track, reason, &RequestMetadata::default())?;
         self.channel = Some(self.session.open_track_channel(&self.track)?);
@@ -768,6 +874,9 @@ impl Presenter for VividPresenter {
             first_error = Some(error);
         }
         // As in track replacement, the media transport must outlive DESTROY_TRACK.
+        if let Some(channel) = &channel {
+            let _ = channel.close();
+        }
         drop(channel);
         if let Err(error) = self
             .session
@@ -787,6 +896,8 @@ fn create_and_prime_track(
     session: &mut vivid_sdk::Session,
     surface: &Surface,
     viewport: WindowSize,
+    initial_frame: Option<&[u8]>,
+    active_io: &Mutex<Option<TrackChannel>>,
 ) -> io::Result<(Track, TrackChannel)> {
     let track_id = session.allocate_id()?;
     let mut configuration = None;
@@ -815,11 +926,20 @@ fn create_and_prime_track(
 
     let prime = (|| -> io::Result<TrackChannel> {
         let channel = session.open_track_channel(&track)?;
-        let blank = vec![0_u8; viewport.framebuffer_len().map_err(io::Error::other)?];
-        if zstd_enabled {
-            channel.send_raster_adaptive(1, 1, &blank)?;
+        *active_io
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(channel.clone());
+        let blank;
+        let pixels = if let Some(frame) = initial_frame {
+            frame
         } else {
-            channel.send_raster(1, 1, &blank, false)?;
+            blank = vec![0_u8; viewport.framebuffer_len().map_err(io::Error::other)?];
+            &blank
+        };
+        if zstd_enabled {
+            channel.send_raster_adaptive(1, 1, pixels)?;
+        } else {
+            channel.send_raster(1, 1, pixels, false)?;
         }
         session.wait_track(
             &track,
@@ -833,6 +953,13 @@ fn create_and_prime_track(
         Ok(channel) => Ok((track, channel)),
         Err(error) => {
             let _ = session.destroy_track(&track, &RequestMetadata::default());
+            if let Some(channel) = active_io
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = channel.close();
+            }
             Err(error)
         }
     }
@@ -1029,6 +1156,72 @@ impl Drop for VividPresenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_failures_preserve_the_actual_active_track_and_geometry() {
+        let before = WindowSize::from_cells(4, 5, 1, 1);
+        let after = WindowSize::from_cells(6, 8, 1, 1);
+        for stage in ["surface", "activation", "node"] {
+            let mut presenter =
+                VividPresenter::new(offline_session(), before, 0, test_descriptor(), 0).unwrap();
+            let old = presenter.track.id();
+            presenter.replacement_fault = Some(stage);
+            assert!(presenter.resize(after, true).is_err(), "{stage}");
+            let definition = presenter.surface.definition().unwrap();
+            if stage == "node" {
+                assert_ne!(presenter.track.id(), old);
+                assert_eq!(presenter.track_viewport(), after);
+                assert_eq!(
+                    definition.logical_width,
+                    u64::from(after.page_area_width_px())
+                );
+            } else {
+                assert_eq!(presenter.track.id(), old);
+                assert_eq!(presenter.track_viewport(), before);
+                assert_eq!(
+                    definition.logical_width,
+                    u64::from(before.page_area_width_px())
+                );
+            }
+            presenter
+                .show_frame(
+                    &vec![0; presenter.track_viewport().framebuffer_len().unwrap()],
+                    None,
+                )
+                .unwrap();
+            presenter.teardown().unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_stays_hidden_until_content_and_resize_primes_retained_content() {
+        let before = WindowSize::from_cells(4, 5, 1, 1);
+        let after = WindowSize::from_cells(6, 7, 1, 1);
+        let mut presenter =
+            VividPresenter::new(offline_session(), before, 0, test_descriptor(), 0).unwrap();
+        presenter.set_visible(true).unwrap();
+        assert!(!presenter.visible);
+        let image = Arc::new(PageImage {
+            pixels: vec![80; 48],
+            width: 4,
+            height: 4,
+            row_stride: 12,
+            highlights: Vec::new(),
+        });
+        let frame = presenter
+            .compose(image.clone(), before, ViewTransform::default())
+            .unwrap();
+        presenter.show_frame(&frame.rgba, None).unwrap();
+        assert!(presenter.visible);
+        presenter.resize(after, true).unwrap();
+        assert!(!presenter.needs_full_frame());
+        assert!(
+            presenter
+                .retained_view
+                .as_ref()
+                .is_some_and(|(retained, _)| Arc::ptr_eq(retained, &image))
+        );
+    }
     use vivid_protocol::registry;
     use vivid_sdk::{ProducerConfig, Session, SurfaceRole};
 
@@ -1093,12 +1286,6 @@ mod tests {
             resize_action(final_size, final_size, final_size, true),
             ResizeAction::None
         );
-    }
-
-    #[test]
-    fn command_queue_capacity_obeys_the_declared_inflight_claim() {
-        assert_eq!(command_queue_capacity(8 * 1024, 2 * 1024), 4);
-        assert_eq!(command_queue_capacity(1, 4096), 1);
     }
 
     #[test]

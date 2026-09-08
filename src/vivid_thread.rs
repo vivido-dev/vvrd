@@ -2,15 +2,18 @@ use std::{
     collections::VecDeque,
     sync::Arc,
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use flume::{Receiver, RecvTimeoutError, Sender};
+#[cfg(test)]
+use crate::compositor::compose_view;
+use crate::mailbox::{Receiver, Sender};
+use flume::RecvTimeoutError;
 use vivid_protocol::registry;
 use vivid_sdk::{Session, SurfaceDescriptor};
 
 use crate::{
-    compositor::{ComposedFrame, PageImage, ViewTransform, compose_view, plan_frame_delta},
+    compositor::{ComposedFrame, DeltaPlanner, FramePlan, PageImage, ViewTransform},
     geometry::{TargetViewport, WindowSize},
     presenter::{Presenter, PresenterSignal, VividPresenter},
 };
@@ -40,7 +43,6 @@ pub enum PresentCmd {
         search_term: Option<String>,
         document_revision: u64,
     },
-    Shutdown,
 }
 
 #[derive(Debug)]
@@ -73,6 +75,7 @@ pub struct VividThread {
     pub commands: Sender<PresentCmd>,
     pub events: Receiver<PresentEvent>,
     join: Option<JoinHandle<()>>,
+    cancel: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl VividThread {
@@ -84,8 +87,9 @@ impl VividThread {
         initial_page: usize,
     ) -> std::io::Result<Self> {
         let presenter = VividPresenter::new(session, viewport, policy, descriptor, initial_page)?;
-        let (commands, command_rx) = flume::bounded(presenter.command_queue_capacity());
-        let (event_tx, events) = flume::unbounded();
+        let cancel = presenter.cancel_handle();
+        let (commands, command_rx) = crate::mailbox::channel();
+        let (event_tx, events) = crate::mailbox::channel();
         let join = thread::Builder::new()
             .name("vvrd-vivid".to_owned())
             .spawn(move || run(presenter, command_rx, event_tx))?;
@@ -93,23 +97,51 @@ impl VividThread {
             commands,
             events,
             join: Some(join),
+            cancel,
         })
     }
 
     pub fn shutdown(mut self) {
-        let _ = self.commands.send(PresentCmd::Shutdown);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        self.stop();
+    }
+    fn stop(&mut self) {
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        self.commands.close();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !join.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
         }
+        if !join.is_finished() {
+            (self.cancel)();
+        }
+        let _ = join.join();
     }
 }
-
 impl Drop for VividThread {
     fn drop(&mut self) {
-        let _ = self.commands.send(PresentCmd::Shutdown);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        self.stop();
+    }
+}
+impl crate::mailbox::Coalesce for PresentCmd {
+    fn discard_obsolete(&self) -> bool {
+        matches!(self, Self::ShowView { .. })
+    }
+    fn replaces(&self, previous: &Self) -> bool {
+        matches!(
+            (self, previous),
+            (Self::ShowView { .. }, Self::ShowView { .. })
+        )
+    }
+}
+impl crate::mailbox::Coalesce for PresentEvent {
+    fn replaces(&self, previous: &Self) -> bool {
+        matches!(
+            (self, previous),
+            (Self::FrameShown { .. }, Self::FrameShown { .. })
+                | (Self::TargetChanged { .. }, Self::TargetChanged { .. })
+        )
     }
 }
 
@@ -122,6 +154,7 @@ fn run(
 
     let mut deferred = VecDeque::new();
     let mut previous = None;
+    let mut planner = DeltaPlanner::default();
     loop {
         let signals = service_presenter_signals(&mut presenter, &events);
         if signals.stop {
@@ -162,32 +195,49 @@ fn run(
                 image,
                 viewport,
                 transform,
-            } => compose_view((*image).clone(), viewport, transform)
+            } => presenter
+                .compose(image.clone(), viewport, transform)
                 .map_err(|error| std::io::Error::other(error.to_string()))
                 .and_then(|frame| {
-                    let delta = if let (Some(previous), Some(limit)) =
-                        (previous.as_ref(), presenter.delta_operation_limit())
+                    let plan = if let Some(previous) = previous.as_ref()
                         && previous.viewport == viewport
                     {
-                        plan_frame_delta(
-                            &previous.frame,
-                            &frame,
-                            viewport,
-                            previous.transform,
-                            transform,
-                            Arc::ptr_eq(&previous.image, &image),
-                            limit,
-                        )
-                        .map_err(|error| std::io::Error::other(error.to_string()))?
+                        planner
+                            .plan(
+                                &previous.frame,
+                                &frame,
+                                viewport,
+                                previous.transform,
+                                transform,
+                                Arc::ptr_eq(&previous.image, &image),
+                                presenter.delta_operation_limit().unwrap_or(0),
+                            )
+                            .map_err(|error| std::io::Error::other(error.to_string()))?
                     } else {
-                        None
+                        FramePlan::Full
                     };
-                    let frame_id = presenter.show_frame(&frame.rgba, delta.as_ref())?;
+                    let delta = match &plan {
+                        FramePlan::Delta(delta) => Some(delta),
+                        _ => None,
+                    };
+                    let sent =
+                        if matches!(plan, FramePlan::Unchanged) && !presenter.needs_full_frame() {
+                            Ok(presenter.current_frame_id())
+                        } else {
+                            presenter.show_frame(&frame.rgba, delta)
+                        };
+                    if let FramePlan::Delta(delta) = plan {
+                        planner.recycle(delta);
+                    }
+                    let frame_id = sent?;
                     let event = PresentEvent::FrameShown {
                         frame_id,
                         content_width: frame.content_width,
                         content_height: frame.content_height,
                     };
+                    if let Some(old) = previous.take() {
+                        presenter.recycle(old.frame);
+                    }
                     previous = Some(PreviousComposition {
                         image,
                         viewport,
@@ -215,7 +265,6 @@ fn run(
             } => presenter
                 .update_content_descriptor(page, search_term, document_revision)
                 .map(|()| None),
-            PresentCmd::Shutdown => break,
         };
         let signals = service_presenter_signals(&mut presenter, &events);
         if signals.resend_full
@@ -432,6 +481,91 @@ mod tests {
 
     use vivid_sdk::{ProducerConfig, SurfaceRole};
 
+    #[test]
+    fn identical_views_do_not_send_media_but_recovery_still_sends_full() {
+        let viewport = WindowSize::from_cells(4, 5, 1, 1);
+        let fake = vivid_sdk::testing::TestPresenter::start(4, 5).unwrap();
+        let vivid =
+            VividThread::spawn(live_session(&fake), viewport, 0, test_descriptor(), 0).unwrap();
+        vivid.events.recv_timeout(Duration::from_secs(2)).unwrap();
+        let image = test_page();
+        let show = || PresentCmd::ShowView {
+            image: image.clone(),
+            viewport,
+            transform: ViewTransform::default(),
+        };
+        vivid.commands.send(show()).unwrap();
+        let first = match vivid.events.recv_timeout(Duration::from_secs(2)).unwrap() {
+            PresentEvent::FrameShown { frame_id, .. } => frame_id,
+            event => panic!("{event:?}"),
+        };
+        vivid.commands.send(show()).unwrap();
+        assert!(
+            matches!(vivid.events.recv_timeout(Duration::from_secs(2)).unwrap(), PresentEvent::FrameShown { frame_id, .. } if frame_id == first)
+        );
+        vivid.shutdown();
+        // Priming plus the first content frame, with no redundant third media record.
+        assert_eq!(
+            fake.channels()
+                .iter()
+                .map(|channel| channel.media_records)
+                .sum::<u64>(),
+            2
+        );
+        // The separate presenter full-frame regression verifies mandatory recovery bypasses this skip.
+    }
+
+    #[test]
+    fn saturated_shutdown_cancels_a_stalled_owner_without_stopping_another() {
+        let fake = vivid_sdk::testing::TestPresenter::start(4, 5).unwrap();
+        let viewport = WindowSize::from_cells(4, 5, 1, 1);
+        let vivid =
+            VividThread::spawn(live_session(&fake), viewport, 0, test_descriptor(), 0).unwrap();
+        let other_fake = vivid_sdk::testing::TestPresenter::start(4, 5).unwrap();
+        let mut other =
+            VividPresenter::new(live_session(&other_fake), viewport, 0, test_descriptor(), 0)
+                .unwrap();
+        vivid.events.recv_timeout(Duration::from_secs(2)).unwrap();
+        vivid.commands.send(show_view(viewport)).unwrap();
+        vivid.events.recv_timeout(Duration::from_secs(2)).unwrap();
+        let updates = fake
+            .observed()
+            .iter()
+            .filter(|record| record.record_type == vivid_protocol::messages::UPDATE_NODE)
+            .count();
+        fake.script()
+            .drop_reply(vivid_protocol::messages::SCENE_PRESENTED, 1);
+        vivid.commands.send(PresentCmd::SetVisible(false)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fake
+            .observed()
+            .iter()
+            .filter(|record| record.record_type == vivid_protocol::messages::UPDATE_NODE)
+            .count()
+            == updates
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        for page in 0..32 {
+            vivid
+                .commands
+                .send(PresentCmd::UpdateContent {
+                    page,
+                    search_term: None,
+                    document_revision: 1,
+                })
+                .unwrap();
+        }
+        let start = Instant::now();
+        vivid.shutdown();
+        assert!(start.elapsed() < Duration::from_secs(3));
+        other
+            .show_frame(&vec![0; viewport.framebuffer_len().unwrap()], None)
+            .unwrap();
+        other.teardown().unwrap();
+    }
+
     fn dry_run_session() -> Session {
         Session::connect(ProducerConfig::offline()).unwrap()
     }
@@ -469,7 +603,7 @@ mod tests {
 
     #[test]
     fn consecutive_frames_coalesce_without_crossing_control_commands() {
-        let (sender, receiver) = flume::unbounded();
+        let (sender, receiver) = crate::mailbox::channel();
         let viewport = WindowSize::from_cells(1, 2, 1, 1);
         let view = |value| PresentCmd::ShowView {
             image: Arc::new(PageImage {
@@ -493,9 +627,6 @@ mod tests {
             .unwrap();
         sender.send(view(3)).unwrap();
         let mut deferred = VecDeque::new();
-        assert!(
-            matches!(next_command(&receiver, &mut deferred), Ok(PresentCmd::ShowView { image, .. }) if image.pixels[0] == 2)
-        );
         assert!(matches!(
             next_command(&receiver, &mut deferred),
             Ok(PresentCmd::Resize { settled: true, .. })
@@ -569,7 +700,7 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
 
-        let (event_sender, events) = flume::unbounded();
+        let (event_sender, events) = crate::mailbox::channel();
         apply_target_change(&mut presenter, &event_sender);
         assert!(matches!(
             events.recv_timeout(Duration::from_secs(2)),
@@ -608,7 +739,7 @@ mod tests {
         };
         presenter.resize(after, true).unwrap();
 
-        let (events, observed) = flume::unbounded();
+        let (events, observed) = crate::mailbox::channel();
         resend_full_frame(&mut presenter, &previous, &events);
         assert!(observed.try_recv().is_err());
     }

@@ -72,8 +72,7 @@ pub fn clear_page_area(size: WindowSize) -> anyhow::Result<()> {
 
 pub fn draw_status(size: WindowSize, text: &str) -> anyhow::Result<()> {
     let width = size.cols as usize;
-    let mut line: String = text.chars().take(width.saturating_sub(1)).collect();
-    line.push_str(&" ".repeat(width.saturating_sub(line.chars().count())));
+    let line = safe_line(text, width);
     execute!(
         stdout(),
         cursor::MoveTo(0, size.rows.saturating_sub(1)),
@@ -115,9 +114,9 @@ pub fn draw_toc(
         };
         let line = format!(
             "{marker}{}{}  (p.{})",
-            "  ".repeat(entry.level),
+            "  ".repeat(entry.level.min(size.cols as usize / 2)),
             entry.title,
-            entry.page + 1
+            entry.page.saturating_add(1)
         );
         draw_line(size, row as u16, &line)?;
     }
@@ -186,7 +185,50 @@ pub fn draw_help(size: WindowSize) -> anyhow::Result<()> {
 }
 
 fn draw_line(size: WindowSize, row: u16, text: &str) -> anyhow::Result<()> {
-    let display: String = text.chars().take(size.cols as usize).collect();
+    let display = safe_line(text, size.cols as usize);
     execute!(stdout(), cursor::MoveTo(0, row), Print(display))?;
     Ok(())
+}
+
+/// Only printable graphemes enter Print; clipping never splits a wide cluster.
+fn safe_line(text: &str, width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut result = String::new();
+    let mut used = 0;
+    for cluster in text.graphemes(true) {
+        let safe = if cluster.chars().any(|ch| ch.is_control()) {
+            "�"
+        } else {
+            cluster
+        };
+        let cells = UnicodeWidthStr::width(safe);
+        if cells > width.saturating_sub(used) {
+            break;
+        }
+        // Bound zero-width sequences too; they must not turn a short status row into huge output.
+        if result.len().saturating_add(safe.len()) > width.saturating_mul(32) {
+            break;
+        }
+        result.push_str(safe);
+        used += cells;
+    }
+    result.push_str(&" ".repeat(width.saturating_sub(used)));
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn terminal_text_cannot_execute_controls_or_split_graphemes() {
+        assert!(
+            !safe_line("\x1b]52;c;evil\x07\r\n", 40)
+                .chars()
+                .any(char::is_control)
+        );
+        assert_eq!(safe_line("中a", 2), "中");
+        assert_eq!(safe_line("e\u{301}中", 2), "e\u{301} ");
+        assert_eq!(safe_line("👩‍💻x", 2), "👩‍💻");
+    }
 }

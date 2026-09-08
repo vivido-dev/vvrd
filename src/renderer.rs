@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flume::{Receiver, Sender};
+use crate::mailbox::{Receiver, Sender};
 use mupdf::{
     Colorspace, Document, Matrix, MetadataName, Page, Quad, TextPageFlags,
     text_page::SearchHitResponse,
@@ -41,7 +41,7 @@ pub const MUPDF_WHITE: i32 = i32::from_be_bytes([0, 0xff, 0xff, 0xff]);
 pub const TINT_BLACK: i32 = i32::from_be_bytes([0, 0x70, 0x42, 0x14]);
 pub const TINT_WHITE: i32 = i32::from_be_bytes([0, 0xF5, 0xE6, 0xC8]);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DocumentKind {
     Fixed,
     Reflowable,
@@ -79,7 +79,7 @@ pub fn is_epub(path: &Path) -> bool {
 }
 
 /// Paper choices shared by every open: markup paper theme and page orientation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PaperStyle {
     /// Markup paper theme.
     pub theme: ThemeMode,
@@ -87,28 +87,28 @@ pub struct PaperStyle {
     pub landscape: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LinkInfo {
     pub text: String,
     pub uri: String,
     pub page: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TocEntry {
     pub title: String,
     pub page: usize,
     pub level: usize,
 }
 
-#[derive(Debug)]
-struct PaginationResult {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PaginationResult {
     n_pages: usize,
     toc: Vec<TocEntry>,
     metadata: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RenderOptions {
     pub width_px: f32,
     pub height_px: f32,
@@ -141,7 +141,9 @@ impl RenderOptions {
     }
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum RenderCmd {
+    Fence(u64),
     Render {
         page: usize,
         options: RenderOptions,
@@ -158,7 +160,9 @@ pub enum RenderCmd {
     Shutdown,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum RenderEvent {
+    Idle(u64),
     Opened {
         kind: DocumentKind,
         n_pages: usize,
@@ -171,7 +175,8 @@ pub enum RenderEvent {
     Page {
         page: usize,
         generation: u64,
-        image: PageImage,
+        image: Arc<PageImage>,
+        document_revision: u64,
         text: String,
         links: Vec<LinkInfo>,
     },
@@ -183,41 +188,22 @@ pub enum RenderEvent {
     Stopped,
 }
 
-pub struct RenderThread {
-    pub commands: Sender<RenderCmd>,
-    pub events: Receiver<RenderEvent>,
-    join: Option<JoinHandle<()>>,
-}
+pub use crate::render_process::RenderThread;
 
-impl RenderThread {
-    pub fn spawn(path: PathBuf, viewport: WindowSize, style: PaperStyle) -> Self {
-        let (commands, command_rx) = flume::unbounded();
-        let (event_tx, events) = flume::unbounded();
-        let join = thread::Builder::new()
-            .name("vvrd-render".to_owned())
-            .spawn(move || run_render_thread(path, viewport, style, command_rx, event_tx))
-            .expect("failed to spawn document render thread");
-        Self {
-            commands,
-            events,
-            join: Some(join),
-        }
-    }
-
-    pub fn shutdown(mut self) {
-        let _ = self.commands.send(RenderCmd::Shutdown);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+impl crate::mailbox::Coalesce for RenderCmd {
+    fn replaces(&self, previous: &Self) -> bool {
+        matches!((self, previous), (Self::Render { .. }, Self::Render { .. }))
     }
 }
-
-impl Drop for RenderThread {
-    fn drop(&mut self) {
-        let _ = self.commands.send(RenderCmd::Shutdown);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+impl crate::mailbox::Coalesce for RenderEvent {
+    fn discard_obsolete(&self) -> bool {
+        matches!(self, Self::Page { .. })
+    }
+    fn replaces(&self, previous: &Self) -> bool {
+        matches!(
+            (self, previous),
+            (Self::Page { .. }, Self::Page { .. }) | (Self::Notice(_), Self::Notice(_))
+        )
     }
 }
 
@@ -230,8 +216,8 @@ enum BackendDocument {
     Markup(MarkupDocument),
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ReflowLayout {
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReflowLayout {
     width_px: f32,
     height_px: f32,
     font_size: f32,
@@ -560,7 +546,9 @@ fn run_pagination_thread(
         if superseded(&shared, request.sequence) {
             continue;
         }
-        let result = paginate_reflowable(&path, request.layout, landscape);
+        let result = crate::render_process::paginate(&path, request.layout, landscape, || {
+            superseded(&shared, request.sequence)
+        });
         if superseded(&shared, request.sequence) {
             continue;
         }
@@ -596,7 +584,7 @@ fn superseded(shared: &(Mutex<PaginationState>, Condvar), sequence: u64) -> bool
 /// Runs on the pagination thread against its own `Document`. A MuPDF document is single-threaded,
 /// but one cloned context per thread is MuPDF's supported model, so the render thread keeps
 /// serving page requests while this pass runs.
-fn paginate_reflowable(
+pub(crate) fn paginate_reflowable(
     path: &Path,
     layout: ReflowLayout,
     landscape: bool,
@@ -629,7 +617,7 @@ fn paginate_reflowable(
     })
 }
 
-fn run_render_thread(
+pub(crate) fn run_render_thread(
     path: PathBuf,
     viewport: WindowSize,
     style: PaperStyle,
@@ -658,13 +646,24 @@ fn run_render_thread(
         return;
     }
 
+    let _ = events.send(RenderEvent::Idle(0));
     let mut cache = RenderCache::default();
     let mut deferred = VecDeque::new();
+    let mut pending_prerender = None;
     let heartbeat = RenderHeartbeat::start(events.clone());
     while let Some(command) = next_render_command(&commands, &mut deferred) {
         let mut prerender_request = None;
         let mut request_pagination_after_render = false;
         let result = match command {
+            RenderCmd::Fence(sequence) => {
+                let _ = events.send(RenderEvent::Idle(sequence));
+                if commands.is_empty()
+                    && let Some((page, options)) = pending_prerender.take()
+                {
+                    prerender_backend_neighbors(&document, page, &options, &mut cache, &commands);
+                }
+                continue;
+            }
             RenderCmd::Render { page, options } => {
                 request_pagination_after_render = pagination_pending;
                 match document.update_layout(&options, landscape) {
@@ -694,15 +693,16 @@ fn run_render_thread(
                 let image = if let Some(image) = cache.get(&key) {
                     Ok(image)
                 } else {
-                    render_backend_with_isolation(&document, page, &options, &heartbeat).inspect(
-                        |image| {
+                    render_backend_with_isolation(&document, page, &options, &heartbeat)
+                        .map(Arc::new)
+                        .inspect(|image| {
                             cache.insert(key, image.clone());
-                        },
-                    )
+                        })
                 };
                 let event = image.map(|image| RenderEvent::Page {
                     page,
                     generation: options.generation,
+                    document_revision,
                     image,
                     text: document.page_text(page),
                     links: document.page_links(page),
@@ -773,11 +773,7 @@ fn run_render_thread(
             paginator.request(document_revision, layout);
             pagination_pending = false;
         }
-        if let Some((page, options)) = prerender_request
-            && commands.is_empty()
-        {
-            prerender_backend_neighbors(&document, page, &options, &mut cache, &commands);
-        }
+        pending_prerender = prerender_request;
     }
     drop(paginator);
     heartbeat.stop();
@@ -888,6 +884,7 @@ struct CacheKey {
     black: i32,
     white: i32,
     epub_font_size: u32,
+    zoom_factor: u32,
     search_term: Option<String>,
 }
 
@@ -903,6 +900,7 @@ impl CacheKey {
             black: options.black,
             white: options.white,
             epub_font_size: options.epub_font_size.to_bits(),
+            zoom_factor: options.zoom_factor.to_bits(),
             search_term: options.search_term.clone(),
         }
     }
@@ -910,7 +908,7 @@ impl CacheKey {
 
 #[derive(Default)]
 struct RenderCache {
-    pages: HashMap<CacheKey, PageImage>,
+    pages: HashMap<CacheKey, Arc<PageImage>>,
     order: VecDeque<CacheKey>,
     bytes: usize,
 }
@@ -919,14 +917,15 @@ impl RenderCache {
     const MAX_PAGES: usize = 24;
     const MAX_BYTES: usize = 256 * 1024 * 1024;
 
-    fn get(&mut self, key: &CacheKey) -> Option<PageImage> {
+    fn get(&mut self, key: &CacheKey) -> Option<Arc<PageImage>> {
         let image = self.pages.get(key)?.clone();
         self.order.retain(|candidate| candidate != key);
         self.order.push_back(key.clone());
         Some(image)
     }
 
-    fn insert(&mut self, key: CacheKey, image: PageImage) {
+    fn insert(&mut self, key: CacheKey, image: impl Into<Arc<PageImage>>) {
+        let image = image.into();
         if let Some(previous) = self.pages.remove(&key) {
             self.bytes = self.bytes.saturating_sub(previous.pixels.len());
             self.order.retain(|candidate| candidate != &key);
@@ -1094,28 +1093,6 @@ pub fn render_page(
     })
 }
 
-pub fn export_document_page(
-    path: &Path,
-    page: usize,
-    viewport: WindowSize,
-    options: &RenderOptions,
-    output: &Path,
-    auto_crop: bool,
-    style: PaperStyle,
-) -> Result<(), RenderError> {
-    let document = BackendDocument::open(path, viewport, options.epub_font_size, style)?;
-    document.export_page(page, options, output, auto_crop)
-}
-
-pub fn document_page_count(
-    path: &Path,
-    viewport: WindowSize,
-    epub_font_size: f32,
-    style: PaperStyle,
-) -> Result<usize, RenderError> {
-    Ok(BackendDocument::open(path, viewport, epub_font_size, style)?.page_count())
-}
-
 fn render_markup_page(
     document: &MarkupDocument,
     page_num: usize,
@@ -1216,6 +1193,21 @@ fn render_loaded_page(
     })?;
     let page = document.load_page(page_number)?;
     let bounds = page.bounds()?;
+    if ![
+        bounds.x0,
+        bounds.y0,
+        bounds.x1,
+        bounds.y1,
+        options.width_px,
+        options.height_px,
+    ]
+    .into_iter()
+    .all(f32::is_finite)
+    {
+        return Err(RenderError::Converting(
+            "non-finite page geometry".to_owned(),
+        ));
+    }
     let natural_width = (bounds.x1 - bounds.x0).max(1.0);
     let natural_height = (bounds.y1 - bounds.y0).max(1.0);
     let rotated = !options.rotation.is_multiple_of(180);
@@ -1227,6 +1219,39 @@ fn render_loaded_page(
     let (_, _, scale) = scale_fit(dimensions, (options.width_px, options.height_px));
     let mut matrix = Matrix::new_scale(scale, scale);
     matrix.rotate((options.rotation % 360) as f32);
+    let transformed = [bounds.x0, bounds.x1]
+        .into_iter()
+        .flat_map(|x| {
+            [bounds.y0, bounds.y1].map(|y| {
+                (
+                    x * matrix.a + y * matrix.c + matrix.e,
+                    x * matrix.b + y * matrix.d + matrix.f,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let w = transformed
+        .iter()
+        .map(|p| p.0)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        - transformed
+            .iter()
+            .map(|p| p.0)
+            .fold(f32::INFINITY, f32::min)
+            .floor();
+    let h = transformed
+        .iter()
+        .map(|p| p.1)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        - transformed
+            .iter()
+            .map(|p| p.1)
+            .fold(f32::INFINITY, f32::min)
+            .floor();
+    crate::markup::mermaid::validate_raster_size(w as u32, h as u32)
+        .map_err(|e| RenderError::Converting(e.to_string()))?;
     let mut pixmap = page.to_pixmap(&matrix, &Colorspace::device_rgb(), false, false)?;
     let (black, white) = if options.tinted {
         (TINT_BLACK, TINT_WHITE)
@@ -1240,7 +1265,14 @@ fn render_loaded_page(
     }
     let highlights = search_page(&page, options.search_term.as_deref())?
         .into_iter()
-        .map(|quad| highlight_rect(quad, scale))
+        .map(|quad| {
+            highlight_rect(
+                quad,
+                &matrix,
+                pixmap.origin(),
+                (pixmap.width(), pixmap.height()),
+            )
+        })
         .collect();
     copy_pixmap_rgb(&pixmap, highlights)
 }
@@ -1303,12 +1335,27 @@ fn search_document(document: &Document, term: &str) -> Result<Vec<usize>, Render
     Ok(counts)
 }
 
-fn highlight_rect(quad: Quad, scale: f32) -> HighlightRect {
+fn highlight_rect(
+    quad: Quad,
+    matrix: &Matrix,
+    origin: (i32, i32),
+    size: (u32, u32),
+) -> HighlightRect {
+    let points = [quad.ul, quad.ur, quad.ll, quad.lr].map(|p| {
+        (
+            p.x * matrix.a + p.y * matrix.c + matrix.e - origin.0 as f32,
+            p.x * matrix.b + p.y * matrix.d + matrix.f - origin.1 as f32,
+        )
+    });
+    let min_x = points.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
+    let min_y = points.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+    let max_x = points.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max);
+    let max_y = points.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
     HighlightRect {
-        x0: (quad.ul.x * scale).max(0.0) as u32,
-        y0: (quad.ul.y * scale).max(0.0) as u32,
-        x1: (quad.lr.x * scale).max(0.0) as u32,
-        y1: (quad.lr.y * scale).max(0.0) as u32,
+        x0: min_x.floor().max(0.0).min(size.0 as f32) as u32,
+        y0: min_y.floor().max(0.0).min(size.1 as f32) as u32,
+        x1: max_x.ceil().max(0.0).min(size.0 as f32) as u32,
+        y1: max_y.ceil().max(0.0).min(size.1 as f32) as u32,
     }
 }
 
@@ -1386,6 +1433,11 @@ fn scale_fit((width, height): (f32, f32), (area_w, area_h): (f32, f32)) -> (f32,
     if projected_w > MAX_RENDER_DIMENSION || projected_h > MAX_RENDER_DIMENSION {
         scale /= (projected_w / MAX_RENDER_DIMENSION).max(projected_h / MAX_RENDER_DIMENSION);
     }
+    // Leave rounding headroom for MuPDF's transformed bounding rectangle.
+    let pixel_scale = ((MAX_MARKUP_PAGE_PIXELS as f64 - 65_536.0)
+        / (f64::from(width) * f64::from(height)))
+    .sqrt() as f32;
+    scale = scale.min(pixel_scale);
     (width * scale, height * scale, scale)
 }
 
@@ -1419,7 +1471,78 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    #[ignore = "isolated performance measurement"]
+    fn audit_bench_cache_hits() {
+        let options = RenderOptions::for_viewport(WindowSize::from_cells(80, 24, 10, 20), 1);
+        let key = CacheKey::new(0, &options);
+        let mut cache = RenderCache::default();
+        cache.insert(
+            key.clone(),
+            PageImage {
+                width: 2040,
+                height: 2640,
+                row_stride: 2040 * 3,
+                pixels: vec![1; 2040 * 2640 * 3],
+                highlights: Vec::new(),
+            },
+        );
+        crate::audit_bench::begin_measurement();
+        let started = Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(cache.get(&key).unwrap());
+        }
+        let elapsed = started.elapsed();
+        let (allocated, peak) = crate::audit_bench::finish_measurement();
+        println!(
+            "cache_hits: ns/hit={} allocated_bytes={allocated} peak_additional_live_bytes={peak}",
+            elapsed.as_nanos() / 100
+        );
+    }
+
     static TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn large_pdf_rasters_obey_the_total_pixel_budget() {
+        for (width, height) in [(1.0, 1.0), (612.0, 792.0), (100_000.0, 2.0)] {
+            let (w, h, _) = scale_fit((width, height), (1e9, 1e9));
+            assert!(f64::from(w.ceil()) * f64::from(h.ceil()) <= MAX_MARKUP_PAGE_PIXELS as f64);
+            assert!(w <= MAX_RENDER_DIMENSION && h <= MAX_RENDER_DIMENSION);
+        }
+    }
+
+    #[test]
+    fn highlights_follow_rotation_and_nonzero_pixmap_origin() {
+        let quad = Quad::from(mupdf::Rect::new(10.0, 20.0, 30.0, 40.0));
+        let rect = highlight_rect(quad, &Matrix::new_rotate(90.0), (-50, 5), (100, 100));
+        assert_eq!(
+            rect,
+            HighlightRect {
+                x0: 10,
+                y0: 5,
+                x1: 30,
+                y1: 25
+            }
+        );
+    }
+
+    #[test]
+    fn cache_hit_shares_the_pixel_allocation() {
+        let mut cache = RenderCache::default();
+        let key = CacheKey::new(
+            0,
+            &RenderOptions::for_viewport(WindowSize::from_cells(4, 5, 1, 1), 1),
+        );
+        let page = Arc::new(PageImage {
+            width: 1,
+            height: 1,
+            row_stride: 3,
+            pixels: vec![0; 3],
+            highlights: Vec::new(),
+        });
+        cache.insert(key.clone(), page.clone());
+        assert!(Arc::ptr_eq(&page, &cache.get(&key).unwrap()));
+    }
 
     fn temp_file(extension: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1734,6 +1857,7 @@ mod tests {
 
     fn event_name(event: &RenderEvent) -> &'static str {
         match event {
+            RenderEvent::Idle(_) => "idle",
             RenderEvent::Opened { .. } => "Opened",
             RenderEvent::Page { .. } => "Page",
             RenderEvent::SearchComplete(_) => "SearchComplete",
@@ -1837,7 +1961,7 @@ mod tests {
 
     #[test]
     fn render_requests_coalesce_without_crossing_queries() {
-        let (sender, receiver) = flume::unbounded();
+        let (sender, receiver) = crate::mailbox::channel();
         let viewport = WindowSize::from_cells(80, 24, 10, 20);
         for generation in [1, 2] {
             sender
@@ -1853,12 +1977,19 @@ mod tests {
                 page: 3,
                 options: RenderOptions::for_viewport(viewport, 3),
             })
-            .unwrap();
+            .unwrap_err();
         let mut deferred = VecDeque::new();
         assert!(matches!(
             next_render_command(&receiver, &mut deferred),
             Some(RenderCmd::Render { page: 2, .. })
         ));
+        sender
+            .send(RenderCmd::Render {
+                page: 3,
+                options: RenderOptions::for_viewport(viewport, 3),
+            })
+            .unwrap();
+
         assert!(matches!(
             next_render_command(&receiver, &mut deferred),
             Some(RenderCmd::GetLinks(2))

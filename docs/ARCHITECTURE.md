@@ -100,7 +100,7 @@ whole recovery design rests on.
 
 ### D2 — Synchronous, multi-threaded runtime (no tokio)
 The SDK is blocking (std threads + condvars + blocking socket I/O). vvrd drops kitpdf's tokio
-runtime and uses plain `std::thread` workers coordinated by `flume` channels, with
+runtime and uses plain `std::thread` supervisors and bounded mailboxes, with
 `crossterm::event::poll(timeout)` driving the UI timers (loading-indicator delay, resize debounce).
 This matches the SDK's nature and removes an async/blocking impedance mismatch.
 
@@ -120,10 +120,9 @@ Why this model is the primary path:
 - **Deletes an entire bug class.** kitpdf's `compute_page_surface` juggles Kitty source-rects,
   centering, and placement. With a framebuffer, scroll/zoom/pan is a plain crop-and-scale into a
   buffer the presenter draws 1:1 (`contain`-fit of a same-aspect buffer never letterboxes).
-- **No size ceilings, ever.** A raster track is admissible only if `72 + w·h·4` fits the presenter
-  ceiling (~16.7 M pixels raw). A viewport-sized frame is always far under that, so — unlike kitpdf,
-  which clamps to 10 000 px for Kitty — zoom is unbounded. Sharpness is preserved by rendering the
-  page at zoom resolution in MuPDF and cropping the viewport region, exactly as kitpdf does.
+- **Viewport-sized transport with bounded rendering.** A raster track is admissible only if `72 + w·h·4` fits the presenter
+  ceiling (~16.7 M pixels raw). The viewport must fit that transport ceiling. Page rendering also obeys the 16.7 MP budget;
+  extreme zoom reduces raster scale uniformly before cropping the viewport region.
 - **Single bounded presenter resource** with retained delta composition and full-frame recovery.
 - **Zstd is per-track.** Raster zstd is a field of the immutable raster track configuration, not a
   session feature. vvrd probes it together with raster deltas, prefers zstd when the presenter can
@@ -169,19 +168,33 @@ Critical compositing fact: Vivid media lives at `TEXT_LAYER_BETWEEN_BACKGROUND_A
 - vvrd must keep glyphs out of the page area while an image shows (mirrors kitpdf clearing the page
   area). "Loading…" text is drawn only when no node is visible.
 
-### D5 — Backend-owning render thread + CPU pixmap prerender cache
-A dedicated blocking thread owns either the MuPDF `Document` (which is `!Send`) or the native
-Markdown/Mermaid document plan. It renders a window around the current page into RGB pixmaps and
-serves search/TOC/metadata/links/export. Prerendering neighbours keeps page turns instant. The cache
-is **CPU-side pixmaps**, bounded to 24 pages and 256 MiB, feeding the compositor; markup pagination
-and semantics remain resident while only requested pages are rasterized.
+### D5 — Supervised rendering processes and shared CPU pixmaps
+A supervised subprocess owns the MuPDF `Document` or native Markdown/Mermaid plan. It serves
+opening, rendering, search, metadata, links, transactional reload, and export over private pipes.
+No native document operation runs on the UI thread. The subprocess caches at most 24 pages and
+256 MiB of immutable `Arc<PageImage>` pixels; hits share allocations. Neighbour prefetch runs only
+after the request completion fence and when no command is pending.
 
-MuPDF's EPUB `page_count` lays out every chapter, so it stays off the interactive path. After the
-first requested page has been published, a low-priority, secret-free helper process opens its own
-MuPDF document, computes the exact count and outline, and returns bounded JSON to a supervising
-thread. Until the helper finishes, the UI treats the count as unknown and accepts speculative
-next-page requests; neither navigation nor neighbour prerendering calls `page_count`. A newer layout
-request or shutdown kills a stale helper.
+EPUB counting and outlines use a second disposable subprocess after the first page is returned.
+A newer layout request or shutdown kills a superseded paginator. Open/render deadlines are 30 s;
+Office opening, reload, search, export, conversion and pagination have 120 s deadlines. Preflight
+has the same bounded helper policy. A failed worker keeps the last displayed page and restarts
+only after a new request; it cannot enter an automatic crash loop.
+
+Worker IPC has a 12-byte little-endian header (u32 JSON metadata length, u64 raw RGB length), an
+8 MiB metadata ceiling and a 50.1 MB pixel ceiling. Documents are limited to 100,000 pages and
+outline depth to 256; terminal indentation is additionally clipped to the visible cell width.
+Geometry, exact tight stride, payload length,
+request generation and document revision are validated before publication. Raw pixels use only
+private worker pipes and the Vivid media lane, never the terminal PTY. Process groups on Unix and
+process-tree termination on Windows include conversion descendants in cancellation.
+
+PDF and markup rasterization both enforce 16,384 pixels per axis and 16.7 MP before allocation.
+PDF scale is reduced uniformly with rounding headroom. Search geometry uses the full rendering
+matrix and pixmap origin. The Vivid compositor borrows page pixels, retains one prepared
+crop/highlight/scale result, reuses viewport and delta buffers, and compares translated rows
+without allocating a reference framebuffer. Identical frames send no media except when a full
+recovery frame is required.
 
 ### D5a — vvrd owns MuPDF's system-font lookups
 MuPDF asks for a substitute font whenever it meets a character no loaded face covers, and it only
@@ -232,7 +245,7 @@ are both covered. A temporarily removed source is ignored until a later create e
 remains the manual reload path for every backend and for linked Markdown assets.
 
 Automatic and manual reloads construct a complete replacement document before swapping it into
-the render thread. Success clears page rasters, clamps the current page, rereads local assets, and
+the document worker. Success clears page rasters, clamps the current page, rereads local assets, and
 advances the document content revision. Failure reports an error while the previous plan and
 visible frame remain active. The revision is included in `PresentCmd::UpdateContent`, so a
 same-page reload updates the surface descriptor without changing the surface generation, node,
@@ -254,8 +267,7 @@ terminal is not Vivido (no `VIVID_ENDPOINT_CONTROL`), vvrd exits with a clear me
 
 ### D8 — Deterministic, bounded teardown
 Because a placed node persists in the presenter independent of PTY text, exit/panic paths **must**
-`DELETE_NODE`, `DESTROY_TRACK`, and `DESTROY_SURFACE`, in that order. A `Drop` guard on the Vivid
-thread guarantees this on normal exit, `q`/`Ctrl-C`, error, and panic — otherwise a ghost image
+`DELETE_NODE`, `DESTROY_TRACK`, and `DESTROY_SURFACE`, in that order. A shared shutdown/`Drop` path attempts this with a two-second grace period on normal exit, `q`/`Ctrl-C`, error, and panic — otherwise a ghost image
 lingers in Vivido.
 
 The track transport must **outlive** its ordered `DESTROY_TRACK`. A relay that observes the media
@@ -286,50 +298,34 @@ climbing; only a replacement track restarts it.
 
 ## 4. Runtime structure (threads & data flow)
 
-Three threads, coordinated by `flume` channels (kitpdf already uses `flume`):
+The UI, render supervisor, and Vivid worker communicate through bounded mailboxes:
 
-```
-              key / mouse / resize (crossterm, raw mode, alt screen)
-                                   │
-          ┌────────────────────────▼─────────────────────────┐
-          │  UI thread  (main)                                │
-          │  · owns App state (page, scroll, zoom, mode…)     │
-          │  · crossterm poll/read loop + UI timers           │
-          │  · draws status bar & text overlays to the PTY    │
-          │  · decides the desired *view* + document commands  │
-          └───────┬───────────────────────────────┬──────────┘
-     RenderNotif  │                                │ PresentCmd
-   (JumpToPage,   │                                │ (ShowView{page,transform},
-    Area, Search, ▼                                ▼  Resize, HideNode, Teardown)
-    Invert…) ┌─────────────────┐        ┌────────────────────────────────┐
-             │ Render thread    │ Page  │ Vivid thread                    │
-             │ · backend/plan   │ pixmap│ · owns vivid_sdk::Session       │
-             │   (!Send)        ├──────▶│ · owns surface + raster track   │
-             │ · page → RGB     │(flume)│   + TrackChannel + scene node   │
-             │ · search/TOC/    │       │ · composites viewport RGBA      │
-             │   meta/links/exp │       │   (crop/scale/highlight)        │
-             └─────────────────┘        │ · send_raster (channel flow)    │
-                     ▲                   │ · scene txns / resize / recover │
-                     └───────RenderInfo──┴────────────┬───────────────────┘
-                        (NumPages, Page, Toc,         │ PresentEvent
-                         Metadata, Links, Error)      ▼ (FrameShown, TrackLost,
-                                                        TargetChanged, Error)
-                                              back to UI thread
+```text
+UI ── RenderCmd ── supervisor ── private pipes ── document worker
+ ▲                     │                              │
+ └── RenderEvent ───────┘                              └── EPUB paginator process
+ │
+ └── PresentCmd ── Vivid worker / Composer ── SDK control and media channels
+        ▲                │
+        └─ PresentEvent ─┘
 ```
 
-- **UI thread** never blocks on the network. It emits `RenderNotif` to the render thread (identical
-  enum to kitpdf) and `PresentCmd` to the Vivid thread, and consumes `RenderInfo`/`PresentEvent`.
-- **Render thread** owns backend dispatch, a window of rendered pages, MuPDF `!Send` isolation,
-  the owned lazy markup `PagePlan`, panic-caught page rendering, and the slow-render watchdog.
-- **Vivid thread** owns *all* presenter I/O. It composites the current page pixmap + view transform
-  into the viewport buffer and sends it as a raster frame (blocking on channel flow off the UI
-  thread), runs scene transactions, handles resize (replace the track at new dims), applies presenter
-  signals (full-frame requests, channel loss, track loss, target change), and performs teardown. It **coalesces** superseded view requests — only the
-  latest desired view is composited/sent — giving smooth scroll with no backlog (spec §11.4 allows
-  the presenter to drop intermediate frames; vvrd drops them producer-side).
+Mailboxes contain at most 32 entries and one replaceable request/result of each coalescible kind.
+Render requests coalesce only after the last query barrier; a request that cannot yet be queued
+is retained as the UI's latest desired render and retried without blocking input. Export and
+other ordered commands return a visible busy result if full. Obsolete display frames and page
+results may be discarded, but their replacements are appended after intervening controls.
+A cancelled mailbox closes independently of capacity. IPC readers and writers have bounded
+queues too, so blocked pipe I/O cannot prevent the supervisor from enforcing deadlines.
 
-The SDK additionally runs its own `vivid-sdk-control` and `vivid-sdk-heartbeat` threads internally
-(reply routing, `PING`/`PONG`, liveness). vvrd does not manage those.
+The Vivid worker owns presenter state and composition. It retains a session cancellation handle
+and access to the currently blocking track transport outside its work queue. Normal teardown
+gets two seconds for ordered `DELETE_NODE`, `DESTROY_TRACK`, and `DESTROY_SURFACE`; cancellation
+then shuts down control and media I/O. Renderer shutdown similarly kills and reaps stuck native
+work. `Drop` and explicit shutdown share idempotent implementations.
+
+The SDK continues to own authentication, checked framing, reply correlation, flow control,
+heartbeat, and session-scoped cleanup. vvrd does not implement a second protocol stack.
 
 ---
 
@@ -341,13 +337,16 @@ Modeled on kitpdf, with the Kitty layer swapped for a Vivid presenter layer.
 |---|---|---|
 | `main.rs` | CLI parse, env/config, terminal guard, thread wiring, event loop | port of kitpdf `main.rs` (de-tokio-fied) |
 | `app.rs` | App state: page, scroll/zoom/pan, input mode, search, transforms, pixmap residency | port of kitpdf `app.rs` (near-verbatim; drops Kitty `ImageId`) |
-| `renderer.rs` | Backend dispatch and render thread: cache, search, TOC, metadata, links, reload, EPUB reflow, export, watchdog | MuPDF path from kitpdf plus native backend |
+| `renderer.rs` | Native worker backend: cache, search, TOC, metadata, links, reload, EPUB reflow, export | MuPDF path from kitpdf plus native backend |
 | `source_watch.rs` | Bounded source notifications, path matching, and reload debounce for Markdown/DOCX/PPTX | New |
 | `office.rs` | Office conversion: LibreOffice discovery, content-hash PDF cache, bounded headless `soffice` subprocess with isolated profile | New for PPTX/DOCX/ODP/ODT viewing |
 | `markup/` | Owned Markdown IR, Letter pagination, text/image/SVG raster helpers, bundled Mona Sans/Monaspace fonts | adapted from Kitmd `45cb75f` |
 | `mermaid_engine/` | Complete Rust Mermaid parser, validation, layout, and SVG renderer | copied from Kitmd `45cb75f` |
 | `compositor.rs` | Page pixmap + view transform → viewport RGBA buffer (crop/scale/highlight/crop-margins) | derived from kitpdf `image_pipeline.rs` + `compute_page_surface` |
 | `presenter.rs` | `Presenter` trait + `VividPresenter`: session, document surface, raster track + channel, scene node, frame send, resize, three recoveries, teardown | wraps `vivid_sdk` |
+| `render_process.rs` | Subprocess supervision, deadlines, validated private-pipe IPC and pagination | — |
+| `mailbox.rs` | Bounded submission, ordering barriers and latest-view coalescing | — |
+| `child_process.rs` | Helper environment scrubbing and process-tree cancellation | — |
 | `vivid_thread.rs` | Owns `Session` + presenter; `PresentCmd`/`PresentEvent` loop; signal servicing; frame coalescing | — |
 | `fake_presenter.rs` | Test-only Vivid 1.5 presenter: real auth transcript, framing, and channel handshake | test support |
 | `terminal.rs` | Raw mode / alt screen / cursor / mouse guard; status bar; TOC/metadata/links/help/loading text draw | port of kitpdf `terminal.rs` |
@@ -439,7 +438,7 @@ added.)
    verifies that MuPDF can open a reflowable document without also paginating the full book. The
    renderer publishes the requested EPUB page first, then a low-priority helper process completes the
    full-book page count and outline pass in a separate MuPDF address space. Arrow-key rendering
-   continues in the parent while that helper is busy. Neither helper child inherits any endpoint or
+   continues in the document worker while that helper is busy. Neither helper child inherits any endpoint or
    secret variables. `mupdf_fonts::install()` runs before any document is opened — MuPDF caches
    resolved fonts per context, so a loader installed later is never consulted for faces it already
    looked up (D5a).
@@ -447,9 +446,9 @@ added.)
    verify the selected target profile and read the authoritative grid from the target descriptor.
 3. Enter alt screen / raw mode / hide cursor (terminal guard). Install panic hook that restores the
    terminal *and* tears down Vivid.
-4. Spawn the backend-owning render thread and Vivid thread (owns the session). Send initial `Area`
+4. Spawn the document subprocess supervisor and Vivid thread (owns the session). Send initial `Render`
    (viewport × zoom) to the renderer; `CREATE_SURFACE`, then create + prime the raster track, then
-   `ACTIVATE_TRACK` slot 3, then `CREATE_NODE` for the full-viewport placement.
+   `ACTIVATE_TRACK` slot 3, then a hidden `CREATE_NODE` for the full-viewport placement. Show it after the first content frame.
 5. Load persisted per-file state; jump to saved/`-p` page.
 
 The track is primed — channel opened, first full frame sent, `MILESTONE_OUTPUT_READY` awaited —
@@ -468,17 +467,19 @@ kitpdf does). Zoom changes render resolution → new `Area`. Vivid thread coales
 (`UPDATE_NODE`); nothing else changes. On settle, `PresentCmd::Resize` performs the full track
 replacement:
 
-1. create the replacement raster track at the new dimensions and prime it;
+1. compose the retained page at the new dimensions, prime the replacement track with content,
+   and wait for output readiness (startup keeps the node hidden until content exists);
 2. `UPDATE_SURFACE` the logical size (this advances the surface **generation**, since coordinate
    truth changed, but not surface identity);
 3. `ACTIVATE_TRACK` slot 3 — one atomic compositor-boundary swap;
-4. `UPDATE_NODE` if the cell geometry changed;
+4. adopt the activated track/channel locally, then `UPDATE_NODE` if cell geometry changed;
 5. `DESTROY_TRACK` the retired track, then drop its transport.
 
 Because the replacement is already output-ready when the slot swaps, the resize shows **no blank
-frame** — the visible regression of the 1.1 source-replacement path. A failure in steps 1–3 destroys
-the half-built replacement and leaves the current track active, so the worst case is a stale-size
-frame, never a blank one.
+frame** — the visible regression of the 1.1 source-replacement path. A failure before activation destroys the candidate and restores surface geometry and the
+previous activation through current SDK revisions. Failed rollback cancels the session. After
+activation, local state always owns the replacement, even if node update fails; retirement still
+runs. Target-follow retries obey an unconditional two-second deadline.
 
 The local PTY resize is only a fallback for presenters that do not announce `TARGET_CHANGED`. Each
 fallback command names the last target generation observed by the UI; if an authoritative target
@@ -509,11 +510,8 @@ vvrd **must** run inside `vvmux`, including a **floating pane** (where `vivi` al
 a first-class target, not an afterthought. The good news from auditing `vvmux/src` is that the
 framebuffer + single-node model (D3/D4) is exactly the shape `vvmux` handles best.
 
-> **Status: `vvmux` is still Vivid 1.1 and has not been migrated.** A 1.5 vvrd cannot run inside a
-> 1.1 `vvmux` today, and no 1.1↔1.5 adapter should be written for it: per the migration guide, such
-> an adapter is a terminating gateway with reduced guarantees and is never the semantic reference.
-> The rest of this section describes the design vvrd retains for when `vvmux` migrates; the
-> pane-local, one-node, one-bounded-track discipline it calls for is unchanged by 1.5.
+Both current Vivido and vvmux use Vivid 1.5. Direct and nested smoke tests exercise the same
+producer binary; no 1.1 compatibility path is provided.
 
 **The nested path.** `vvmux` runs a per-pane *virtual presenter*: it sets the pane shell's Vivid
 endpoint and secret to point at itself, terminates vvrd's Vivid session, scopes objects and flow to
@@ -573,7 +571,7 @@ core design; §Verification calls out explicit tiled/floating-pane test cases.
 
 | kitpdf feature | vvrd mechanism |
 |---|---|
-| PDF & EPUB via MuPDF | Same MuPDF render thread |
+| PDF & EPUB via MuPDF | MuPDF document subprocess |
 | Markdown and Mermaid | Native fixed 2040×2640 Letter `PagePlan`; Kitmd-derived renderer/engine |
 | Sharp zoom (re-render at resolution) | Render page at `viewport×zoom`; crop viewport region into framebuffer |
 | Vertical scroll + auto page-turn at bounds | Same `App` scroll logic; compositor crops at scroll offset |
@@ -591,7 +589,7 @@ core design; §Verification calls out explicit tiled/floating-pane test cases.
 | Light/dark paper theme | `--theme light|dark`, markup only |
 | Source refresh | Automatic debounced Markdown/DOCX/PPTX watch plus manual `R`/F5; atomic backend reload keeps the old document on failure |
 | Loading indicator w/ delay | Same UI timer; text drawn while node hidden |
-| Panic isolation + slow-render watchdog | Ported into the render thread |
+| Panic isolation + slow-render watchdog | Supervised subprocess with operation deadlines |
 | Clean exit / Ctrl-C / panic cleanup | Terminal restore **+ Vivid node/track/surface teardown** |
 | Kitty capability detection / SHM probe | Replaced by Vivid profile negotiation (HELLO/WELCOME) and `PROBE_TRACK_CONFIG` |
 | tmux passthrough placeholders | N/A (Vivid media is off-PTY); grid-cell node needs no passthrough |
@@ -635,3 +633,9 @@ core design; §Verification calls out explicit tiled/floating-pane test cases.
 
 *See [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) for the phased build order, dependency
 list, file-by-file tasks, and verification steps.*
+
+## Audit validation
+
+See [AUDIT-2026-09.md](AUDIT-2026-09.md) for regression coverage, benchmark measurements and
+platform validation. Helper launchers centrally remove all `VIVID_*` environment entries.
+Document-derived terminal output is sanitized and clipped by grapheme/cell width before `Print`.

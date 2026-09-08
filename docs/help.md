@@ -17,7 +17,7 @@ vvrd [OPTIONS] <DOCUMENT>
 -w, --white-color CSS    custom document white
     --theme light|dark   Markdown/Mermaid paper theme (default: light)
     --dry-run             validate without a live presenter
-    --trace DIR           write control.vivid and raster-*.vivid traces
+    --trace DIR           write metadata-only control.ndjson and track-*.ndjson traces
 -v, --verbose             diagnostic logging without credentials
 ```
 

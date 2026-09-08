@@ -1,10 +1,13 @@
+use std::sync::Arc;
+
 use anyhow::{Context as _, ensure};
 use image::{ImageBuffer, Rgb, RgbImage, imageops::FilterType};
 
 use crate::geometry::WindowSize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PageImage {
+    #[serde(skip)]
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
@@ -12,7 +15,7 @@ pub struct PageImage {
     pub highlights: Vec<HighlightRect>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HighlightRect {
     pub x0: u32,
     pub y0: u32,
@@ -99,16 +102,107 @@ impl PageImage {
     }
 }
 
+/// Retains one prepared page; pan/scroll only borrow it and repaint a reusable viewport.
+#[derive(Default)]
+pub struct Composer {
+    key: Option<(Arc<PageImage>, WindowSize, bool, bool)>,
+    prepared: Option<RgbImage>,
+    spare: Vec<u8>,
+}
+
+impl Composer {
+    pub fn compose(
+        &mut self,
+        page: Arc<PageImage>,
+        viewport: WindowSize,
+        transform: ViewTransform,
+    ) -> anyhow::Result<ComposedFrame> {
+        let same = self.key.as_ref().is_some_and(|(old, size, crop, fit)| {
+            Arc::ptr_eq(old, &page)
+                && *size == viewport
+                && *crop == transform.auto_crop
+                && *fit == transform.fit_to_viewport
+        });
+        if !same {
+            self.prepared = None;
+            self.key = None;
+            validate_page(&page)?;
+            let needs_preparation = !page.highlights.is_empty()
+                || transform.auto_crop
+                || (transform.fit_to_viewport
+                    && (page.width > viewport.page_area_width_px()
+                        || page.height > viewport.page_area_height_px()));
+            if needs_preparation {
+                self.prepared = Some(prepare_page(&page, viewport, transform)?);
+            }
+            self.key = Some((
+                page.clone(),
+                viewport,
+                transform.auto_crop,
+                transform.fit_to_viewport,
+            ));
+        }
+        let (pixels, content_width, content_height, stride) = match &self.prepared {
+            Some(image) => (
+                image.as_raw().as_slice(),
+                image.width(),
+                image.height(),
+                image.width() as usize * 3,
+            ),
+            None => (
+                page.pixels.as_slice(),
+                page.width,
+                page.height,
+                page.row_stride,
+            ),
+        };
+        blit(
+            pixels,
+            content_width,
+            content_height,
+            stride,
+            viewport,
+            transform,
+            std::mem::take(&mut self.spare),
+        )
+    }
+    pub fn recycle(&mut self, frame: ComposedFrame) {
+        self.spare = frame.rgba;
+    }
+}
+
+pub fn validate_page(page: &PageImage) -> anyhow::Result<()> {
+    crate::markup::mermaid::validate_raster_size(page.width, page.height)?;
+    let tight = (page.width as usize)
+        .checked_mul(3)
+        .context("page stride overflow")?;
+    ensure!(page.row_stride >= tight, "invalid page stride");
+    let length = page
+        .row_stride
+        .checked_mul(page.height as usize)
+        .context("page length overflow")?;
+    ensure!(length == page.pixels.len(), "page buffer length mismatch");
+    Ok(())
+}
+
+#[cfg(test)]
 pub fn compose_view(
     page: PageImage,
     viewport: WindowSize,
     transform: ViewTransform,
 ) -> anyhow::Result<ComposedFrame> {
+    Composer::default().compose(Arc::new(page), viewport, transform)
+}
+
+fn prepare_page(
+    page: &PageImage,
+    viewport: WindowSize,
+    transform: ViewTransform,
+) -> anyhow::Result<RgbImage> {
     let width = viewport.page_area_width_px();
     let height = viewport.page_area_height_px();
-    ensure!(width > 0 && height > 0, "viewport has no drawable pixels");
     let highlights = page.highlights.clone();
-    let mut image = page.into_rgb()?;
+    let mut image = page.clone().into_rgb()?;
     ensure!(
         image.width() > 0 && image.height() > 0,
         "page image is empty"
@@ -119,7 +213,7 @@ pub fn compose_view(
         image = crop_whitespace_image(image);
     }
 
-    let (content_width, content_height, image) =
+    let (_, _, image) =
         if transform.fit_to_viewport && (image.width() > width || image.height() > height) {
             let scale =
                 (width as f64 / image.width() as f64).min(height as f64 / image.height() as f64);
@@ -146,7 +240,23 @@ pub fn compose_view(
             (image.width(), image.height(), image)
         };
 
-    let mut rgba = vec![0_u8; viewport.framebuffer_len()?];
+    Ok(image)
+}
+
+fn blit(
+    pixels: &[u8],
+    content_width: u32,
+    content_height: u32,
+    stride: usize,
+    viewport: WindowSize,
+    transform: ViewTransform,
+    mut rgba: Vec<u8>,
+) -> anyhow::Result<ComposedFrame> {
+    let width = viewport.page_area_width_px();
+    let height = viewport.page_area_height_px();
+    ensure!(width > 0 && height > 0, "viewport has no drawable pixels");
+    rgba.resize(viewport.framebuffer_len()?, 0);
+    rgba.fill(0);
     let source_x = transform.offset_x.min(content_width.saturating_sub(width));
     let source_y = transform
         .offset_y
@@ -157,11 +267,11 @@ pub fn compose_view(
     let destination_y = height.saturating_sub(draw_height) / 2;
     for y in 0..draw_height {
         for x in 0..draw_width {
-            let pixel = image.get_pixel(x + source_x, y + source_y);
+            let source = (y + source_y) as usize * stride + (x + source_x) as usize * 3;
             let index = (((y + destination_y) as usize * width as usize)
                 + (x + destination_x) as usize)
                 * 4;
-            rgba[index..index + 3].copy_from_slice(&pixel.0);
+            rgba[index..index + 3].copy_from_slice(&pixels[source..source + 3]);
             rgba[index + 3] = u8::MAX;
         }
     }
@@ -172,7 +282,79 @@ pub fn compose_view(
     })
 }
 
+pub enum FramePlan {
+    Unchanged,
+    Full,
+    Delta(FrameDelta),
+}
+
+#[derive(Default)]
+pub struct DeltaPlanner {
+    buffers: Vec<Vec<u8>>,
+    operations: Vec<DeltaOperation>,
+}
+impl DeltaPlanner {
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan(
+        &mut self,
+        previous: &ComposedFrame,
+        current: &ComposedFrame,
+        viewport: WindowSize,
+        before: ViewTransform,
+        after: ViewTransform,
+        same_image: bool,
+        limit: u32,
+    ) -> anyhow::Result<FramePlan> {
+        if previous.rgba == current.rgba {
+            return Ok(FramePlan::Unchanged);
+        }
+        Ok(
+            match plan_frame_delta_inner(
+                previous, current, viewport, before, after, same_image, limit, self,
+            )? {
+                Some(delta) => FramePlan::Delta(delta),
+                None => FramePlan::Full,
+            },
+        )
+    }
+    pub fn recycle(&mut self, delta: FrameDelta) {
+        self.operations = delta.operations;
+        for operation in self.operations.drain(..) {
+            if let DeltaOperation::Overwrite { mut rgba, .. } = operation {
+                rgba.clear();
+                self.buffers.push(rgba);
+            }
+        }
+    }
+    fn extract(&mut self, frame: &[u8], width: u32, rect: DamageRect) -> anyhow::Result<Vec<u8>> {
+        extract_rect_into(frame, width, rect, self.buffers.pop().unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
 pub fn plan_frame_delta(
+    previous: &ComposedFrame,
+    current: &ComposedFrame,
+    viewport: WindowSize,
+    before: ViewTransform,
+    after: ViewTransform,
+    same_image: bool,
+    limit: u32,
+) -> anyhow::Result<Option<FrameDelta>> {
+    plan_frame_delta_inner(
+        previous,
+        current,
+        viewport,
+        before,
+        after,
+        same_image,
+        limit,
+        &mut DeltaPlanner::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_frame_delta_inner(
     previous: &ComposedFrame,
     current: &ComposedFrame,
     viewport: WindowSize,
@@ -180,6 +362,7 @@ pub fn plan_frame_delta(
     current_transform: ViewTransform,
     same_page_image: bool,
     operation_limit: u32,
+    scratch: &mut DeltaPlanner,
 ) -> anyhow::Result<Option<FrameDelta>> {
     let width = viewport.page_area_width_px();
     let height = viewport.page_area_height_px();
@@ -202,6 +385,7 @@ pub fn plan_frame_delta(
             previous_transform,
             current_transform,
             operation_limit,
+            scratch,
         )?
     {
         return Ok(Some(delta));
@@ -216,12 +400,13 @@ pub fn plan_frame_delta(
     Ok(Some(FrameDelta {
         damaged_pixels: u64::from(rect.width) * u64::from(rect.height),
         operations: vec![DeltaOperation::Overwrite {
-            rgba: extract_rect(&current.rgba, width, rect)?,
+            rgba: scratch.extract(&current.rgba, width, rect)?,
             rect,
         }],
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_translation_delta(
     previous: &[u8],
     current: &[u8],
@@ -230,6 +415,7 @@ fn plan_translation_delta(
     previous_transform: ViewTransform,
     current_transform: ViewTransform,
     operation_limit: u32,
+    scratch: &mut DeltaPlanner,
 ) -> anyhow::Result<Option<FrameDelta>> {
     let shift_x = i64::from(previous_transform.offset_x) - i64::from(current_transform.offset_x);
     let shift_y = i64::from(previous_transform.offset_y) - i64::from(current_transform.offset_y);
@@ -263,7 +449,17 @@ fn plan_translation_delta(
         return Ok(None);
     }
 
-    let mut operations = Vec::with_capacity(1 + rects.len());
+    // Validate the copy against borrowed rows. The exposed strips are overwritten from current.
+    for y in 0..copy_height {
+        let source = ((source_y + y) as usize * width as usize + source_x as usize) * 4;
+        let destination =
+            ((destination_y + y) as usize * width as usize + destination_x as usize) * 4;
+        let length = copy_width as usize * 4;
+        if previous[source..source + length] != current[destination..destination + length] {
+            return Ok(None);
+        }
+    }
+    let mut operations = std::mem::take(&mut scratch.operations);
     operations.push(DeltaOperation::Copy {
         destination_x,
         destination_y,
@@ -274,7 +470,7 @@ fn plan_translation_delta(
     });
     for rect in rects {
         operations.push(DeltaOperation::Overwrite {
-            rgba: extract_rect(current, width, rect)?,
+            rgba: scratch.extract(current, width, rect)?,
             rect,
         });
     }
@@ -284,11 +480,7 @@ fn plan_translation_delta(
         operations,
         damaged_pixels: damage,
     };
-    if apply_delta_reference(previous, width, height, &delta)? == current {
-        Ok(Some(delta))
-    } else {
-        Ok(None)
-    }
+    Ok(Some(delta))
 }
 
 fn translation_axis(length: u32, shift: i64) -> (u32, u32, u32) {
@@ -345,15 +537,25 @@ fn changed_bounds(previous: &[u8], current: &[u8], width: u32, height: u32) -> O
     })
 }
 
+#[cfg(test)]
 fn extract_rect(frame: &[u8], frame_width: u32, rect: DamageRect) -> anyhow::Result<Vec<u8>> {
+    extract_rect_into(frame, frame_width, rect, Vec::new())
+}
+fn extract_rect_into(
+    frame: &[u8],
+    frame_width: u32,
+    rect: DamageRect,
+    mut rgba: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
     let row_bytes = usize::try_from(rect.width)
         .context("damage width exceeds address space")?
         .checked_mul(4)
         .context("damage row size overflow")?;
-    let mut rgba = Vec::with_capacity(
+    rgba.clear();
+    rgba.reserve(
         row_bytes
             .checked_mul(rect.height as usize)
-            .context("damage buffer size overflow")?,
+            .context("damage buffer overflow")?,
     );
     for y in rect.y..rect.y + rect.height {
         let start = (usize::try_from(y)
@@ -367,6 +569,7 @@ fn extract_rect(frame: &[u8], frame_width: u32, rect: DamageRect) -> anyhow::Res
     Ok(rgba)
 }
 
+#[cfg(test)]
 fn apply_delta_reference(
     previous: &[u8],
     frame_width: u32,
@@ -422,6 +625,7 @@ fn apply_delta_reference(
     Ok(frame)
 }
 
+#[cfg(test)]
 fn overwrite_rect(
     frame: &mut [u8],
     frame_width: u32,
