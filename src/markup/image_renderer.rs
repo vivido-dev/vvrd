@@ -2,14 +2,18 @@
 
 use std::io::Cursor;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use cosmic_text::{
     Attrs, Buffer, Color as CosmicColor, Family, FontSystem, Metrics, Shaping, Style, SwashCache,
     Weight,
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+use rayon::prelude::*;
 
 use crate::markup::fonts;
+
+/// Channels in the RGBA rasters this module renders and scales.
+const CHANNELS: usize = 4;
 
 pub const META_STRIKE: usize = 1;
 pub const META_CODE: usize = 1 << 1;
@@ -443,6 +447,130 @@ pub fn overlay(dst: &mut RgbaImage, x: i32, y: i32, src: &RgbaImage) {
     }
 }
 
+/// Magnify a page raster with a four-tap Catmull-Rom filter, in parallel over rows.
+///
+/// Zoom re-renders the whole page at every step, so this sits on the interactive path. A general
+/// single-threaded filter spends hundreds of milliseconds on a letter-sized page there, long
+/// enough for the reader to blank the view and draw its loading placeholder between zoom steps.
+/// Catmull-Rom is as sharp as Lanczos when magnifying, and its separable passes split by row.
+///
+/// The destination must be at least as large as the source: four taps do not cover the wider
+/// source footprint that minification has to average over.
+pub fn magnify(image: &RgbaImage, width: u32, height: u32) -> Result<RgbaImage> {
+    ensure!(
+        width >= image.width() && height >= image.height(),
+        "magnify cannot shrink a raster"
+    );
+    if (width, height) == (image.width(), image.height()) {
+        return Ok(image.clone());
+    }
+    ensure!(image.width() > 0 && image.height() > 0, "empty raster");
+    let source_stride = (image.width() as usize)
+        .checked_mul(CHANNELS)
+        .context("source row exceeds addressable memory")?;
+    let stride = (width as usize)
+        .checked_mul(CHANNELS)
+        .context("magnified row exceeds addressable memory")?;
+    let columns = stride
+        .checked_mul(image.height() as usize)
+        .context("magnified columns exceed addressable memory")?;
+    let total = stride
+        .checked_mul(height as usize)
+        .context("magnified raster exceeds addressable memory")?;
+
+    // Horizontal pass first: every destination row then reads four already-widened rows.
+    let horizontal = Taps::new(image.width(), width);
+    let mut widened = vec![0u8; columns];
+    widened
+        .par_chunks_mut(stride)
+        .zip(image.as_raw().par_chunks_exact(source_stride))
+        .for_each(|(destination, source)| horizontal.resample_row(source, destination));
+
+    let vertical = Taps::new(image.height(), height);
+    let mut pixels = vec![0u8; total];
+    pixels
+        .par_chunks_mut(stride)
+        .enumerate()
+        .for_each(|(row, destination)| vertical.blend_rows(&widened, stride, row, destination));
+    RgbaImage::from_raw(width, height, pixels).context("magnified raster has inconsistent size")
+}
+
+/// The source window of every destination position along one axis: four taps and their weights.
+struct Taps {
+    taps: Vec<(isize, [f32; 4])>,
+    last: isize,
+}
+
+impl Taps {
+    fn new(source: u32, destination: u32) -> Self {
+        let ratio = source as f32 / destination as f32;
+        let taps = (0..destination)
+            .map(|index| {
+                let center = (index as f32 + 0.5) * ratio - 0.5;
+                let first = center.floor() as isize - 1;
+                let weights = std::array::from_fn(|offset| {
+                    catmull_rom(center - (first + offset as isize) as f32)
+                });
+                (first, weights)
+            })
+            .collect();
+        Self {
+            taps,
+            last: source as isize - 1,
+        }
+    }
+
+    fn resample_row(&self, source: &[u8], destination: &mut [u8]) {
+        let (source, _) = source.as_chunks::<CHANNELS>();
+        let (destination, _) = destination.as_chunks_mut::<CHANNELS>();
+        for (&(first, weights), pixel) in self.taps.iter().zip(destination) {
+            for (channel, value) in pixel.iter_mut().enumerate() {
+                let mut sum = 0.0;
+                for (offset, weight) in weights.iter().enumerate() {
+                    let column = (first + offset as isize).clamp(0, self.last) as usize;
+                    sum += weight * f32::from(source[column][channel]);
+                }
+                *value = channel_value(sum);
+            }
+        }
+    }
+
+    fn blend_rows(&self, source: &[u8], stride: usize, row: usize, destination: &mut [u8]) {
+        let (first, weights) = self.taps[row];
+        let rows: [&[u8]; 4] = std::array::from_fn(|offset| {
+            let row = (first + offset as isize).clamp(0, self.last) as usize;
+            &source[row * stride..][..stride]
+        });
+        for (index, value) in destination.iter_mut().enumerate() {
+            let mut sum = 0.0;
+            for (offset, weight) in weights.iter().enumerate() {
+                sum += weight * f32::from(rows[offset][index]);
+            }
+            *value = channel_value(sum);
+        }
+    }
+}
+
+/// Catmull-Rom, the interpolating cubic: it reproduces the source pixel it lands on and stays
+/// within a two-pixel radius, so magnified text keeps its edges instead of softening.
+fn catmull_rom(distance: f32) -> f32 {
+    let distance = distance.abs();
+    let squared = distance * distance;
+    let cubed = squared * distance;
+    if distance < 1.0 {
+        1.5 * cubed - 2.5 * squared + 1.0
+    } else if distance < 2.0 {
+        -0.5 * cubed + 2.5 * squared - 4.0 * distance + 2.0
+    } else {
+        0.0
+    }
+}
+
+/// The cubic overshoots around sharp edges; clamp before narrowing back to a channel.
+fn channel_value(value: f32) -> u8 {
+    value.round().clamp(0.0, 255.0) as u8
+}
+
 pub fn resize_to_width(image: &RgbaImage, max_width: u32) -> RgbaImage {
     if image.width() <= max_width || max_width == 0 {
         return image.clone();
@@ -492,6 +620,46 @@ fn to_cosmic(color: Rgba<u8>) -> CosmicColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn magnify_keeps_flat_colour_and_edges_inside_the_channel_range() {
+        let mut image = RgbaImage::from_pixel(8, 8, rgba(250, 250, 248, 255));
+        for x in 0..8 {
+            image.put_pixel(x, 4, rgba(0, 0, 0, 255));
+        }
+        let magnified = magnify(&image, 24, 24).unwrap();
+        assert_eq!(magnified.dimensions(), (24, 24));
+        // The paper away from the stroke stays exactly the paper colour: a four-tap window that
+        // only sees one colour has to reproduce it.
+        assert_eq!(*magnified.get_pixel(3, 1), rgba(250, 250, 248, 255));
+        // The stroke survives magnification, and the cubic's overshoot stays inside the channel.
+        let stroke = (0..24)
+            .map(|y| u32::from(magnified.get_pixel(12, y)[0]))
+            .min()
+            .unwrap();
+        assert!(stroke < 40, "magnified stroke washed out to {stroke}");
+    }
+
+    #[test]
+    fn magnify_reproduces_the_source_at_its_own_size_and_refuses_to_shrink() {
+        let mut image = RgbaImage::from_pixel(6, 4, rgba(12, 34, 56, 255));
+        image.put_pixel(2, 1, rgba(200, 100, 0, 255));
+        assert_eq!(magnify(&image, 6, 4).unwrap(), image);
+        assert!(magnify(&image, 3, 2).is_err());
+        assert!(magnify(&image, 6, 2).is_err());
+    }
+
+    #[test]
+    fn magnify_interpolates_a_gradient_without_reordering_it() {
+        let image = RgbaImage::from_fn(4, 1, |x, _| rgba((x * 60) as u8, (x * 60) as u8, 0, 255));
+        let magnified = magnify(&image, 16, 1).unwrap();
+        let row: Vec<u8> = magnified.pixels().map(|pixel| pixel[0]).collect();
+        assert!(row.windows(2).all(|pair| pair[0] <= pair[1]), "{row:?}");
+        // Edge taps repeat the border pixel, so the ends reach the source extremes; the cubic may
+        // overshoot slightly past the last value and must stay a valid channel when it does.
+        assert_eq!(row.first(), Some(&0));
+        assert!(row.last().is_some_and(|last| *last >= 180), "{row:?}");
+    }
 
     #[test]
     fn rendered_image_round_trips_png() {

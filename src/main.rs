@@ -527,6 +527,7 @@ fn request_render(
         draw_loading,
         runtime.current_image.is_some(),
         current_image_is_ready(runtime),
+        current_image_shows_another_page(runtime),
     ) {
         LoadingPolicy::None => runtime.loading_deadline = None,
         LoadingPolicy::Immediate => {
@@ -589,14 +590,28 @@ fn loading_policy(
     draw_loading: bool,
     has_displayed_page: bool,
     page_is_ready: bool,
+    shows_another_page: bool,
 ) -> LoadingPolicy {
     if !draw_loading || page_is_ready {
         LoadingPolicy::None
-    } else if has_displayed_page {
+    } else if !has_displayed_page {
+        LoadingPolicy::Immediate
+    } else if shows_another_page {
         LoadingPolicy::Delayed
     } else {
-        LoadingPolicy::Immediate
+        // Zoom, rotation and colour changes re-render the page already on screen. Those pixels
+        // stay a truthful view of the requested page, so blanking them would replace a readable
+        // page with a placeholder that says less than the page it covered.
+        LoadingPolicy::None
     }
+}
+
+/// Is the committed frame a different page from the one about to be rendered?
+fn current_image_shows_another_page(runtime: &Runtime) -> bool {
+    runtime
+        .current_image
+        .as_ref()
+        .is_some_and(|(page, _, _)| *page != runtime.app.page)
 }
 
 fn current_image_is_ready(runtime: &Runtime) -> bool {
@@ -1492,9 +1507,28 @@ mod tests {
 
     #[test]
     fn page_turn_retains_the_previous_frame_during_loading_grace() {
-        assert_eq!(loading_policy(true, true, false), LoadingPolicy::Delayed);
-        assert_eq!(loading_policy(true, false, false), LoadingPolicy::Immediate);
-        assert_eq!(loading_policy(true, true, true), LoadingPolicy::None);
-        assert_eq!(loading_policy(false, true, false), LoadingPolicy::None);
+        assert_eq!(
+            loading_policy(true, true, false, true),
+            LoadingPolicy::Delayed
+        );
+        assert_eq!(
+            loading_policy(true, false, false, false),
+            LoadingPolicy::Immediate
+        );
+        assert_eq!(loading_policy(true, true, true, true), LoadingPolicy::None);
+        assert_eq!(
+            loading_policy(false, true, false, true),
+            LoadingPolicy::None
+        );
+    }
+
+    #[test]
+    fn rescaling_the_displayed_page_never_blanks_it() {
+        // Zoom steps re-render the page that is already on screen. Holding it is what keeps a
+        // slow rescale from flashing the loading placeholder between two zoom levels.
+        assert_eq!(
+            loading_policy(true, true, false, false),
+            LoadingPolicy::None
+        );
     }
 }

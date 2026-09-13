@@ -21,8 +21,8 @@ use crate::{
     error::RenderError,
     geometry::WindowSize,
     markup::{
-        ThemeMode,
-        markdown::{MarkupDocument, MarkupKind},
+        ThemeMode, image_renderer,
+        markdown::{MarkupDocument, MarkupKind, MarkupPage},
     },
     office,
 };
@@ -390,7 +390,7 @@ impl BackendDocument {
     ) -> Result<(), RenderError> {
         let image = match self {
             Self::MuPdf { document, .. } => render_loaded_page(document, page, options)?,
-            Self::Markup(document) => render_markup_page(document, page, options)?,
+            Self::Markup(document) => render_markup_page(document, page, options, None)?,
         }
         .into_rgb()
         .map_err(|error| RenderError::Converting(error.to_string()))?;
@@ -648,6 +648,7 @@ pub(crate) fn run_render_thread(
 
     let _ = events.send(RenderEvent::Idle(0));
     let mut cache = RenderCache::default();
+    let mut base = MarkupBase::default();
     let mut deferred = VecDeque::new();
     let mut pending_prerender = None;
     let heartbeat = RenderHeartbeat::start(events.clone());
@@ -669,6 +670,7 @@ pub(crate) fn run_render_thread(
                 match document.update_layout(&options, landscape) {
                     Ok(true) => {
                         cache.clear();
+                        base.clear();
                         if matches!(document.kind(), DocumentKind::Reflowable) {
                             pagination_pending = true;
                             request_pagination_after_render = true;
@@ -693,7 +695,7 @@ pub(crate) fn run_render_thread(
                 let image = if let Some(image) = cache.get(&key) {
                     Ok(image)
                 } else {
-                    render_backend_with_isolation(&document, page, &options, &heartbeat)
+                    render_backend_with_isolation(&document, page, &options, &heartbeat, &mut base)
                         .map(Arc::new)
                         .inspect(|image| {
                             cache.insert(key, image.clone());
@@ -719,6 +721,7 @@ pub(crate) fn run_render_thread(
                         document = replacement;
                         document_revision = document_revision.saturating_add(1);
                         cache.clear();
+                        base.clear();
                         if matches!(document.kind(), DocumentKind::Reflowable) {
                             pagination_pending = true;
                             if paginator.is_none() {
@@ -849,11 +852,14 @@ fn render_backend_with_isolation(
     page: usize,
     options: &RenderOptions,
     heartbeat: &RenderHeartbeat,
+    base: &mut MarkupBase,
 ) -> Result<PageImage, RenderError> {
     heartbeat.begin(page);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match document {
         BackendDocument::MuPdf { document, .. } => render_loaded_page(document, page, options),
-        BackendDocument::Markup(document) => render_markup_page(document, page, options),
+        BackendDocument::Markup(document) => {
+            render_markup_page(document, page, options, Some(base))
+        }
     }));
     heartbeat.end();
     match result {
@@ -903,6 +909,49 @@ impl CacheKey {
             zoom_factor: options.zoom_factor.to_bits(),
             search_term: options.search_term.clone(),
         }
+    }
+}
+
+fn render_markup_base(
+    document: &MarkupDocument,
+    page_num: usize,
+    search_term: Option<&str>,
+) -> Result<MarkupPage, RenderError> {
+    document
+        .render_page(page_num, search_term)
+        .map_err(|error| RenderError::Markup(error.to_string()))
+}
+
+/// The unscaled raster of the markup page the reader is looking at.
+///
+/// One page is enough: it is the page every zoom, rotation and colour change re-renders.
+/// Speculative neighbour renders deliberately leave it alone, so stepping the zoom never has to
+/// lay the current page out again.
+#[derive(Default)]
+struct MarkupBase {
+    cached: Option<(usize, Option<String>, Arc<MarkupPage>)>,
+}
+
+impl MarkupBase {
+    fn page(
+        &mut self,
+        document: &MarkupDocument,
+        page: usize,
+        search_term: Option<&str>,
+    ) -> Result<Arc<MarkupPage>, RenderError> {
+        if let Some((cached, term, rendered)) = &self.cached
+            && *cached == page
+            && term.as_deref() == search_term
+        {
+            return Ok(Arc::clone(rendered));
+        }
+        let rendered = Arc::new(render_markup_base(document, page, search_term)?);
+        self.cached = Some((page, search_term.map(str::to_owned), Arc::clone(&rendered)));
+        Ok(rendered)
+    }
+
+    fn clear(&mut self) {
+        self.cached = None;
     }
 }
 
@@ -985,7 +1034,9 @@ fn prerender_backend_neighbors(
             BackendDocument::MuPdf { document, .. } => {
                 render_loaded_page(document, neighbor, options)
             }
-            BackendDocument::Markup(document) => render_markup_page(document, neighbor, options),
+            BackendDocument::Markup(document) => {
+                render_markup_page(document, neighbor, options, None)
+            }
         };
         if let Ok(image) = rendered {
             cache.insert(key, image);
@@ -1084,7 +1135,7 @@ pub fn render_page(
     let options = RenderOptions::for_viewport(viewport, 1);
     let page = match &document {
         BackendDocument::MuPdf { document, .. } => render_loaded_page(document, page_num, &options),
-        BackendDocument::Markup(document) => render_markup_page(document, page_num, &options),
+        BackendDocument::Markup(document) => render_markup_page(document, page_num, &options, None),
     }?;
     Ok(RenderedDocument {
         page,
@@ -1093,16 +1144,23 @@ pub fn render_page(
     })
 }
 
+/// Render a markup page at the requested scale, reusing `base` when it holds this page already.
+///
+/// Only the scale changes while the reader zooms, so the laid-out raster is worth keeping: it
+/// turns every zoom step into a rescale of the page already on screen instead of a second pass
+/// over its text, images and diagrams.
 fn render_markup_page(
     document: &MarkupDocument,
     page_num: usize,
     options: &RenderOptions,
+    base: Option<&mut MarkupBase>,
 ) -> Result<PageImage, RenderError> {
-    let rendered = document
-        .render_page(page_num, options.search_term.as_deref())
-        .map_err(|error| RenderError::Markup(error.to_string()))?;
-    let mut image = rendered.image;
-    let mut highlights = rendered.highlights;
+    let search_term = options.search_term.as_deref();
+    let rendered = match base {
+        Some(base) => base.page(document, page_num, search_term)?,
+        None => Arc::new(render_markup_base(document, page_num, search_term)?),
+    };
+    let mut highlights = rendered.highlights.clone();
 
     let requested_zoom = if options.zoom_factor.is_finite() {
         options.zoom_factor.max(1.0)
@@ -1110,23 +1168,26 @@ fn render_markup_page(
         1.0
     };
     let pixel_scale = (MAX_MARKUP_PAGE_PIXELS as f64
-        / (u64::from(image.width()) * u64::from(image.height())) as f64)
+        / (u64::from(rendered.image.width()) * u64::from(rendered.image.height())) as f64)
         .sqrt() as f32;
-    let dimension_scale =
-        (MAX_RENDER_DIMENSION / image.width().max(image.height()) as f32).max(f32::EPSILON);
+    let dimension_scale = (MAX_RENDER_DIMENSION
+        / rendered.image.width().max(rendered.image.height()) as f32)
+        .max(f32::EPSILON);
     let scale = requested_zoom.min(pixel_scale).min(dimension_scale);
-    if scale > 1.0 + f32::EPSILON {
-        let width = (image.width() as f32 * scale).round().max(1.0) as u32;
-        let height = (image.height() as f32 * scale).round().max(1.0) as u32;
-        image =
-            image::imageops::resize(&image, width, height, image::imageops::FilterType::Lanczos3);
+    let mut image = if scale > 1.0 + f32::EPSILON {
+        let width = (rendered.image.width() as f32 * scale).round().max(1.0) as u32;
+        let height = (rendered.image.height() as f32 * scale).round().max(1.0) as u32;
         for rect in &mut highlights {
             rect.x0 = (rect.x0 as f32 * scale).round() as u32;
             rect.y0 = (rect.y0 as f32 * scale).round() as u32;
             rect.x1 = (rect.x1 as f32 * scale).round() as u32;
             rect.y1 = (rect.y1 as f32 * scale).round() as u32;
         }
-    }
+        image_renderer::magnify(&rendered.image, width, height)
+            .map_err(|error| RenderError::Markup(error.to_string()))?
+    } else {
+        rendered.image.clone()
+    };
 
     for _ in 0..((options.rotation % 360) / 90) {
         let old_height = image.height();
@@ -1589,6 +1650,105 @@ mod tests {
     }
 
     #[test]
+    fn a_reused_markup_raster_renders_the_same_zoomed_page_as_a_fresh_one() {
+        let document = MarkupDocument::parse(
+            "# Zoom\n\nthe quick brown fox",
+            Path::new("."),
+            "zoom",
+            MarkupKind::Markdown,
+            ThemeMode::Light,
+            false,
+        )
+        .unwrap();
+        let mut options = RenderOptions::for_viewport(WindowSize::from_cells(80, 24, 10, 20), 1);
+        options.zoom_factor = 1.44;
+        let mut base = MarkupBase::default();
+        let first = render_markup_page(&document, 0, &options, Some(&mut base)).unwrap();
+        let reused = render_markup_page(&document, 0, &options, Some(&mut base)).unwrap();
+        let fresh = render_markup_page(&document, 0, &options, None).unwrap();
+        assert!(first.width > 2_040 && first.height > 2_640);
+        assert!(reused.pixels == fresh.pixels, "reused raster diverged");
+        assert!(first.pixels == fresh.pixels, "first raster diverged");
+
+        // Highlights belong to the kept raster, so a new search term cannot be answered from the
+        // term it was rendered with: zooming a search hit must magnify its highlights too.
+        options.search_term = Some("quick".to_owned());
+        let searched = render_markup_page(&document, 0, &options, Some(&mut base)).unwrap();
+        assert!(fresh.highlights.is_empty());
+        assert!(!searched.highlights.is_empty());
+    }
+
+    #[test]
+    fn reload_replaces_the_magnified_markup_raster() {
+        let markdown = temp_file("md");
+        let directory = markdown.parent().unwrap();
+        let asset = directory.join(format!(
+            "vvrd-renderer-zoom-asset-{}-{}.png",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        image::RgbaImage::from_pixel(12, 12, image::Rgba([255, 0, 0, 255]))
+            .save(&asset)
+            .unwrap();
+        fs::write(
+            &markdown,
+            format!("![asset]({})", asset.file_name().unwrap().to_string_lossy()),
+        )
+        .unwrap();
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        let mut options = RenderOptions::for_viewport(viewport, 1);
+        options.zoom_factor = 1.44;
+        let renderer =
+            RenderThread::spawn(markdown.clone(), viewport, paper_style(ThemeMode::Light));
+        let _ = renderer
+            .events
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        renderer
+            .commands
+            .send(RenderCmd::Render {
+                page: 0,
+                options: options.clone(),
+            })
+            .unwrap();
+        let first = expect_page(&renderer);
+        assert!(first.pixels.as_chunks::<3>().0.contains(&[255, 0, 0]));
+
+        image::RgbaImage::from_pixel(12, 12, image::Rgba([0, 0, 255, 255]))
+            .save(&asset)
+            .unwrap();
+        renderer.commands.send(RenderCmd::Reload).unwrap();
+        let _ = renderer
+            .events
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        options.generation = 2;
+        renderer
+            .commands
+            .send(RenderCmd::Render { page: 0, options })
+            .unwrap();
+        let second = expect_page(&renderer);
+        assert!(second.pixels.as_chunks::<3>().0.contains(&[0, 0, 255]));
+        assert!(!second.pixels.as_chunks::<3>().0.contains(&[255, 0, 0]));
+        fs::remove_file(markdown).unwrap();
+        fs::remove_file(asset).unwrap();
+    }
+
+    fn expect_page(renderer: &RenderThread) -> Arc<PageImage> {
+        loop {
+            match renderer
+                .events
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap()
+            {
+                RenderEvent::Page { image, .. } => return image,
+                RenderEvent::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
     fn markup_transform_keeps_letter_dimensions_until_rotation() {
         let document = MarkupDocument::parse(
             "# Paper\n\ntext",
@@ -1601,11 +1761,11 @@ mod tests {
         .unwrap();
         let viewport = WindowSize::from_cells(80, 24, 10, 20);
         let mut options = RenderOptions::for_viewport(viewport, 1);
-        let page = render_markup_page(&document, 0, &options).unwrap();
+        let page = render_markup_page(&document, 0, &options, None).unwrap();
         assert_eq!((page.width, page.height), (2_040, 2_640));
 
         options.rotation = 90;
-        let page = render_markup_page(&document, 0, &options).unwrap();
+        let page = render_markup_page(&document, 0, &options, None).unwrap();
         assert_eq!((page.width, page.height), (2_640, 2_040));
     }
 
@@ -1622,11 +1782,11 @@ mod tests {
         .unwrap();
         let viewport = WindowSize::from_cells(80, 24, 10, 20);
         let mut options = RenderOptions::for_viewport(viewport, 1);
-        let page = render_markup_page(&document, 0, &options).unwrap();
+        let page = render_markup_page(&document, 0, &options, None).unwrap();
         assert_eq!((page.width, page.height), (2_640, 2_040));
 
         options.rotation = 90;
-        let page = render_markup_page(&document, 0, &options).unwrap();
+        let page = render_markup_page(&document, 0, &options, None).unwrap();
         assert_eq!((page.width, page.height), (2_040, 2_640));
     }
 
