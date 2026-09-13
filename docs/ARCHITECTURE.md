@@ -17,22 +17,17 @@ This document describes the overall architecture. The step-by-step build order l
 
 ## 1. Context: where vvrd sits
 
-```
-        ┌──────────── Vivido terminal (presenter) ─────────────┐
-        │  GPU compositor · scene graph · media decode         │
-        │                                                      │
-  PTY   │   text + zero-width anchor marker (allowed on PTY)    │
-  ◀─────┼──────────────────────────────────────────────────────┤
-        │                                                      │
-  Vivid │   control connection  (VIVID_ENDPOINT_CONTROL)        │
-  side  │   track channels      (VIVID_ENDPOINT_BULK)           │  ◀── page images ride here,
-  chan. │   proof-authenticated from VIVID_ROOT_SECRET          │      NEVER on the PTY
-        └──────────────────────────────────────────────────────┘
-                         ▲
-                         │  vvrd is a Vivid *producer*
-                 ┌───────┴────────┐
-                 │      vvrd       │   document render · TUI · vivid_sdk
-                 └────────────────┘
+```mermaid
+flowchart LR
+    vvrd["vvrd — Vivid producer<br/>document render · TUI · vivid_sdk"]
+
+    subgraph vivido["Vivido terminal (presenter)"]
+        comp["GPU compositor · scene graph<br/>media decode"]
+    end
+
+    vvrd <-- "PTY<br/>terminal text · keys/mouse<br/>bounded anchor marker only" --> comp
+    vvrd -- "control connection · VIVID_ENDPOINT_CONTROL<br/>proof-authenticated from VIVID_ROOT_SECRET" --> comp
+    vvrd -- "track channels · VIVID_ENDPOINT_BULK<br/>page images ride here, NEVER on the PTY" --> comp
 ```
 
 Vivido launches its child shell with the `VIVID_ENDPOINT_*` lane endpoints and `VIVID_ROOT_SECRET`
@@ -300,14 +295,24 @@ climbing; only a replacement track restarts it.
 
 The UI, render supervisor, and Vivid worker communicate through bounded mailboxes:
 
-```text
-UI ── RenderCmd ── supervisor ── private pipes ── document worker
- ▲                     │                              │
- └── RenderEvent ───────┘                              └── EPUB paginator process
- │
- └── PresentCmd ── Vivid worker / Composer ── SDK control and media channels
-        ▲                │
-        └─ PresentEvent ─┘
+```mermaid
+flowchart LR
+    ui["UI thread<br/>input · timers · status and overlay text"]
+    sup["render supervisor<br/>deadlines · cancellation"]
+    doc["document worker<br/>(subprocess)"]
+    epub["EPUB paginator<br/>(subprocess)"]
+    vivid["Vivid worker / Composer<br/>presenter state · composition"]
+    sdk["vivid_sdk<br/>control and media channels"]
+
+    ui -- RenderCmd --> sup
+    sup -- RenderEvent --> ui
+    sup -- "requests (private pipes)" --> doc
+    doc -- "validated results · raw RGB" --> sup
+    doc -- "spawns · supersedes" --> epub
+    ui -- PresentCmd --> vivid
+    vivid -- PresentEvent --> ui
+    vivid -- "frames · scene updates" --> sdk
+    sdk -- "flow control · events" --> vivid
 ```
 
 Mailboxes contain at most 32 entries and one replaceable request/result of each coalescible kind.

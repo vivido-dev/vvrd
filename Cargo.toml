@@ -37,7 +37,7 @@ image = { version = "0.25", features = [
 ], default-features = false }
 rayon = { version = "1", default-features = false }
 base64 = "0.23"
-comrak = "0.54"
+comrak = "0.55"
 cosmic-text = "0.19"
 dagre = "0.1.1"
 fontdb = "0.24"

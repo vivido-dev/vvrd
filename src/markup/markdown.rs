@@ -578,7 +578,6 @@ fn comrak_options() -> Options<'static> {
     options.extension.strikethrough = true;
     options.extension.tasklist = true;
     options.extension.autolink = true;
-    options.extension.tagfilter = true;
     options
 }
 
