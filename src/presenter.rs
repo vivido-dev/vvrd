@@ -614,6 +614,8 @@ fn record_signal(
         SessionEvent::ConnectionClosed { diagnostic } => {
             signals.push_back(PresenterSignal::ConnectionClosed(diagnostic));
         }
+        // Document raster tracks have no timed playback to hold or resume.
+        SessionEvent::PlaybackHold(_) => {}
         SessionEvent::AnchorReady { .. }
         | SessionEvent::AnchorGone { .. }
         | SessionEvent::ContextChanged { .. }
