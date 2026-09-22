@@ -10,14 +10,14 @@ shell reached with `vvssh`.
 (Nested operation in vvmux panes returns once vvmux migrates to Vivid 1.5.)
 
 ```sh
-cargo build --release
-target/release/vvrd book.epub
-target/release/vvrd --page 12 paper.pdf
-target/release/vvrd --theme dark guide.md
-target/release/vvrd --landscape guide.md
-target/release/vvrd diagram.mmd
-target/release/vvrd deck.pptx
-target/release/vvrd --export paper.pdf
+cargo install vvrd
+vvrd book.epub
+vvrd --page 12 paper.pdf
+vvrd --theme dark guide.md
+vvrd --landscape guide.md
+vvrd diagram.mmd
+vvrd deck.pptx
+vvrd --export paper.pdf
 ```
 
 Vivido and vvssh provide `VIVID_ENDPOINT_CONTROL`, optional `VIVID_ENDPOINT_BULK`, and
