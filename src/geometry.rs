@@ -10,7 +10,7 @@ const DEFAULT_CELL_HEIGHT_PX: u32 = 20;
 ///
 /// Vivid 1.5 core has no grid: cell geometry is a property of the selected presentation target
 /// profile, and arrives in `WELCOME`/`TARGET_CHANGED` rather than on any source or surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowSize {
     pub cols: u16,
     pub rows: u16,

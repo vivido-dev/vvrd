@@ -5797,17 +5797,18 @@ pub fn write_output_png(
     render_cfg: &RenderConfig,
     theme: &Theme,
 ) -> Result<()> {
-    let mut opt = usvg::Options {
+    let mut opt = resvg::usvg::Options {
         font_family: primary_font(&theme.font_family),
-        default_size: usvg::Size::from_wh(render_cfg.width, render_cfg.height)
-            .unwrap_or(usvg::Size::from_wh(800.0, 600.0).unwrap()),
+        default_size: resvg::usvg::Size::from_wh(render_cfg.width, render_cfg.height)
+            .unwrap_or(resvg::usvg::Size::from_wh(800.0, 600.0).unwrap()),
         ..Default::default()
     };
 
     opt.fontdb_mut().load_system_fonts();
 
-    let tree = usvg::Tree::from_str(svg, &opt)?;
+    let tree = resvg::usvg::Tree::from_str(svg, &opt)?;
     let size = tree.size().to_int_size();
+    crate::markup::mermaid::validate_raster_size(size.width(), size.height())?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())
         .ok_or_else(|| anyhow::anyhow!("Failed to allocate pixmap"))?;
     if let Some(color) = parse_hex_color(&theme.background) {

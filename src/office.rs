@@ -3,6 +3,7 @@
 
 use std::{
     fmt::Write as _,
+    io::Read as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -188,7 +189,8 @@ fn run_soffice(
     let stderr = std::fs::File::create(&stderr_log).map_err(|error| {
         RenderError::Converting(format!("cannot create {}: {error}", stderr_log.display()))
     })?;
-    let mut child = Command::new(soffice)
+    let mut command = Command::new(soffice);
+    let mut child = crate::child_process::scrub(&mut command)
         .arg("--headless")
         .arg("--norestore")
         .arg("--nolockcheck")
@@ -245,11 +247,22 @@ fn run_soffice(
 }
 
 fn source_digest(source: &Path) -> Result<String, RenderError> {
-    let bytes = std::fs::read(source).map_err(|error| {
+    let mut file = std::fs::File::open(source).map_err(|error| {
         RenderError::Converting(format!("cannot read {}: {error}", source.display()))
     })?;
+    let mut hash = Md5::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| RenderError::Converting(error.to_string()))?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
     let mut digest = String::with_capacity(32);
-    for byte in Md5::digest(&bytes) {
+    for byte in hash.finalize() {
         write!(&mut digest, "{byte:02x}").expect("writing to String cannot fail");
     }
     Ok(digest)
@@ -274,10 +287,17 @@ fn file_url(path: &Path) -> String {
     if !text.starts_with('/') {
         url.push('/');
     }
-    for byte in text.as_bytes() {
+    let bytes = text.as_bytes();
+    for (index, byte) in bytes.iter().copied().enumerate() {
         match byte {
+            b':' if cfg!(windows)
+                && index == 1
+                && bytes.first().is_some_and(|byte| byte.is_ascii_alphabetic()) =>
+            {
+                url.push(':');
+            }
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
-                url.push(*byte as char);
+                url.push(byte as char);
             }
             _ => write!(&mut url, "%{byte:02X}").expect("writing to String cannot fail"),
         }
@@ -312,6 +332,15 @@ mod tests {
         assert_eq!(
             file_url(Path::new("/tmp/a b/c-d_office")),
             "file:///tmp/a%20b/c-d_office"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_url_preserves_windows_drive_colon() {
+        assert_eq!(
+            file_url(Path::new(r"C:\Users\Example User\office")),
+            "file:///C:/Users/Example%20User/office"
         );
     }
 

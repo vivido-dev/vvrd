@@ -1,6 +1,6 @@
 [package]
 name = "vvrd"
-version = "0.3.2"
+version = "0.3.3"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.89"
@@ -37,7 +37,7 @@ image = { version = "0.25", features = [
 ], default-features = false }
 rayon = { version = "1", default-features = false }
 base64 = "0.23"
-comrak = "0.54"
+comrak = "0.55"
 cosmic-text = "0.19"
 dagre = "0.1.1"
 fontdb = "0.24"
@@ -50,7 +50,9 @@ ttf-parser = "0.25"
 
 clap = { version = "4", features = ["derive", "env"] }
 csscolorparser = { version = "0.8", default-features = false }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
+unicode-width = "0.2"
+unicode-segmentation = "1"
 serde_json = "1"
 directories = "6"
 md-5 = "0.11"

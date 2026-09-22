@@ -1,13 +1,18 @@
 mod app;
+#[cfg(test)]
+mod audit_bench;
+mod child_process;
 mod compositor;
 mod error;
 mod export;
 mod geometry;
+mod mailbox;
 mod markup;
 mod mermaid_engine;
 mod mupdf_fonts;
 mod office;
 mod presenter;
+mod render_process;
 mod renderer;
 mod semantic;
 mod source_watch;
@@ -140,6 +145,7 @@ struct Runtime {
     loading_deadline: Option<Instant>,
     semantic: Arc<semantic::SemanticControl>,
     document_revision: u64,
+    render_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,21 +156,18 @@ enum LoadingPolicy {
 }
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--render-worker")) {
+        return render_process::worker_main().map_err(Into::into);
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--paginate-worker")) {
+        return render_process::pagination_main().map_err(Into::into);
+    }
     let cli = Cli::parse();
     validate_cli(&cli)?;
+    validate_document_capabilities(&cli.document, office::find_soffice().is_some())?;
     // Before any document is opened: MuPDF caches resolved fonts per context, so a loader
     // installed later would not be consulted for faces already looked up.
     mupdf_fonts::install();
-    if matches!(
-        renderer::detect_backend(&cli.document),
-        renderer::RenderBackend::Office
-    ) && office::find_soffice().is_none()
-    {
-        eprintln!(
-            "warning: LibreOffice (soffice) not found; PPTX/DOCX/ODP/ODT viewing requires LibreOffice"
-        );
-        std::process::exit(1);
-    }
     if cli.probe_document {
         if renderer::is_epub(&cli.document) {
             renderer::probe_epub(&cli.document)?;
@@ -195,20 +198,11 @@ fn main() -> anyhow::Result<()> {
         options.black = black;
         options.white = white;
         options.epub_font_size = saved.epub_font_size.unwrap_or(11.0);
-        let n_pages = renderer::document_page_count(
+        let output = render_process::export_page(
             &cli.document,
+            initial_page,
             viewport,
-            options.epub_font_size,
-            paper_style(&cli),
-        )?;
-        let page = initial_page.min(n_pages.saturating_sub(1));
-        let output = export::next_export_path(&cli.document, page, n_pages)?;
-        renderer::export_document_page(
-            &cli.document,
-            page,
-            viewport,
-            &options,
-            &output,
+            options,
             saved.auto_crop,
             paper_style(&cli),
         )?;
@@ -266,6 +260,7 @@ fn main() -> anyhow::Result<()> {
         loading_deadline: None,
         semantic: semantic.clone(),
         document_revision: 1,
+        render_pending: false,
     };
 
     let old_hook = std::panic::take_hook();
@@ -364,6 +359,20 @@ fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_document_capabilities(path: &Path, office_available: bool) -> anyhow::Result<()> {
+    if matches!(
+        renderer::detect_backend(path),
+        renderer::RenderBackend::Office
+    ) && !office_available
+    {
+        bail!(
+            "Office document support is disabled because LibreOffice (soffice) is not installed; \
+             PPTX, DOCX, ODP, and ODT files require LibreOffice"
+        );
+    }
+    Ok(())
+}
+
 fn paper_style(cli: &Cli) -> renderer::PaperStyle {
     renderer::PaperStyle {
         theme: cli.theme.into(),
@@ -375,6 +384,7 @@ fn probe_document(path: &Path, theme: ThemeArg, landscape: bool) -> anyhow::Resu
     // The preflight child never talks Vivid, so it inherits no session material or endpoints.
     // VIVID_TOKEN is the retired 1.1 name and is scrubbed too, so a stale variable cannot leak.
     let mut command = Command::new(std::env::current_exe()?);
+    child_process::isolate(&mut command);
     command
         .arg("--probe-document")
         .arg("--theme")
@@ -385,7 +395,7 @@ fn probe_document(path: &Path, theme: ThemeArg, landscape: bool) -> anyhow::Resu
     if landscape {
         command.arg("--landscape");
     }
-    let status = command
+    let mut child = command
         .arg(path)
         .env_remove("VIVID_ROOT_SECRET")
         .env_remove("VIVID_TOKEN")
@@ -396,8 +406,24 @@ fn probe_document(path: &Path, theme: ThemeArg, landscape: bool) -> anyhow::Resu
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .context("cannot start document preflight")?;
+    let timeout = if renderer::detect_backend(path) == renderer::RenderBackend::Office {
+        120
+    } else {
+        30
+    };
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child_process::kill_tree(&mut child);
+            bail!("document preflight timed out");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     if !status.success() {
         bail!("document preflight failed for {}", path.display());
     }
@@ -501,6 +527,7 @@ fn request_render(
         draw_loading,
         runtime.current_image.is_some(),
         current_image_is_ready(runtime),
+        current_image_shows_another_page(runtime),
     ) {
         LoadingPolicy::None => runtime.loading_deadline = None,
         LoadingPolicy::Immediate => {
@@ -516,10 +543,17 @@ fn request_render(
             runtime.loading_deadline = Some(Instant::now() + LOADING_DELAY);
         }
     }
-    render.commands.send(RenderCmd::Render {
+    match render.commands.send(RenderCmd::Render {
         page: runtime.app.page,
         options: render_options(&runtime.app, runtime.viewport, black, white),
-    })?;
+    }) {
+        Ok(()) => runtime.render_pending = false,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            runtime.render_pending = true;
+            runtime.app.show_info("renderer busy; latest view pending");
+        }
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
@@ -556,14 +590,28 @@ fn loading_policy(
     draw_loading: bool,
     has_displayed_page: bool,
     page_is_ready: bool,
+    shows_another_page: bool,
 ) -> LoadingPolicy {
     if !draw_loading || page_is_ready {
         LoadingPolicy::None
-    } else if has_displayed_page {
+    } else if !has_displayed_page {
+        LoadingPolicy::Immediate
+    } else if shows_another_page {
         LoadingPolicy::Delayed
     } else {
-        LoadingPolicy::Immediate
+        // Zoom, rotation and colour changes re-render the page already on screen. Those pixels
+        // stay a truthful view of the requested page, so blanking them would replace a readable
+        // page with a placeholder that says less than the page it covered.
+        LoadingPolicy::None
     }
+}
+
+/// Is the committed frame a different page from the one about to be rendered?
+fn current_image_shows_another_page(runtime: &Runtime) -> bool {
+    runtime
+        .current_image
+        .as_ref()
+        .is_some_and(|(page, _, _)| *page != runtime.app.page)
 }
 
 fn current_image_is_ready(runtime: &Runtime) -> bool {
@@ -592,7 +640,7 @@ fn wait_for_presenter(vivid: &VividThread) -> anyhow::Result<()> {
 }
 
 fn wait_for_document(render: &RenderThread, runtime: &mut Runtime) -> anyhow::Result<()> {
-    match render.events.recv_timeout(Duration::from_secs(30))? {
+    match render.events.recv_timeout(Duration::from_secs(120))? {
         RenderEvent::Opened {
             kind,
             n_pages,
@@ -661,79 +709,99 @@ fn run_event_loop(
 ) -> anyhow::Result<()> {
     let mut reload_debouncer = ReloadDebouncer::default();
     loop {
-        if let Some(watcher) = source_watcher {
-            while let Ok(event) = watcher.events.try_recv() {
-                match event {
-                    SourceWatchEvent::Changed => reload_debouncer.note_change(Instant::now()),
-                    SourceWatchEvent::Error(error) => {
-                        runtime
-                            .app
-                            .show_info(format!("hot reload watcher error: {error}"));
-                        draw_status(runtime)?;
+        let tick = (|| -> anyhow::Result<bool> {
+            if let Some(watcher) = source_watcher {
+                while let Ok(event) = watcher.events.try_recv() {
+                    match event {
+                        SourceWatchEvent::Changed => reload_debouncer.note_change(Instant::now()),
+                        SourceWatchEvent::Error(error) => {
+                            runtime
+                                .app
+                                .show_info(format!("hot reload watcher error: {error}"));
+                            draw_status(runtime)?;
+                        }
                     }
                 }
+                if reload_debouncer.take_due(Instant::now(), document.is_file()) {
+                    render.commands.send(RenderCmd::Reload)?;
+                    runtime.app.show_info("reloading changed source...");
+                    draw_status(runtime)?;
+                }
             }
-            if reload_debouncer.take_due(Instant::now(), document.is_file()) {
-                render.commands.send(RenderCmd::Reload)?;
-                runtime.app.show_info("reloading changed source...");
-                draw_status(runtime)?;
+            while let Ok(render_event) = render.events.try_recv() {
+                handle_render_event(document, render, vivid, runtime, render_event, black, white)?;
             }
-        }
-        while let Ok(render_event) = render.events.try_recv() {
-            handle_render_event(document, render, vivid, runtime, render_event, black, white)?;
-        }
-        while let Ok(present_event) = vivid.events.try_recv() {
-            handle_present_event(render, vivid, runtime, present_event, black, white)?;
-        }
-        if let Some((cols, rows, deadline)) = runtime.pending_resize
-            && Instant::now() >= deadline
-        {
-            runtime.pending_resize = None;
-            runtime.viewport = WindowSize::from_cells(
-                cols,
-                rows,
-                runtime.viewport.cell_width_px,
-                runtime.viewport.cell_height_px,
-            );
-            runtime.app.invalidate();
-            vivid.commands.send(PresentCmd::Resize {
-                viewport: runtime.viewport,
-                settled: true,
-                observed_target_generation: runtime.target_generation,
-            })?;
-            show_current(vivid, runtime)?;
-            request_render(render, vivid, runtime, black, white, true)?;
-        }
-        if let Some(deadline) = runtime.loading_deadline
-            && Instant::now() >= deadline
-        {
-            runtime.loading_deadline = None;
-            if !current_image_is_ready(runtime)
-                && matches!(runtime.app.input_mode, InputMode::Normal)
-                && runtime.target_presentable
+            while let Ok(present_event) = vivid.events.try_recv() {
+                handle_present_event(render, vivid, runtime, present_event, black, white)?;
+            }
+            if runtime.render_pending {
+                request_render(render, vivid, runtime, black, white, false)?;
+            }
+            if let Some((cols, rows, deadline)) = runtime.pending_resize
+                && Instant::now() >= deadline
             {
-                hide_node(vivid, runtime)?;
-                terminal::draw_loading(runtime.viewport)?;
+                runtime.pending_resize = None;
+                runtime.viewport = WindowSize::from_cells(
+                    cols,
+                    rows,
+                    runtime.viewport.cell_width_px,
+                    runtime.viewport.cell_height_px,
+                );
+                runtime.app.invalidate();
+                vivid.commands.send(PresentCmd::Resize {
+                    viewport: runtime.viewport,
+                    settled: true,
+                    observed_target_generation: runtime.target_generation,
+                })?;
+                show_current(vivid, runtime)?;
+                request_render(render, vivid, runtime, black, white, true)?;
+            }
+            if let Some(deadline) = runtime.loading_deadline
+                && Instant::now() >= deadline
+            {
+                runtime.loading_deadline = None;
+                if !current_image_is_ready(runtime)
+                    && matches!(runtime.app.input_mode, InputMode::Normal)
+                    && runtime.target_presentable
+                {
+                    hide_node(vivid, runtime)?;
+                    terminal::draw_loading(runtime.viewport)?;
+                    draw_status(runtime)?;
+                }
+            }
+            if event::poll(Duration::from_millis(20))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Release => {}
+                    Event::Key(key)
+                        if handle_key(document, render, vivid, runtime, key, black, white)? =>
+                    {
+                        return Ok(true);
+                    }
+                    Event::Key(_) => {}
+                    Event::Resize(cols, rows) if cols > 0 && rows > 1 => {
+                        runtime.pending_resize =
+                            Some((cols, rows, Instant::now() + RESIZE_DEBOUNCE));
+                    }
+                    Event::Mouse(mouse) => {
+                        handle_mouse(render, vivid, runtime, mouse, black, white)?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(false)
+        })();
+        match tick {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
+            {
+                runtime.app.show_info("worker busy; retry the command");
                 draw_status(runtime)?;
             }
-        }
-        if event::poll(Duration::from_millis(20))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Release => {}
-                Event::Key(key)
-                    if handle_key(document, render, vivid, runtime, key, black, white)? =>
-                {
-                    return Ok(());
-                }
-                Event::Key(_) => {}
-                Event::Resize(cols, rows) if cols > 0 && rows > 1 => {
-                    runtime.pending_resize = Some((cols, rows, Instant::now() + RESIZE_DEBOUNCE));
-                }
-                Event::Mouse(mouse) => {
-                    handle_mouse(render, vivid, runtime, mouse, black, white)?;
-                }
-                _ => {}
-            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -829,7 +897,11 @@ fn handle_render_event(
             image,
             text,
             links,
-        } if page == runtime.app.page && generation == runtime.app.generation => {
+            document_revision,
+        } if document_revision == runtime.document_revision
+            && page == runtime.app.page
+            && generation == runtime.app.generation =>
+        {
             // Publish semantic identity only for a page that survived render coalescing. Rapid
             // navigation can skip many requested pages, and serializing their descriptor updates
             // ahead of the one visible frame needlessly stalls the Vivid control lane.
@@ -838,7 +910,7 @@ fn handle_render_event(
                 state.text = text;
                 state.links = links;
             });
-            runtime.current_image = Some((page, generation, Arc::new(image)));
+            runtime.current_image = Some((page, generation, image));
             show_current(vivid, runtime)?;
         }
         RenderEvent::Page { .. } => {}
@@ -879,6 +951,7 @@ fn handle_render_event(
             runtime.app.show_info(error);
             draw_status(runtime)?;
         }
+        RenderEvent::Idle(_) => {}
         RenderEvent::Stopped => bail!("document renderer stopped"),
     }
     let _ = document;
@@ -1344,7 +1417,7 @@ fn open_url(url: &str) {
     let command = "open";
     #[cfg(not(target_os = "macos"))]
     let command = "xdg-open";
-    let _ = Command::new(command)
+    let _ = child_process::scrub(&mut Command::new(command))
         .arg(url)
         .env_remove("VIVID_ROOT_SECRET")
         .env_remove("VIVID_TOKEN")
@@ -1368,6 +1441,20 @@ mod tests {
             parse_color("#123456").unwrap(),
             i32::from_be_bytes([0, 0x12, 0x34, 0x56])
         );
+    }
+
+    #[test]
+    fn office_formats_are_disabled_without_libreoffice() {
+        for path in ["deck.pptx", "report.docx", "slides.odp", "document.odt"] {
+            let error = validate_document_capabilities(Path::new(path), false).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Office document support is disabled")
+            );
+        }
+        assert!(validate_document_capabilities(Path::new("document.pdf"), false).is_ok());
+        assert!(validate_document_capabilities(Path::new("deck.pptx"), true).is_ok());
     }
 
     #[test]
@@ -1420,9 +1507,28 @@ mod tests {
 
     #[test]
     fn page_turn_retains_the_previous_frame_during_loading_grace() {
-        assert_eq!(loading_policy(true, true, false), LoadingPolicy::Delayed);
-        assert_eq!(loading_policy(true, false, false), LoadingPolicy::Immediate);
-        assert_eq!(loading_policy(true, true, true), LoadingPolicy::None);
-        assert_eq!(loading_policy(false, true, false), LoadingPolicy::None);
+        assert_eq!(
+            loading_policy(true, true, false, true),
+            LoadingPolicy::Delayed
+        );
+        assert_eq!(
+            loading_policy(true, false, false, false),
+            LoadingPolicy::Immediate
+        );
+        assert_eq!(loading_policy(true, true, true, true), LoadingPolicy::None);
+        assert_eq!(
+            loading_policy(false, true, false, true),
+            LoadingPolicy::None
+        );
+    }
+
+    #[test]
+    fn rescaling_the_displayed_page_never_blanks_it() {
+        // Zoom steps re-render the page that is already on screen. Holding it is what keeps a
+        // slow rescale from flashing the loading placeholder between two zoom levels.
+        assert_eq!(
+            loading_policy(true, true, false, false),
+            LoadingPolicy::None
+        );
     }
 }
