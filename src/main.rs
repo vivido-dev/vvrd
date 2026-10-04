@@ -814,6 +814,17 @@ fn handle_mouse(
     black: i32,
     white: i32,
 ) -> anyhow::Result<()> {
+    if matches!(runtime.app.input_mode, InputMode::Normal) {
+        let rerender = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => runtime.app.next_page(),
+            MouseEventKind::Down(MouseButton::Right) => runtime.app.prev_page(),
+            _ => false,
+        };
+        if rerender {
+            request_render(render, vivid, runtime, black, white, true)?;
+        }
+        return Ok(());
+    }
     let InputMode::Toc { selected } = runtime.app.input_mode else {
         return Ok(());
     };

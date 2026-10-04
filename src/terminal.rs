@@ -169,6 +169,7 @@ pub fn draw_help(size: WindowSize) -> anyhow::Result<()> {
         "←/→, h/l   previous/next page (pan with h/l in zoom)",
         "↑/↓        scroll; j/k always turn pages",
         "PgUp/PgDn viewport/page; Space next page; g go to page",
+        "Left/right mouse click: next/previous page",
         "z zoom mode; o/O zoom in/out; r rotate; i invert",
         "c auto-crop; d warm tint; </> EPUB font size",
         "/ search; n/N next/previous result; t table of contents",

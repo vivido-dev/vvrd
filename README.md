@@ -26,10 +26,10 @@ without a live presenter. `--trace DIR` writes Vivid control and raster streams 
 
 ## Controls
 
-| Key | Action |
+| Input | Action |
 |---|---|
-| Left | Previous page |
-| Right, Space | next page |
+| Left, right mouse click | Previous page |
+| Right, Space, left mouse click | Next page |
 | Up/Down | Scroll; turn at the page boundary |
 | `j`/`k` | Next/previous page without scrolling |
 | `h`/`l` | Page turn, or horizontal pan in zoom mode |
