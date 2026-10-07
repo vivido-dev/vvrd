@@ -36,7 +36,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         if ENABLED.load(Ordering::Relaxed) {
-            let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+            let _ = LIVE.try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
                 Some(live.saturating_sub(layout.size()))
             });
         }
