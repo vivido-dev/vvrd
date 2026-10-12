@@ -613,6 +613,7 @@ mod tests {
             width: 1,
             height: 1,
             row_stride: 3,
+            background: [112, 66, 20],
             highlights: Vec::new(),
         };
         let mut event = RenderEvent::Page {
@@ -626,7 +627,8 @@ mod tests {
         let mut bytes = Vec::new();
         write_record(&mut bytes, &event, &[1, 2, 3]).unwrap();
         assert!(
-            matches!(read_event(&mut bytes.as_slice()).unwrap(), RenderEvent::Page { image, .. } if image.pixels == [1, 2, 3])
+            matches!(read_event(&mut bytes.as_slice()).unwrap(), RenderEvent::Page { image, .. }
+                if image.pixels == [1, 2, 3] && image.background == [112, 66, 20])
         );
         if let RenderEvent::Page { image, .. } = &mut event {
             Arc::get_mut(image).unwrap().width = 2;

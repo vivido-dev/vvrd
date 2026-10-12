@@ -1205,6 +1205,7 @@ mod tests {
         assert!(!presenter.visible);
         let image = Arc::new(PageImage {
             pixels: vec![80; 48],
+            background: [255; 3],
             width: 4,
             height: 4,
             row_stride: 12,

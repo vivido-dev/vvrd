@@ -124,6 +124,19 @@ pub struct RenderOptions {
 }
 
 impl RenderOptions {
+    fn colors(&self) -> (i32, i32) {
+        let (black, white) = if self.tinted {
+            (TINT_BLACK, TINT_WHITE)
+        } else {
+            (self.black, self.white)
+        };
+        if self.inverted {
+            (white, black)
+        } else {
+            (black, white)
+        }
+    }
+
     pub fn for_viewport(viewport: WindowSize, generation: u64) -> Self {
         Self {
             width_px: viewport.page_area_width_px() as f32,
@@ -388,14 +401,16 @@ impl BackendDocument {
         output: &Path,
         auto_crop: bool,
     ) -> Result<(), RenderError> {
-        let image = match self {
+        let page = match self {
             Self::MuPdf { document, .. } => render_loaded_page(document, page, options)?,
             Self::Markup(document) => render_markup_page(document, page, options, None)?,
-        }
-        .into_rgb()
-        .map_err(|error| RenderError::Converting(error.to_string()))?;
+        };
+        let background = page.background;
+        let image = page
+            .into_rgb()
+            .map_err(|error| RenderError::Converting(error.to_string()))?;
         let image = if auto_crop {
-            crop_whitespace_image(image)
+            crop_whitespace_image(image, background)
         } else {
             image
         };
@@ -1202,6 +1217,9 @@ fn render_markup_page(
     }
     apply_markup_colors(&mut image, options);
 
+    // Fixed markup paper margins keep the origin at the transformed paper color.
+    let paper = image.get_pixel(0, 0);
+    let background = [paper[0], paper[1], paper[2]];
     let width = image.width();
     let height = image.height();
     let mut pixels = Vec::with_capacity(width as usize * height as usize * 3);
@@ -1213,19 +1231,13 @@ fn render_markup_page(
         width,
         height,
         row_stride: width as usize * 3,
+        background,
         highlights,
     })
 }
 
 fn apply_markup_colors(image: &mut image::RgbaImage, options: &RenderOptions) {
-    let (mut black, mut white) = if options.tinted {
-        (TINT_BLACK, TINT_WHITE)
-    } else {
-        (options.black, options.white)
-    };
-    if options.inverted {
-        std::mem::swap(&mut black, &mut white);
-    }
+    let (black, white) = options.colors();
     if black == MUPDF_BLACK && white == MUPDF_WHITE {
         return;
     }
@@ -1314,14 +1326,8 @@ fn render_loaded_page(
     crate::markup::mermaid::validate_raster_size(w as u32, h as u32)
         .map_err(|e| RenderError::Converting(e.to_string()))?;
     let mut pixmap = page.to_pixmap(&matrix, &Colorspace::device_rgb(), false, false)?;
-    let (black, white) = if options.tinted {
-        (TINT_BLACK, TINT_WHITE)
-    } else {
-        (options.black, options.white)
-    };
-    if options.inverted {
-        pixmap.tint(white, black)?;
-    } else if black != MUPDF_BLACK || white != MUPDF_WHITE {
+    let (black, white) = options.colors();
+    if black != MUPDF_BLACK || white != MUPDF_WHITE {
         pixmap.tint(black, white)?;
     }
     let highlights = search_page(&page, options.search_term.as_deref())?
@@ -1335,12 +1341,14 @@ fn render_loaded_page(
             )
         })
         .collect();
-    copy_pixmap_rgb(&pixmap, highlights)
+    let [_, red, green, blue] = white.to_be_bytes();
+    copy_pixmap_rgb(&pixmap, highlights, [red, green, blue])
 }
 
 fn copy_pixmap_rgb(
     pixmap: &mupdf::Pixmap,
     highlights: Vec<HighlightRect>,
+    background: [u8; 3],
 ) -> Result<PageImage, RenderError> {
     let width = pixmap.width();
     let height = pixmap.height();
@@ -1366,6 +1374,7 @@ fn copy_pixmap_rgb(
         width,
         height,
         row_stride,
+        background,
         highlights,
     })
 }
@@ -1545,6 +1554,7 @@ mod tests {
                 height: 2640,
                 row_stride: 2040 * 3,
                 pixels: vec![1; 2040 * 2640 * 3],
+                background: [255; 3],
                 highlights: Vec::new(),
             },
         );
@@ -1599,6 +1609,7 @@ mod tests {
             height: 1,
             row_stride: 3,
             pixels: vec![0; 3],
+            background: [255; 3],
             highlights: Vec::new(),
         });
         cache.insert(key.clone(), page.clone());
@@ -1767,6 +1778,72 @@ mod tests {
         options.rotation = 90;
         let page = render_markup_page(&document, 0, &options, None).unwrap();
         assert_eq!((page.width, page.height), (2_640, 2_040));
+    }
+
+    #[test]
+    fn auto_crop_mupdf_pages_follows_rendered_colors_and_rotation() {
+        let document = Document::from_bytes(
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="64">
+                <rect x="28" y="24" width="24" height="16" fill="#000"/>
+            </svg>"##,
+            "image/svg+xml",
+        )
+        .unwrap();
+        let viewport = WindowSize::from_cells(1, 2, 80, 80);
+        for (black, white) in [(MUPDF_BLACK, MUPDF_WHITE), (0x283c50, 0xd2beaa)] {
+            for (inverted, tinted) in [(false, false), (true, false), (false, true), (true, true)] {
+                for rotation in [0, 90] {
+                    let mut options = RenderOptions::for_viewport(viewport, 1);
+                    options.black = black;
+                    options.white = white;
+                    options.inverted = inverted;
+                    options.tinted = tinted;
+                    options.rotation = rotation;
+                    let page = render_loaded_page(&document, 0, &options).unwrap();
+                    let background = page.background;
+                    assert_eq!(&page.pixels[..3], &background);
+                    let image = crop_whitespace_image(page.into_rgb().unwrap(), background);
+                    let expected = if rotation == 0 { (40, 32) } else { (32, 40) };
+                    assert_eq!(image.dimensions(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auto_crop_markup_and_exports_follow_inversion_tint_and_paper_theme() {
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        for theme in [ThemeMode::Light, ThemeMode::Dark] {
+            let document = MarkupDocument::parse(
+                "# Crop\n\npage margins",
+                Path::new("."),
+                "crop",
+                MarkupKind::Markdown,
+                theme,
+                false,
+            )
+            .unwrap();
+            let backend = BackendDocument::Markup(document.clone());
+            let mut base = MarkupBase::default();
+            for (inverted, tinted) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut options = RenderOptions::for_viewport(viewport, 1);
+                options.inverted = inverted;
+                options.tinted = tinted;
+                let page = render_markup_page(&document, 0, &options, Some(&mut base)).unwrap();
+                let background = page.background;
+                assert_eq!(&page.pixels[..3], &background);
+                let image = crop_whitespace_image(page.into_rgb().unwrap(), background);
+                assert!(image.width() < 2_040 && image.height() < 2_640);
+
+                let output = temp_file("png");
+                backend.export_page(0, &options, &output, true).unwrap();
+                assert_eq!(
+                    image::image_dimensions(&output).unwrap(),
+                    image.dimensions()
+                );
+                fs::remove_file(output).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -2111,6 +2188,7 @@ mod tests {
                     width: 1,
                     height: 1,
                     row_stride: 3,
+                    background: [255; 3],
                     highlights: Vec::new(),
                 },
             );

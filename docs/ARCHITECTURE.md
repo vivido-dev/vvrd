@@ -191,6 +191,10 @@ crop/highlight/scale result, reuses viewport and delta buffers, and compares tra
 without allocating a reference framebuffer. Identical frames send no media except when a full
 recovery frame is required.
 
+Each page carries its rendered paper color through worker IPC. Margin cropping compares pixels
+against that color with a small tolerance, so inversion, tinting, custom colors, and dark markup
+paper work in both the viewport and PNG exports.
+
 ### D5a — vvrd owns MuPDF's system-font lookups
 MuPDF asks for a substitute font whenever it meets a character no loaded face covers, and it only
 remembers the answer when one is found. A script with no installed font therefore repeats the same

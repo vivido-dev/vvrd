@@ -12,6 +12,8 @@ pub struct PageImage {
     pub width: u32,
     pub height: u32,
     pub row_stride: usize,
+    /// Paper color after inversion, tinting, and custom color mapping.
+    pub background: [u8; 3],
     pub highlights: Vec<HighlightRect>,
 }
 
@@ -210,7 +212,7 @@ fn prepare_page(
     apply_highlights(&mut image, &highlights);
 
     if transform.auto_crop {
-        image = crop_whitespace_image(image);
+        image = crop_whitespace_image(image, page.background);
     }
 
     let (_, _, image) =
@@ -663,8 +665,10 @@ fn apply_highlights(image: &mut RgbImage, highlights: &[HighlightRect]) {
     }
 }
 
-fn whitespace_bounds(image: &RgbImage) -> Option<(u32, u32, u32, u32)> {
-    const THRESHOLD: u8 = 240;
+fn whitespace_bounds(image: &RgbImage, background: [u8; 3]) -> Option<(u32, u32, u32, u32)> {
+    // Preserve the former near-white tolerance relative to the rendered paper color.
+    const TOLERANCE: u8 = 15;
+    // Leave a small raster-space border around content to avoid clipping antialiased edges.
     const MARGIN: u32 = 8;
     let mut min_x = image.width();
     let mut min_y = image.height();
@@ -672,7 +676,12 @@ fn whitespace_bounds(image: &RgbImage) -> Option<(u32, u32, u32, u32)> {
     let mut max_y = 0;
     let mut found = false;
     for (x, y, pixel) in image.enumerate_pixels() {
-        if pixel.0.iter().any(|channel| *channel < THRESHOLD) {
+        if pixel
+            .0
+            .iter()
+            .zip(background)
+            .any(|(channel, paper)| channel.abs_diff(paper) > TOLERANCE)
+        {
             found = true;
             min_x = min_x.min(x);
             min_y = min_y.min(y);
@@ -695,8 +704,8 @@ fn whitespace_bounds(image: &RgbImage) -> Option<(u32, u32, u32, u32)> {
     })
 }
 
-pub fn crop_whitespace_image(image: RgbImage) -> RgbImage {
-    if let Some((x, y, width, height)) = whitespace_bounds(&image) {
+pub fn crop_whitespace_image(image: RgbImage, background: [u8; 3]) -> RgbImage {
+    if let Some((x, y, width, height)) = whitespace_bounds(&image, background) {
         image::imageops::crop_imm(&image, x, y, width, height).to_image()
     } else {
         image
@@ -713,7 +722,64 @@ mod tests {
             width,
             height,
             row_stride,
+            background: [255; 3],
             highlights: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn auto_crop_removes_inverted_and_tinted_paper_margins() {
+        for (background, foreground) in [
+            ([255, 255, 255], [0, 0, 0]),
+            ([0, 0, 0], [255, 255, 255]),
+            ([245, 230, 200], [112, 66, 20]),
+            ([112, 66, 20], [245, 230, 200]),
+            ([20, 24, 28], [220, 225, 230]),
+            ([40, 60, 80], [210, 190, 170]),
+        ] {
+            let mut image = RgbImage::from_pixel(80, 64, Rgb(background));
+            for y in 24..40 {
+                for x in 28..52 {
+                    image.put_pixel(x, y, Rgb(foreground));
+                }
+            }
+            let cropped = crop_whitespace_image(image.clone(), background);
+            assert_eq!(cropped.dimensions(), (40, 32), "background {background:?}");
+            assert_eq!(cropped.get_pixel(8, 8), &Rgb(foreground));
+
+            let mut page = page(image.into_raw(), 80, 64, 80 * 3);
+            page.background = background;
+            let page = Arc::new(page);
+            let viewport = WindowSize::from_cells(1, 2, 40, 32);
+            let mut composer = Composer::default();
+            for auto_crop in [false, true, false, true] {
+                let frame = composer
+                    .compose(
+                        page.clone(),
+                        viewport,
+                        ViewTransform {
+                            auto_crop,
+                            ..ViewTransform::default()
+                        },
+                    )
+                    .unwrap();
+                let dimensions = if auto_crop { (40, 32) } else { (80, 64) };
+                assert_eq!((frame.content_width, frame.content_height), dimensions);
+            }
+        }
+    }
+
+    #[test]
+    fn auto_crop_preserves_blank_pages_and_content_at_opposite_corners() {
+        for background in [[255; 3], [0; 3], [245, 230, 200], [112, 66, 20]] {
+            let image = RgbImage::from_pixel(80, 64, Rgb(background));
+            assert_eq!(crop_whitespace_image(image.clone(), background), image);
+
+            let mut image = image;
+            let foreground = background.map(|channel| 255 - channel);
+            image.put_pixel(0, 0, Rgb(foreground));
+            image.put_pixel(79, 63, Rgb(foreground));
+            assert_eq!(crop_whitespace_image(image.clone(), background), image);
         }
     }
 

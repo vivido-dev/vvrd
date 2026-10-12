@@ -594,6 +594,7 @@ mod tests {
     fn test_page() -> Arc<PageImage> {
         Arc::new(PageImage {
             pixels: vec![255; 3 * 4 * 4],
+            background: [255; 3],
             width: 4,
             height: 4,
             row_stride: 3 * 4,
@@ -608,6 +609,7 @@ mod tests {
         let view = |value| PresentCmd::ShowView {
             image: Arc::new(PageImage {
                 pixels: vec![value, 0, 0],
+                background: [255; 3],
                 width: 1,
                 height: 1,
                 row_stride: 3,
