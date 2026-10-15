@@ -44,6 +44,18 @@ without a live presenter. `--trace DIR` writes Vivid control and raster streams 
 | `R` or F5 | Manually reread and repaginate the document and local assets |
 | `q`, Esc, Ctrl-C | Quit |
 
+`--preview` shows the document inside a file manager's preview pane instead, as
+[vfm](https://github.com/wensheng/vfm) runs it inside Vivido:
+
+```sh
+vvrd --preview book.epub 48 27 52 2      # DOCUMENT COLUMNS ROWS [COLUMN ROW]
+```
+
+The page fills that 0-based grid-cell rectangle of the window. Nothing is drawn in the terminal, the
+document opens at its first page (or `--page`), and no reader state is saved. Stdin takes one command
+per line: `next`, `prev`, `first`, `last`, and `hide`/`show` while something covers the pane. The
+preview ends, removing its page, when stdin closes. Errors go to stderr.
+
 Reader state is saved per document in the platform cache directory. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the transport and compositor design.
 

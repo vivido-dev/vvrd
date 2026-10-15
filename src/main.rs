@@ -60,12 +60,29 @@ const SEMANTIC_AVAILABLE_OUTLINE: u64 = 1 << 3;
 // negotiated settled geometry normally wins and cancels this local terminal-size fallback.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 const LOADING_DELAY: Duration = Duration::from_millis(90);
+/// How long the preview loop waits for a pane command before servicing renderer events again.
+///
+/// Matches the interactive loop's input poll, so page turns are equally responsive.
+const PANE_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
     /// PDF, EPUB, Markdown, Mermaid, PPTX, DOCX, ODP, or ODT document to read.
     document: PathBuf,
+
+    /// With --preview: the pane's COLUMNS ROWS [COLUMN ROW] in grid cells, as file managers
+    /// append them after the document.
+    #[arg(requires = "preview")]
+    pane: Vec<u16>,
+
+    /// Show the document in a file manager's preview pane instead of full screen.
+    ///
+    /// Nothing is drawn in the terminal and no reader state is saved. Stdin takes one command
+    /// per line: `next`, `prev`, `first`, `last`, and `hide`/`show` while the pane is covered.
+    /// The preview ends when stdin closes.
+    #[arg(long, conflicts_with_all = ["export", "probe_document"])]
+    preview: bool,
 
     /// Page number to open (one-based; overrides saved state).
     #[arg(short = 'p', long = "page")]
@@ -126,6 +143,40 @@ impl From<ThemeArg> for ThemeMode {
     }
 }
 
+/// A file manager's preview pane, in grid cells from the viewport's upper-left corner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pane {
+    column: u16,
+    row: u16,
+    columns: u16,
+    rows: u16,
+}
+
+/// A line a file manager writes to a preview's stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneCommand {
+    Next,
+    Prev,
+    First,
+    Last,
+    /// `false` while something covers the pane.
+    Visible(bool),
+}
+
+impl PaneCommand {
+    fn parse(line: &str) -> Option<Self> {
+        Some(match line.trim() {
+            "next" => Self::Next,
+            "prev" => Self::Prev,
+            "first" => Self::First,
+            "last" => Self::Last,
+            "hide" => Self::Visible(false),
+            "show" => Self::Visible(true),
+            _ => return None,
+        })
+    }
+}
+
 struct Runtime {
     app: App,
     viewport: WindowSize,
@@ -146,6 +197,8 @@ struct Runtime {
     semantic: Arc<semantic::SemanticControl>,
     document_revision: u64,
     render_pending: bool,
+    /// A file manager covered the preview pane; pages arrive but stay hidden.
+    covered: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,7 +239,13 @@ fn main() -> anyhow::Result<()> {
 
     let black = parse_color(&cli.black)?;
     let white = parse_color(&cli.white)?;
-    let saved = state::load_state(&cli.document).unwrap_or_default();
+    let pane = pane_of(&cli)?;
+    // A preview is a glance: it starts at the top in default colours, whatever was last read.
+    let saved = if pane.is_some() {
+        state::SavedState::default()
+    } else {
+        state::load_state(&cli.document).unwrap_or_default()
+    };
     let initial_page = cli.page.map(|page| page - 1).unwrap_or(saved.page);
 
     if cli.export {
@@ -234,6 +293,16 @@ fn main() -> anyhow::Result<()> {
             WindowSize::from_terminal()?
         }
     };
+    // In a pane the page area is the pane; the row WindowSize reserves for status lies outside.
+    let viewport = match pane {
+        Some(pane) => WindowSize::from_cells(
+            pane.columns,
+            pane.rows.saturating_add(1),
+            viewport.cell_width_px,
+            viewport.cell_height_px,
+        ),
+        None => viewport,
+    };
     let target_generation = session.info().target_generation.get();
 
     let mut app = App::new(initial_page);
@@ -242,7 +311,8 @@ fn main() -> anyhow::Result<()> {
     app.tinted = saved.tinted;
     app.auto_crop = saved.auto_crop;
     app.epub_font_size = saved.epub_font_size.unwrap_or(11.0);
-    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let interactive =
+        pane.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let title = document_title(&cli.document);
     let semantic = Arc::new(semantic::SemanticControl::start(
         title.clone(),
@@ -261,6 +331,7 @@ fn main() -> anyhow::Result<()> {
         semantic: semantic.clone(),
         document_revision: 1,
         render_pending: false,
+        covered: false,
     };
 
     let old_hook = std::panic::take_hook();
@@ -302,18 +373,25 @@ fn main() -> anyhow::Result<()> {
             | SEMANTIC_AVAILABLE_OUTLINE,
         locator_hint: semantic.locator().to_owned(),
     };
-    let vivid = VividThread::spawn(
+    let vivid = VividThread::spawn_in(
         session,
         viewport,
         document_capture_policy(&cli.document),
         descriptor,
         initial_page,
+        pane.map(|pane| (pane.column, pane.row)),
     )?;
     wait_for_presenter(&vivid)?;
     let render = RenderThread::spawn(cli.document.clone(), viewport, paper_style(&cli));
     wait_for_document(&render, &mut runtime)?;
     request_render(&render, &vivid, &mut runtime, black, white, interactive)?;
 
+    if pane.is_some() {
+        run_pane_loop(&render, &vivid, &mut runtime, black, white)?;
+        render.shutdown();
+        vivid.shutdown();
+        return Ok(());
+    }
     if interactive {
         run_event_loop(
             &cli.document,
@@ -347,6 +425,96 @@ fn main() -> anyhow::Result<()> {
     render.shutdown();
     vivid.shutdown();
     Ok(())
+}
+
+/// The pane a `--preview` run is confined to, or `None` for the full-screen reader.
+fn pane_of(cli: &Cli) -> anyhow::Result<Option<Pane>> {
+    if !cli.preview {
+        return Ok(None);
+    }
+    let (columns, rows, column, row) = match cli.pane[..] {
+        [columns, rows] => (columns, rows, 0, 0),
+        [columns, rows, column, row] => (columns, rows, column, row),
+        _ => bail!("--preview needs the pane's COLUMNS ROWS [COLUMN ROW] after the document"),
+    };
+    ensure!(
+        columns > 0 && rows > 0,
+        "--preview pane must be at least one cell"
+    );
+    Ok(Some(Pane {
+        column,
+        row,
+        columns,
+        rows,
+    }))
+}
+
+/// Serves a file manager's preview pane until its stdin closes.
+///
+/// Stdin is read on its own thread, which ends at end of input and so disconnects the channel.
+fn run_pane_loop(
+    render: &RenderThread,
+    vivid: &VividThread,
+    runtime: &mut Runtime,
+    black: i32,
+    white: i32,
+) -> anyhow::Result<()> {
+    let (commands, received) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("vvrd-pane-input".to_owned())
+        .spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if let Some(command) = PaneCommand::parse(&line)
+                    && commands.send(command).is_err()
+                {
+                    break;
+                }
+            }
+        })?;
+    let document = Path::new("document");
+    loop {
+        while let Ok(event) = render.events.try_recv() {
+            handle_render_event(document, render, vivid, runtime, event, black, white)?;
+        }
+        while let Ok(event) = vivid.events.try_recv() {
+            handle_present_event(render, vivid, runtime, event, black, white)?;
+        }
+        if runtime.render_pending {
+            request_render(render, vivid, runtime, black, white, false)?;
+        }
+        let command = match received.recv_timeout(PANE_POLL) {
+            Ok(command) => command,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+        let turned = match command {
+            PaneCommand::Next => runtime.app.next_page(),
+            PaneCommand::Prev => runtime.app.prev_page(),
+            PaneCommand::First => runtime.app.go_to_page(0),
+            // Before an EPUB is fully paginated its last page is unknown; stay put until it is.
+            PaneCommand::Last => {
+                runtime.app.pagination_complete
+                    && runtime
+                        .app
+                        .go_to_page(runtime.app.n_pages.saturating_sub(1))
+            }
+            PaneCommand::Visible(false) => {
+                runtime.covered = true;
+                hide_node(vivid, runtime)?;
+                false
+            }
+            PaneCommand::Visible(true) => {
+                runtime.covered = false;
+                show_current(vivid, runtime)?;
+                false
+            }
+        };
+        if turned {
+            request_render(render, vivid, runtime, black, white, false)?;
+        }
+    }
 }
 
 fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
@@ -524,7 +692,8 @@ fn request_render(
     draw_loading: bool,
 ) -> anyhow::Result<()> {
     match loading_policy(
-        draw_loading,
+        // Only a terminal the reader owns can show a placeholder.
+        draw_loading && runtime.interactive,
         runtime.current_image.is_some(),
         current_image_is_ready(runtime),
         current_image_shows_another_page(runtime),
@@ -1032,7 +1201,10 @@ fn handle_present_event(
 }
 
 fn show_current(vivid: &VividThread, runtime: &mut Runtime) -> anyhow::Result<()> {
-    if !matches!(runtime.app.input_mode, InputMode::Normal) || !runtime.target_presentable {
+    if !matches!(runtime.app.input_mode, InputMode::Normal)
+        || !runtime.target_presentable
+        || runtime.covered
+    {
         return Ok(());
     }
     let Some((_, _, image)) = &runtime.current_image else {
@@ -1445,6 +1617,56 @@ fn open_url(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_takes_the_pane_after_the_document() {
+        let pane = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["vvrd", "--dry-run", "--preview"].iter().chain(args))?;
+            pane_of(&cli)
+                .map_err(|error| clap::Error::raw(clap::error::ErrorKind::ValueValidation, error))
+        };
+        assert_eq!(
+            pane(&["doc.pdf", "48", "20", "51", "2"]).unwrap(),
+            Some(Pane {
+                column: 51,
+                row: 2,
+                columns: 48,
+                rows: 20
+            })
+        );
+        assert_eq!(
+            pane(&["doc.pdf", "10", "5"])
+                .unwrap()
+                .map(|pane| (pane.column, pane.row)),
+            Some((0, 0))
+        );
+        for bad in [
+            &["doc.pdf"][..],
+            &["doc.pdf", "10"],
+            &["doc.pdf", "0", "5"],
+            &["doc.pdf", "x", "5"],
+        ] {
+            assert!(pane(bad).is_err(), "{bad:?}");
+        }
+        // Pane cells only make sense for a preview; the full-screen reader takes one document.
+        assert!(Cli::try_parse_from(["vvrd", "doc.pdf", "10", "5"]).is_err());
+        let reader = Cli::try_parse_from(["vvrd", "doc.pdf"]).unwrap();
+        assert_eq!(pane_of(&reader).unwrap(), None);
+    }
+
+    #[test]
+    fn pane_commands_are_one_word_lines() {
+        assert_eq!(PaneCommand::parse("next\n"), Some(PaneCommand::Next));
+        assert_eq!(PaneCommand::parse("prev"), Some(PaneCommand::Prev));
+        assert_eq!(PaneCommand::parse(" first "), Some(PaneCommand::First));
+        assert_eq!(PaneCommand::parse("last"), Some(PaneCommand::Last));
+        assert_eq!(
+            PaneCommand::parse("hide"),
+            Some(PaneCommand::Visible(false))
+        );
+        assert_eq!(PaneCommand::parse("show"), Some(PaneCommand::Visible(true)));
+        assert_eq!(PaneCommand::parse("quit"), None);
+    }
 
     #[test]
     fn parses_css_colors_for_mupdf() {

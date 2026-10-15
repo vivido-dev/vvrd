@@ -79,6 +79,8 @@ pub struct VividThread {
 }
 
 impl VividThread {
+    /// A full-window presenter thread, as the reader's tests drive it.
+    #[cfg(test)]
     pub fn spawn(
         session: Session,
         viewport: WindowSize,
@@ -86,7 +88,28 @@ impl VividThread {
         descriptor: SurfaceDescriptor,
         initial_page: usize,
     ) -> std::io::Result<Self> {
-        let presenter = VividPresenter::new(session, viewport, policy, descriptor, initial_page)?;
+        Self::spawn_in(session, viewport, policy, descriptor, initial_page, None)
+    }
+
+    /// Like [`Self::spawn`], fixed in a file manager's pane at `pane_origin` when one is given.
+    ///
+    /// # Errors
+    ///
+    /// Returns presenter setup and thread spawn failures.
+    pub fn spawn_in(
+        session: Session,
+        viewport: WindowSize,
+        policy: u64,
+        descriptor: SurfaceDescriptor,
+        initial_page: usize,
+        pane_origin: Option<(u16, u16)>,
+    ) -> std::io::Result<Self> {
+        let mut presenter =
+            VividPresenter::new(session, viewport, policy, descriptor, initial_page)?;
+        if let Some(origin) = pane_origin {
+            // Still hidden here: the node shows with its first page, already in the pane.
+            presenter.place_in_pane(origin)?;
+        }
         let cancel = presenter.cancel_handle();
         let (commands, command_rx) = crate::mailbox::channel();
         let (event_tx, events) = crate::mailbox::channel();
@@ -360,6 +383,10 @@ fn service_presenter_signals(
 }
 
 fn apply_target_change(presenter: &mut VividPresenter, events: &Sender<PresentEvent>) {
+    if presenter.in_pane() {
+        // The pane's size is the file manager's to change, and it restarts the preview to do so.
+        return;
+    }
     let target_generation = presenter.target_generation();
     let (target, settled) = match presenter.target_viewport() {
         Ok(target) => target,

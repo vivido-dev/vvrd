@@ -87,6 +87,9 @@ pub struct VividPresenter {
     track_viewport: WindowSize,
     /// Geometry the scene node currently claims, in terminal cells.
     node_viewport: WindowSize,
+    /// Upper-left grid cell of a file manager's preview pane, which fixes the placement; `None`
+    /// for the full-window reader, whose node starts at the origin and follows the target.
+    pane_origin: Option<(u16, u16)>,
     visible: bool,
     desired_visible: bool,
     has_content: bool,
@@ -171,7 +174,12 @@ impl VividPresenter {
             &track,
             &mut signals,
             NodeCommit::Create(&terminal_node(
-                context_id, node_id, &surface, viewport, false,
+                context_id,
+                node_id,
+                &surface,
+                viewport,
+                (0, 0),
+                false,
             )),
         ) {
             let _ = session.destroy_track(&track, &RequestMetadata::default());
@@ -190,6 +198,7 @@ impl VividPresenter {
             active_io,
             track_viewport: viewport,
             node_viewport: viewport,
+            pane_origin: None,
             visible: false,
             desired_visible: true,
             has_content: false,
@@ -296,6 +305,7 @@ impl VividPresenter {
                 self.node_id,
                 &self.surface,
                 node_viewport,
+                self.origin(),
                 self.visible,
             );
             self.replacement_gate("node")
@@ -315,6 +325,36 @@ impl VividPresenter {
             self.composer.recycle(seed);
         }
         node_result.and(retired_result)
+    }
+
+    /// Moves the page node to a file manager's pane at `origin`, fixing it there.
+    ///
+    /// The viewport given at creation is the pane's size. Later target changes no longer resize
+    /// the reader: the file manager starts a new preview when its pane moves or resizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the presenter's error when the node update fails.
+    pub fn place_in_pane(&mut self, origin: (u16, u16)) -> io::Result<()> {
+        self.pane_origin = Some(origin);
+        let node = terminal_node(
+            self.session.info().root_context_id,
+            self.node_id,
+            &self.surface,
+            self.node_viewport,
+            origin,
+            self.visible,
+        );
+        self.commit_node(NodeCommit::Update(&node))
+    }
+
+    /// Whether the reader is confined to a file manager's preview pane.
+    pub fn in_pane(&self) -> bool {
+        self.pane_origin.is_some()
+    }
+
+    fn origin(&self) -> (u16, u16) {
+        self.pane_origin.unwrap_or((0, 0))
     }
 
     pub fn cancel_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
@@ -791,6 +831,7 @@ impl Presenter for VividPresenter {
             self.node_id,
             &self.surface,
             self.node_viewport,
+            self.origin(),
             visible,
         );
         self.commit_node(NodeCommit::Update(&node))?;
@@ -808,6 +849,7 @@ impl Presenter for VividPresenter {
                     self.node_id,
                     &self.surface,
                     viewport,
+                    self.origin(),
                     self.visible,
                 );
                 self.commit_node(NodeCommit::Update(&node))?;
@@ -1090,6 +1132,7 @@ fn terminal_node(
     node_id: u64,
     surface: &Surface,
     viewport: WindowSize,
+    (column, row): (u16, u16),
     visible: bool,
 ) -> SceneNode {
     SceneNode {
@@ -1099,8 +1142,8 @@ fn terminal_node(
         surface_id: surface.id(),
         geometry: vec![
             (0, Value::Unsigned(COORDINATE_SPACE_GRID_CELL)),
-            (1, Value::Unsigned(0)),
-            (2, Value::Unsigned(0)),
+            (1, Value::Unsigned(u64::from(column) << 32)),
+            (2, Value::Unsigned(u64::from(row) << 32)),
             (3, Value::Unsigned(u64::from(viewport.cols) << 32)),
             (4, Value::Unsigned(u64::from(viewport.page_rows()) << 32)),
             (5, Value::Unsigned(TEXT_LAYER_BETWEEN_BACKGROUND_AND_GLYPH)),
@@ -1258,7 +1301,7 @@ mod tests {
             )
             .unwrap();
         let viewport = WindowSize::from_cells(100, 30, 9, 18);
-        let node = terminal_node(7, 8, &surface, viewport, true);
+        let node = terminal_node(7, 8, &surface, viewport, (0, 0), true);
         assert_eq!(node.owning_context_id, 7);
         assert_eq!(node.surface_context_id, 7);
         assert_eq!(node.surface_id, 9);
@@ -1266,6 +1309,11 @@ mod tests {
         assert_eq!(node.geometry[2].1, Value::Unsigned(0));
         assert_eq!(node.geometry[3].1, Value::Unsigned(100 << 32));
         assert_eq!(node.geometry[4].1, Value::Unsigned(29 << 32));
+        // A preview pane moves the node, not its page area.
+        let pane = terminal_node(7, 8, &surface, viewport, (51, 2), true);
+        assert_eq!(pane.geometry[1].1, Value::Unsigned(51 << 32));
+        assert_eq!(pane.geometry[2].1, Value::Unsigned(2 << 32));
+        assert_eq!(pane.geometry[3..5], node.geometry[3..5]);
     }
 
     #[test]
