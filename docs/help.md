@@ -8,6 +8,7 @@ and help remain readable in Vivido and nested vvmux panes.
 
 ```text
 vvrd [OPTIONS] <DOCUMENT>
+vvrd --preview [OPTIONS] <DOCUMENT> <COLUMNS> <ROWS> [COLUMN ROW]
 
 -p, --page N             open one-based page N instead of the saved page
 -e, --export             export one page as PNG and exit
@@ -16,10 +17,37 @@ vvrd [OPTIONS] <DOCUMENT>
 -b, --black-color CSS    custom document black
 -w, --white-color CSS    custom document white
     --theme light|dark   Markdown/Mermaid paper theme (default: light)
+    --preview             draw into a file manager's preview pane (see below)
     --dry-run             validate without a live presenter
     --trace DIR           write metadata-only control.ndjson and track-*.ndjson traces
 -v, --verbose             diagnostic logging without credentials
 ```
+
+Vivido and vvssh provide `VIVID_ENDPOINT_CONTROL`, optional `VIVID_ENDPOINT_BULK`, and
+`VIVID_ROOT_SECRET`; vvrd discovers them automatically and never puts the secret on the wire.
+Reader state is saved per document in the platform cache directory.
+
+## Controls
+
+| Input | Action |
+|---|---|
+| Left, right mouse click | Previous page |
+| Right, Space, left mouse click | Next page |
+| Up/Down | Scroll; turn at the page boundary |
+| `j`/`k` | Next/previous page without scrolling |
+| `h`/`l` | Page turn, or horizontal pan in zoom mode |
+| PageUp/PageDown | Page turn, or viewport jump in zoom mode |
+| `g` | Go to page |
+| `z`, `o`/`O` | Toggle zoom; zoom in/out |
+| `<`/`>` | Decrease/increase EPUB font size |
+| `i`, `r`, `c`, `d` | Invert, rotate, auto-crop, warm tint |
+| `/`, `n`/`N` | Search; next/previous matching page |
+| `t`, `M`, `f`, `?` | TOC, metadata, links, help |
+| `e` | Export the current page as PNG |
+| `R` or F5 | Manually reread and repaginate the document and local assets |
+| `q`, Esc, Ctrl-C | Quit |
+
+## Formats
 
 PDF and fixed Letter markup pages support zoom, vertical scrolling, horizontal panning, rotation,
 inversion, custom black/white colours, warm tint, whitespace crop, search highlights, links,
@@ -40,6 +68,22 @@ and local assets. Interactive Markdown, DOCX, and PPTX views also watch the open
 perform that reload automatically after a short save debounce. Linked Markdown assets and
 ODP/ODT sources still require `R`/F5. If parsing or pagination fails, the prior document remains
 visible.
+
+## Preview pane
+
+`--preview` shows the document inside a file manager's preview pane, as
+[vfm](https://github.com/wensheng/vfm) runs it inside Vivido:
+
+```sh
+vvrd --preview book.epub 48 27 52 2      # DOCUMENT COLUMNS ROWS [COLUMN ROW]
+```
+
+The page fills that 0-based grid-cell rectangle of the window. Nothing is drawn in the terminal, the
+document opens at its first page (or `--page`), and no reader state is saved. Stdin takes one command
+per line: `next`, `prev`, `first`, `last`, and `hide`/`show` while something covers the pane. The
+preview ends, removing its page, when stdin closes. Errors go to stderr.
+
+## vvmux
 
 In vvmux, moving a floating pane changes only the outer projection; vvrd continues using local
 `(0,0)` coordinates. Resizing a pane recreates its one raster source after a 120 ms debounce.
