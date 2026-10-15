@@ -29,7 +29,8 @@ without a live presenter. `--trace DIR` writes Vivid control and raster streams 
 | Input | Action |
 |---|---|
 | Left, right mouse click | Previous page |
-| Right, Space, left mouse click | Next page |
+| Right, Space, left mouse click outside a link | Next page |
+| Left mouse click on a link | Open local reader documents in vvrd; open web links in the default browser |
 | Up/Down | Scroll; turn at the page boundary |
 | `j`/`k` | Next/previous page without scrolling |
 | `h`/`l` | Page turn, or horizontal pan in zoom mode |
@@ -43,6 +44,10 @@ without a live presenter. `--trace DIR` writes Vivid control and raster streams 
 | `e` | Export the current page as PNG |
 | `R` or F5 | Manually reread and repaginate the document and local assets |
 | `q`, Esc, Ctrl-C | Quit |
+
+Local Markdown, PDF, EPUB, Mermaid, and Office document links open directly in vvrd.
+Relative Markdown links resolve from the current document’s directory. Missing files leave the
+current document open; an unreadable linked document returns to the previous document.
 
 Reader state is saved per document in the platform cache directory. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the transport and compositor design.

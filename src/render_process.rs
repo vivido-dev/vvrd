@@ -615,6 +615,7 @@ mod tests {
             row_stride: 3,
             background: [112, 66, 20],
             highlights: Vec::new(),
+            links: Vec::new(),
         };
         let mut event = RenderEvent::Page {
             page: 0,

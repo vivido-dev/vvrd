@@ -45,6 +45,43 @@ pub enum PresentCmd {
     },
 }
 
+/// Hit regions and identity of the last submitted viewport.
+#[derive(Debug)]
+pub struct ShownView {
+    pub image: Arc<PageImage>,
+    pub viewport: WindowSize,
+    pub transform: ViewTransform,
+    pub links: Vec<crate::compositor::LinkRegion>,
+}
+
+impl ShownView {
+    /// Find a link intersecting the clicked terminal cell, preferring its center.
+    pub fn link_at(&self, column: u16, row: u16) -> Option<&crate::renderer::LinkInfo> {
+        if column >= self.viewport.cols || row >= self.viewport.page_rows() {
+            return None;
+        }
+        let x = u32::from(column) * self.viewport.cell_width_px;
+        let y = u32::from(row) * self.viewport.cell_height_px;
+        let cx = x + self.viewport.cell_width_px / 2;
+        let cy = y + self.viewport.cell_height_px / 2;
+        self.links
+            .iter()
+            .filter(|link| {
+                let r = link.rect;
+                r.x0 < x + self.viewport.cell_width_px
+                    && r.x1 > x
+                    && r.y0 < y + self.viewport.cell_height_px
+                    && r.y1 > y
+            })
+            .min_by_key(|link| {
+                let r = link.rect;
+                u64::from(cx.abs_diff(cx.clamp(r.x0, r.x1)))
+                    + u64::from(cy.abs_diff(cy.clamp(r.y0, r.y1)))
+            })
+            .map(|link| &link.target)
+    }
+}
+
 #[derive(Debug)]
 pub enum PresentEvent {
     Ready,
@@ -52,6 +89,7 @@ pub enum PresentEvent {
         frame_id: u64,
         content_width: u32,
         content_height: u32,
+        view: ShownView,
     },
     TargetChanged {
         viewport: WindowSize,
@@ -234,6 +272,12 @@ fn run(
                         frame_id,
                         content_width: frame.content_width,
                         content_height: frame.content_height,
+                        view: ShownView {
+                            image: Arc::clone(&image),
+                            viewport,
+                            transform,
+                            links: frame.links.clone(),
+                        },
                     };
                     if let Some(old) = previous.take() {
                         presenter.recycle(old.frame);
@@ -443,6 +487,12 @@ fn resend_full_frame(
                 frame_id,
                 content_width: previous.frame.content_width,
                 content_height: previous.frame.content_height,
+                view: ShownView {
+                    image: Arc::clone(&previous.image),
+                    viewport: previous.viewport,
+                    transform: previous.transform,
+                    links: previous.frame.links.clone(),
+                },
             });
         }
         Err(error) => {
@@ -480,6 +530,37 @@ mod tests {
     use super::*;
 
     use vivid_sdk::{ProducerConfig, SurfaceRole};
+
+    #[test]
+    fn link_click_uses_cell_overlap_and_excludes_status_row() {
+        let viewport = WindowSize::from_cells(10, 6, 10, 20);
+        let mut view = ShownView {
+            image: test_page(),
+            viewport,
+            transform: ViewTransform::default(),
+            links: vec![crate::compositor::LinkRegion {
+                rect: crate::compositor::HighlightRect {
+                    x0: 21,
+                    y0: 42,
+                    x1: 39,
+                    y1: 47,
+                },
+                target: crate::renderer::LinkInfo {
+                    text: "link".into(),
+                    uri: "https://example.com".into(),
+                    page: None,
+                },
+            }],
+        };
+        // The short link misses the cell center, but still occupies the clicked cell.
+        assert!(view.link_at(2, 2).is_some());
+        assert!(view.link_at(3, 2).is_some());
+        assert!(view.link_at(4, 2).is_none());
+        assert!(view.link_at(2, 1).is_none());
+        view.links[0].rect.y1 = 120;
+        assert!(view.link_at(2, 5).is_none());
+        assert!(view.link_at(10, 2).is_none());
+    }
 
     #[test]
     fn identical_views_do_not_send_media_but_recovery_still_sends_full() {
@@ -599,6 +680,7 @@ mod tests {
             height: 4,
             row_stride: 3 * 4,
             highlights: Vec::new(),
+            links: Vec::new(),
         })
     }
 
@@ -614,6 +696,7 @@ mod tests {
                 height: 1,
                 row_stride: 3,
                 highlights: Vec::new(),
+                links: Vec::new(),
             }),
             viewport,
             transform: ViewTransform::default(),

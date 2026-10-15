@@ -77,6 +77,7 @@ fn reader_composition_and_delta_workloads() {
                 .map(|i| ((i / (2040 * 3)) % 251) as u8)
                 .collect(),
             highlights: Vec::new(),
+            links: Vec::new(),
             background: [255; 3],
         });
         let mut composer = Composer::default();

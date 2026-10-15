@@ -1176,6 +1176,7 @@ fn render_markup_page(
         None => Arc::new(render_markup_base(document, page_num, search_term)?),
     };
     let mut highlights = rendered.highlights.clone();
+    let mut links = rendered.links.clone();
 
     let requested_zoom = if options.zoom_factor.is_finite() {
         options.zoom_factor.max(1.0)
@@ -1192,7 +1193,10 @@ fn render_markup_page(
     let mut image = if scale > 1.0 + f32::EPSILON {
         let width = (rendered.image.width() as f32 * scale).round().max(1.0) as u32;
         let height = (rendered.image.height() as f32 * scale).round().max(1.0) as u32;
-        for rect in &mut highlights {
+        for rect in highlights
+            .iter_mut()
+            .chain(links.iter_mut().map(|link| &mut link.rect))
+        {
             rect.x0 = (rect.x0 as f32 * scale).round() as u32;
             rect.y0 = (rect.y0 as f32 * scale).round() as u32;
             rect.x1 = (rect.x1 as f32 * scale).round() as u32;
@@ -1207,7 +1211,10 @@ fn render_markup_page(
     for _ in 0..((options.rotation % 360) / 90) {
         let old_height = image.height();
         image = image::imageops::rotate90(&image);
-        for rect in &mut highlights {
+        for rect in highlights
+            .iter_mut()
+            .chain(links.iter_mut().map(|link| &mut link.rect))
+        {
             let previous = *rect;
             rect.x0 = old_height.saturating_sub(previous.y1);
             rect.y0 = previous.x0;
@@ -1233,6 +1240,7 @@ fn render_markup_page(
         row_stride: width as usize * 3,
         background,
         highlights,
+        links,
     })
 }
 
@@ -1342,7 +1350,35 @@ fn render_loaded_page(
         })
         .collect();
     let [_, red, green, blue] = white.to_be_bytes();
-    copy_pixmap_rgb(&pixmap, highlights, [red, green, blue])
+    let mut image = copy_pixmap_rgb(&pixmap, highlights, [red, green, blue])?;
+    if let Ok(links) = page.links() {
+        image.links = links
+            .filter(|link| {
+                [
+                    link.bounds.x0,
+                    link.bounds.y0,
+                    link.bounds.x1,
+                    link.bounds.y1,
+                ]
+                .into_iter()
+                .all(f32::is_finite)
+            })
+            .map(|link| crate::compositor::LinkRegion {
+                rect: highlight_rect(
+                    link.bounds.into(),
+                    &matrix,
+                    pixmap.origin(),
+                    (pixmap.width(), pixmap.height()),
+                ),
+                target: LinkInfo {
+                    text: link.uri.clone(),
+                    uri: link.uri,
+                    page: link.dest.map(|dest| dest.loc.page_number as usize),
+                },
+            })
+            .collect();
+    }
+    Ok(image)
 }
 
 fn copy_pixmap_rgb(
@@ -1376,6 +1412,7 @@ fn copy_pixmap_rgb(
         row_stride,
         background,
         highlights,
+        links: Vec::new(),
     })
 }
 
@@ -1542,6 +1579,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pdf_link_annotations_follow_raster_rotation_and_worker_serialization() {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Annots [4 0 R] >>",
+            "<< /Type /Annot /Subtype /Link /Rect [20 30 60 50] /A << /S /URI /URI (https://example.com/pdf) >> >>",
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{object}\nendobj\n", i + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str("xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+        ));
+        let document = Document::from_bytes(pdf.as_bytes(), "application/pdf").unwrap();
+        for (rotation, width, height, expected) in [
+            (
+                0,
+                200,
+                100,
+                HighlightRect {
+                    x0: 20,
+                    y0: 50,
+                    x1: 60,
+                    y1: 70,
+                },
+            ),
+            (
+                90,
+                100,
+                200,
+                HighlightRect {
+                    x0: 30,
+                    y0: 20,
+                    x1: 50,
+                    y1: 60,
+                },
+            ),
+        ] {
+            let mut options =
+                RenderOptions::for_viewport(WindowSize::from_cells(1, 2, width, height), 1);
+            options.rotation = rotation;
+            let image = render_loaded_page(&document, 0, &options).unwrap();
+            assert_eq!(image.links.len(), 1);
+            assert_eq!(image.links[0].rect, expected);
+            assert_eq!(image.links[0].target.uri, "https://example.com/pdf");
+            let decoded: PageImage =
+                serde_json::from_slice(&serde_json::to_vec(&image).unwrap()).unwrap();
+            assert_eq!(decoded.links, image.links);
+        }
+    }
+
+    #[test]
     #[ignore = "isolated performance measurement"]
     fn audit_bench_cache_hits() {
         let options = RenderOptions::for_viewport(WindowSize::from_cells(80, 24, 10, 20), 1);
@@ -1556,6 +1653,7 @@ mod tests {
                 pixels: vec![1; 2040 * 2640 * 3],
                 background: [255; 3],
                 highlights: Vec::new(),
+                links: Vec::new(),
             },
         );
         crate::audit_bench::begin_measurement();
@@ -1611,6 +1709,7 @@ mod tests {
             pixels: vec![0; 3],
             background: [255; 3],
             highlights: Vec::new(),
+            links: Vec::new(),
         });
         cache.insert(key.clone(), page.clone());
         assert!(Arc::ptr_eq(&page, &cache.get(&key).unwrap()));
@@ -2190,6 +2289,7 @@ mod tests {
                     row_stride: 3,
                     background: [255; 3],
                     highlights: Vec::new(),
+                    links: Vec::new(),
                 },
             );
         }

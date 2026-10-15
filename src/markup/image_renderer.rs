@@ -192,6 +192,40 @@ impl TextRenderer {
         self.layout_text_block(spans, opts).1
     }
 
+    /// Return each shaped span's rectangles, including wrapping and bidirectional text.
+    pub fn span_rects(
+        &mut self,
+        spans: &[TextSpan],
+        opts: &TextBlockOptions,
+    ) -> Vec<(usize, crate::compositor::HighlightRect)> {
+        let (buffer, _) = self.layout_text_block(spans, opts);
+        let mut result: Vec<(usize, crate::compositor::HighlightRect)> = Vec::new();
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs {
+                let index = glyph.metadata >> 2;
+                let x0 = (glyph.x + opts.padding_x as f32).floor().max(0.0) as u32;
+                let x1 = (glyph.x + glyph.w + opts.padding_x as f32).ceil().max(0.0) as u32;
+                let y0 = (run.line_top + opts.padding_y as f32).floor().max(0.0) as u32;
+                let y1 = (run.line_top + run.line_height + opts.padding_y as f32)
+                    .ceil()
+                    .max(0.0) as u32;
+                if let Some((last_index, rect)) = result.last_mut()
+                    && *last_index == index
+                    && rect.y0 == y0
+                    && rect.y1 == y1
+                    && x0 <= rect.x1
+                    && x1 >= rect.x0
+                {
+                    rect.x0 = rect.x0.min(x0);
+                    rect.x1 = rect.x1.max(x1);
+                } else {
+                    result.push((index, crate::compositor::HighlightRect { x0, y0, x1, y1 }));
+                }
+            }
+        }
+        result
+    }
+
     fn layout_text_block(&mut self, spans: &[TextSpan], opts: &TextBlockOptions) -> (Buffer, u32) {
         let content_width = opts
             .width
@@ -204,8 +238,14 @@ impl TextRenderer {
         let default_attrs = self.attrs_for_style(&TextStyle::default(), opts);
         let pieces: Vec<(&str, Attrs<'_>)> = spans
             .iter()
-            .filter(|span| !span.text.is_empty())
-            .map(|span| (span.text.as_str(), self.attrs_for_style(&span.style, opts)))
+            .enumerate()
+            .filter(|(_, span)| !span.text.is_empty())
+            .map(|(index, span)| {
+                let attrs = self.attrs_for_style(&span.style, opts);
+                // The low two bits carry code/strikethrough styling; higher bits identify spans.
+                let metadata = attrs.metadata | (index << 2);
+                (span.text.as_str(), attrs.metadata(metadata))
+            })
             .collect();
 
         if pieces.is_empty() {

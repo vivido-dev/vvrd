@@ -1210,6 +1210,7 @@ mod tests {
             height: 4,
             row_stride: 12,
             highlights: Vec::new(),
+            links: Vec::new(),
         });
         let frame = presenter
             .compose(image.clone(), before, ViewTransform::default())
