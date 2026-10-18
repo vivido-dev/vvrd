@@ -107,6 +107,7 @@ pub struct MarkupDocument {
     theme_mode: ThemeMode,
     theme: RenderTheme,
     geometry: PageGeometry,
+    base_dir: PathBuf,
     blocks: Vec<Block>,
     pages: Vec<PlannedPage>,
     toc: Vec<TocEntry>,
@@ -362,6 +363,7 @@ impl MarkupDocument {
             theme_mode,
             theme,
             geometry,
+            base_dir: base_dir.to_owned(),
             blocks,
             pages,
             toc,
@@ -418,12 +420,49 @@ impl MarkupDocument {
         );
         let mut text_renderer = TextRenderer::new();
         let mut highlights = Vec::new();
+        let mut links = Vec::new();
         for item in &page.items {
             let block = &self.blocks[item.block];
             let image = self.render_item(block, &item.units, &mut text_renderer)?;
             let x = self.geometry.margin
                 + self.geometry.content_width().saturating_sub(image.width()) / 2;
             canvas.overlay(x as i32, item.y as i32, &image);
+            for (href, mut rect) in self.item_link_rects(block, &item.units, &mut text_renderer) {
+                let resolved = resolve_link_href(&href, &self.base_dir);
+                if let Some(target) = page
+                    .links
+                    .iter()
+                    .find(|link| link.uri == href || link.uri == resolved)
+                {
+                    rect.x0 = rect
+                        .x0
+                        .min(image.width())
+                        .saturating_add(x)
+                        .min(self.geometry.width);
+                    rect.x1 = rect
+                        .x1
+                        .min(image.width())
+                        .saturating_add(x)
+                        .min(self.geometry.width);
+                    rect.y0 = rect
+                        .y0
+                        .min(image.height())
+                        .saturating_add(item.y)
+                        .min(self.geometry.height);
+                    rect.y1 = rect
+                        .y1
+                        .min(image.height())
+                        .saturating_add(item.y)
+                        .min(self.geometry.height);
+                    if rect.x0 >= rect.x1 || rect.y0 >= rect.y1 {
+                        continue;
+                    }
+                    links.push(crate::compositor::LinkRegion {
+                        rect,
+                        target: target.clone(),
+                    });
+                }
+            }
             if search_term.is_some_and(|term| contains_case_insensitive(&block.text, term)) {
                 let occurrences =
                     count_matches(&block.text, search_term.unwrap_or_default()).max(1);
@@ -438,7 +477,80 @@ impl MarkupDocument {
         Ok(MarkupPage {
             image: canvas.into_image(),
             highlights,
+            links,
         })
+    }
+
+    fn item_link_rects(
+        &self,
+        block: &Block,
+        units: &Range<usize>,
+        renderer: &mut TextRenderer,
+    ) -> Vec<(String, crate::compositor::HighlightRect)> {
+        let mut result = Vec::new();
+        if block.links.is_empty() {
+            return result;
+        }
+        let mut collect = |lines: &[Vec<InlineSpan>], opts: TextBlockOptions, x: u32, y: u32| {
+            let inline = joined_inline_lines(lines);
+            if !inline.iter().any(|span| span.href.is_some()) {
+                return;
+            }
+            let spans: Vec<_> = inline.iter().map(|span| span.span.clone()).collect();
+            for (index, mut rect) in renderer.span_rects(&spans, &opts) {
+                if let Some(href) = inline.get(index).and_then(|span| span.href.as_ref()) {
+                    rect.x0 = rect.x0.min(opts.width).saturating_add(x);
+                    rect.x1 = rect.x1.min(opts.width).saturating_add(x);
+                    rect.y0 = rect.y0.saturating_add(y);
+                    rect.y1 = rect.y1.saturating_add(y);
+                    result.push((href.clone(), rect));
+                }
+            }
+        };
+        match &block.kind {
+            BlockKind::Text(block) => collect(
+                &block.lines[units.clone()],
+                text_options(block.style, &self.theme, self.geometry),
+                if block.style == TextBlockStyle::Quote {
+                    10
+                } else {
+                    0
+                },
+                0,
+            ),
+            BlockKind::List(block) => collect(
+                &block.lines[units.clone()],
+                text_options(TextBlockStyle::Prose, &self.theme, self.geometry),
+                0,
+                0,
+            ),
+            BlockKind::Table(table) => {
+                let mut rows = vec![0];
+                if table.rows.len() > 1 {
+                    rows.extend((units.start + 1)..(units.end + 1).min(table.rows.len()));
+                }
+                let mut y = 1;
+                for row in rows {
+                    let mut x = 1;
+                    for (column, width) in table.widths.iter().copied().enumerate() {
+                        if let Some(cell) = table.rows[row].get(column) {
+                            let mut opts =
+                                text_options(TextBlockStyle::Prose, &self.theme, self.geometry);
+                            opts.width = width;
+                            opts.padding_x = 8;
+                            opts.padding_y = 7;
+                            opts.font_size = 25.0;
+                            opts.line_height = 34.0;
+                            collect(std::slice::from_ref(cell), opts, x, y);
+                        }
+                        x += width + 1;
+                    }
+                    y += table.row_heights[row] + 1;
+                }
+            }
+            _ => {}
+        }
+        result
     }
 
     fn render_item(
@@ -543,6 +655,7 @@ impl MarkupDocument {
 pub struct MarkupPage {
     pub image: RgbaImage,
     pub highlights: Vec<crate::compositor::HighlightRect>,
+    pub links: Vec<crate::compositor::LinkRegion>,
 }
 
 fn parse_markdown(
@@ -1079,15 +1192,28 @@ fn push_inline_segment(lines: &mut [Vec<InlineSpan>], inline: &InlineSpan, segme
 }
 
 fn joined_lines(lines: &[Vec<InlineSpan>]) -> Vec<TextSpan> {
+    joined_inline_lines(lines)
+        .into_iter()
+        .map(|inline| inline.span)
+        .collect()
+}
+
+fn joined_inline_lines(lines: &[Vec<InlineSpan>]) -> Vec<InlineSpan> {
     let mut spans = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         if index > 0 {
-            spans.push(TextSpan::plain("\n"));
+            spans.push(InlineSpan {
+                span: TextSpan::plain("\n"),
+                href: None,
+            });
         }
-        spans.extend(line.iter().map(|inline| inline.span.clone()));
+        spans.extend(line.iter().cloned());
     }
     if spans.is_empty() {
-        spans.push(TextSpan::plain(" "));
+        spans.push(InlineSpan {
+            span: TextSpan::plain(" "),
+            href: None,
+        });
     }
     spans
 }
@@ -2202,6 +2328,53 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn rendered_links_cover_wrapped_styled_text_lists_quotes_and_tables() {
+        let source = format!(
+            "# Target\n\nplain [first **bold** 中文](https://example.com/one) gap [second](https://example.com/two)\n\n[{}](https://example.com/wrapped)\n\n- [list](https://example.com/list)\n\n> [quote](https://example.com/quote)\n\n| Header | Other |\n| --- | --- |\n| [table](https://example.com/table) | ordinary |\n\n[internal](#target)",
+            "long linked text ".repeat(20)
+        );
+        let document = document(&source);
+        let page = document.render_page(0, None).unwrap();
+        for name in ["one", "two", "wrapped", "list", "quote", "table"] {
+            let uri = format!("https://example.com/{name}");
+            assert!(
+                page.links.iter().any(|link| link.target.uri == uri),
+                "missing {name}"
+            );
+        }
+        let wrapped: Vec<_> = page
+            .links
+            .iter()
+            .filter(|link| link.target.uri.ends_with("/wrapped"))
+            .collect();
+        assert!(
+            wrapped
+                .iter()
+                .any(|link| link.rect.y0 != wrapped[0].rect.y0)
+        );
+        let first = &page
+            .links
+            .iter()
+            .find(|link| link.target.uri.ends_with("/one"))
+            .unwrap()
+            .rect;
+        let second = &page
+            .links
+            .iter()
+            .find(|link| link.target.uri.ends_with("/two"))
+            .unwrap()
+            .rect;
+        assert!(first.x0 > document.geometry.margin); // Unlinked prefix remains unclickable.
+        assert!(first.x1 < second.x0);
+        assert!(page.links.iter().any(|link| link.target.page == Some(0)));
+        assert!(
+            page.links
+                .iter()
+                .all(|link| link.rect.x0 < link.rect.x1 && link.rect.y0 < link.rect.y1)
+        );
     }
 
     #[test]

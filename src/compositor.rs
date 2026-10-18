@@ -12,7 +12,10 @@ pub struct PageImage {
     pub width: u32,
     pub height: u32,
     pub row_stride: usize,
+    /// Paper color after inversion, tinting, and custom color mapping.
+    pub background: [u8; 3],
     pub highlights: Vec<HighlightRect>,
+    pub links: Vec<LinkRegion>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -23,7 +26,14 @@ pub struct HighlightRect {
     pub y1: u32,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+/// A clickable link rectangle in the coordinate space of its containing image.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinkRegion {
+    pub rect: HighlightRect,
+    pub target: crate::renderer::LinkInfo,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ViewTransform {
     pub offset_x: u32,
     pub offset_y: u32,
@@ -36,6 +46,7 @@ pub struct ComposedFrame {
     pub rgba: Vec<u8>,
     pub content_width: u32,
     pub content_height: u32,
+    pub links: Vec<LinkRegion>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +119,7 @@ pub struct Composer {
     key: Option<(Arc<PageImage>, WindowSize, bool, bool)>,
     prepared: Option<RgbImage>,
     spare: Vec<u8>,
+    prepared_links: Vec<LinkRegion>,
 }
 
 impl Composer {
@@ -132,8 +144,22 @@ impl Composer {
                 || (transform.fit_to_viewport
                     && (page.width > viewport.page_area_width_px()
                         || page.height > viewport.page_area_height_px()));
+            self.prepared_links = page.links.clone();
             if needs_preparation {
-                self.prepared = Some(prepare_page(&page, viewport, transform)?);
+                let (image, crop) = prepare_page(&page, viewport, transform)?;
+                for link in &mut self.prepared_links {
+                    let scale_x = image.width() as f64 / crop.2 as f64;
+                    let scale_y = image.height() as f64 / crop.3 as f64;
+                    let x = |value: u32| value.saturating_sub(crop.0).min(crop.2) as f64 * scale_x;
+                    let y = |value: u32| value.saturating_sub(crop.1).min(crop.3) as f64 * scale_y;
+                    link.rect = HighlightRect {
+                        x0: x(link.rect.x0).floor() as u32,
+                        y0: y(link.rect.y0).floor() as u32,
+                        x1: x(link.rect.x1).ceil() as u32,
+                        y1: y(link.rect.y1).ceil() as u32,
+                    };
+                }
+                self.prepared = Some(image);
             }
             self.key = Some((
                 page.clone(),
@@ -156,7 +182,7 @@ impl Composer {
                 page.row_stride,
             ),
         };
-        blit(
+        let mut frame = blit(
             pixels,
             content_width,
             content_height,
@@ -164,7 +190,36 @@ impl Composer {
             viewport,
             transform,
             std::mem::take(&mut self.spare),
-        )
+        )?;
+        let width = viewport.page_area_width_px();
+        let height = viewport.page_area_height_px();
+        let sx = transform.offset_x.min(content_width.saturating_sub(width));
+        let sy = transform
+            .offset_y
+            .min(content_height.saturating_sub(height));
+        let dw = content_width.saturating_sub(sx).min(width);
+        let dh = content_height.saturating_sub(sy).min(height);
+        let dx = width.saturating_sub(dw) / 2;
+        let dy = height.saturating_sub(dh) / 2;
+        frame.links = self
+            .prepared_links
+            .iter()
+            .filter_map(|link| {
+                let x = |v: u32| v.saturating_sub(sx).min(dw) + dx;
+                let y = |v: u32| v.saturating_sub(sy).min(dh) + dy;
+                let rect = HighlightRect {
+                    x0: x(link.rect.x0),
+                    y0: y(link.rect.y0),
+                    x1: x(link.rect.x1),
+                    y1: y(link.rect.y1),
+                };
+                (rect.x0 < rect.x1 && rect.y0 < rect.y1).then(|| LinkRegion {
+                    rect,
+                    target: link.target.clone(),
+                })
+            })
+            .collect();
+        Ok(frame)
     }
     pub fn recycle(&mut self, frame: ComposedFrame) {
         self.spare = frame.rgba;
@@ -198,7 +253,7 @@ fn prepare_page(
     page: &PageImage,
     viewport: WindowSize,
     transform: ViewTransform,
-) -> anyhow::Result<RgbImage> {
+) -> anyhow::Result<(RgbImage, (u32, u32, u32, u32))> {
     let width = viewport.page_area_width_px();
     let height = viewport.page_area_height_px();
     let highlights = page.highlights.clone();
@@ -209,8 +264,14 @@ fn prepare_page(
     );
     apply_highlights(&mut image, &highlights);
 
+    let crop = if transform.auto_crop {
+        whitespace_bounds(&image, page.background)
+    } else {
+        None
+    }
+    .unwrap_or((0, 0, image.width(), image.height()));
     if transform.auto_crop {
-        image = crop_whitespace_image(image);
+        image = image::imageops::crop_imm(&image, crop.0, crop.1, crop.2, crop.3).to_image();
     }
 
     let (_, _, image) =
@@ -240,7 +301,7 @@ fn prepare_page(
             (image.width(), image.height(), image)
         };
 
-    Ok(image)
+    Ok((image, crop))
 }
 
 fn blit(
@@ -279,6 +340,7 @@ fn blit(
         rgba,
         content_width,
         content_height,
+        links: Vec::new(),
     })
 }
 
@@ -663,8 +725,10 @@ fn apply_highlights(image: &mut RgbImage, highlights: &[HighlightRect]) {
     }
 }
 
-fn whitespace_bounds(image: &RgbImage) -> Option<(u32, u32, u32, u32)> {
-    const THRESHOLD: u8 = 240;
+fn whitespace_bounds(image: &RgbImage, background: [u8; 3]) -> Option<(u32, u32, u32, u32)> {
+    // Preserve the former near-white tolerance relative to the rendered paper color.
+    const TOLERANCE: u8 = 15;
+    // Leave a small raster-space border around content to avoid clipping antialiased edges.
     const MARGIN: u32 = 8;
     let mut min_x = image.width();
     let mut min_y = image.height();
@@ -672,7 +736,12 @@ fn whitespace_bounds(image: &RgbImage) -> Option<(u32, u32, u32, u32)> {
     let mut max_y = 0;
     let mut found = false;
     for (x, y, pixel) in image.enumerate_pixels() {
-        if pixel.0.iter().any(|channel| *channel < THRESHOLD) {
+        if pixel
+            .0
+            .iter()
+            .zip(background)
+            .any(|(channel, paper)| channel.abs_diff(paper) > TOLERANCE)
+        {
             found = true;
             min_x = min_x.min(x);
             min_y = min_y.min(y);
@@ -695,8 +764,8 @@ fn whitespace_bounds(image: &RgbImage) -> Option<(u32, u32, u32, u32)> {
     })
 }
 
-pub fn crop_whitespace_image(image: RgbImage) -> RgbImage {
-    if let Some((x, y, width, height)) = whitespace_bounds(&image) {
+pub fn crop_whitespace_image(image: RgbImage, background: [u8; 3]) -> RgbImage {
+    if let Some((x, y, width, height)) = whitespace_bounds(&image, background) {
         image::imageops::crop_imm(&image, x, y, width, height).to_image()
     } else {
         image
@@ -713,7 +782,153 @@ mod tests {
             width,
             height,
             row_stride,
+            background: [255; 3],
             highlights: Vec::new(),
+            links: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn link_regions_follow_crop_fit_centering_and_scrolled_clipping() {
+        let mut image = RgbImage::from_pixel(100, 80, Rgb([255; 3]));
+        for y in 20..60 {
+            for x in 30..70 {
+                image.put_pixel(x, y, Rgb([0; 3]));
+            }
+        }
+        let mut source = page(image.into_raw(), 100, 80, 300);
+        source.links.push(LinkRegion {
+            rect: HighlightRect {
+                x0: 30,
+                y0: 20,
+                x1: 70,
+                y1: 60,
+            },
+            target: crate::renderer::LinkInfo {
+                text: "link".into(),
+                uri: "https://example.com".into(),
+                page: None,
+            },
+        });
+        let source = Arc::new(source);
+        let mut composer = Composer::default();
+        for (viewport, transform, expected) in [
+            (
+                WindowSize::from_cells(120, 101, 1, 1),
+                ViewTransform::default(),
+                HighlightRect {
+                    x0: 40,
+                    y0: 30,
+                    x1: 80,
+                    y1: 70,
+                },
+            ),
+            (
+                WindowSize::from_cells(50, 41, 1, 1),
+                ViewTransform {
+                    fit_to_viewport: true,
+                    ..Default::default()
+                },
+                HighlightRect {
+                    x0: 15,
+                    y0: 10,
+                    x1: 35,
+                    y1: 30,
+                },
+            ),
+            (
+                WindowSize::from_cells(56, 57, 1, 1),
+                ViewTransform {
+                    auto_crop: true,
+                    ..Default::default()
+                },
+                HighlightRect {
+                    x0: 8,
+                    y0: 8,
+                    x1: 48,
+                    y1: 48,
+                },
+            ),
+            (
+                WindowSize::from_cells(40, 31, 1, 1),
+                ViewTransform {
+                    offset_x: 50,
+                    offset_y: 40,
+                    ..Default::default()
+                },
+                HighlightRect {
+                    x0: 0,
+                    y0: 0,
+                    x1: 20,
+                    y1: 20,
+                },
+            ),
+        ] {
+            let frame = composer
+                .compose(source.clone(), viewport, transform)
+                .unwrap();
+            assert_eq!(frame.links.len(), 1);
+            assert_eq!(frame.links[0].rect, expected);
+            let x = (expected.x0 + expected.x1) / 2;
+            let y = (expected.y0 + expected.y1) / 2;
+            let pixel = ((y * viewport.page_area_width_px() + x) * 4) as usize;
+            assert_eq!(&frame.rgba[pixel..pixel + 3], &[0; 3]);
+        }
+    }
+
+    #[test]
+    fn auto_crop_removes_inverted_and_tinted_paper_margins() {
+        for (background, foreground) in [
+            ([255, 255, 255], [0, 0, 0]),
+            ([0, 0, 0], [255, 255, 255]),
+            ([245, 230, 200], [112, 66, 20]),
+            ([112, 66, 20], [245, 230, 200]),
+            ([20, 24, 28], [220, 225, 230]),
+            ([40, 60, 80], [210, 190, 170]),
+        ] {
+            let mut image = RgbImage::from_pixel(80, 64, Rgb(background));
+            for y in 24..40 {
+                for x in 28..52 {
+                    image.put_pixel(x, y, Rgb(foreground));
+                }
+            }
+            let cropped = crop_whitespace_image(image.clone(), background);
+            assert_eq!(cropped.dimensions(), (40, 32), "background {background:?}");
+            assert_eq!(cropped.get_pixel(8, 8), &Rgb(foreground));
+
+            let mut page = page(image.into_raw(), 80, 64, 80 * 3);
+            page.background = background;
+            let page = Arc::new(page);
+            let viewport = WindowSize::from_cells(1, 2, 40, 32);
+            let mut composer = Composer::default();
+            for auto_crop in [false, true, false, true] {
+                let frame = composer
+                    .compose(
+                        page.clone(),
+                        viewport,
+                        ViewTransform {
+                            auto_crop,
+                            ..ViewTransform::default()
+                        },
+                    )
+                    .unwrap();
+                let dimensions = if auto_crop { (40, 32) } else { (80, 64) };
+                assert_eq!((frame.content_width, frame.content_height), dimensions);
+            }
+        }
+    }
+
+    #[test]
+    fn auto_crop_preserves_blank_pages_and_content_at_opposite_corners() {
+        for background in [[255; 3], [0; 3], [245, 230, 200], [112, 66, 20]] {
+            let image = RgbImage::from_pixel(80, 64, Rgb(background));
+            assert_eq!(crop_whitespace_image(image.clone(), background), image);
+
+            let mut image = image;
+            let foreground = background.map(|channel| 255 - channel);
+            image.put_pixel(0, 0, Rgb(foreground));
+            image.put_pixel(79, 63, Rgb(foreground));
+            assert_eq!(crop_whitespace_image(image.clone(), background), image);
         }
     }
 
@@ -792,6 +1007,7 @@ mod tests {
             rgba,
             content_width: width,
             content_height: height,
+            links: Vec::new(),
         }
     }
 

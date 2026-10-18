@@ -124,6 +124,19 @@ pub struct RenderOptions {
 }
 
 impl RenderOptions {
+    fn colors(&self) -> (i32, i32) {
+        let (black, white) = if self.tinted {
+            (TINT_BLACK, TINT_WHITE)
+        } else {
+            (self.black, self.white)
+        };
+        if self.inverted {
+            (white, black)
+        } else {
+            (black, white)
+        }
+    }
+
     pub fn for_viewport(viewport: WindowSize, generation: u64) -> Self {
         Self {
             width_px: viewport.page_area_width_px() as f32,
@@ -388,14 +401,16 @@ impl BackendDocument {
         output: &Path,
         auto_crop: bool,
     ) -> Result<(), RenderError> {
-        let image = match self {
+        let page = match self {
             Self::MuPdf { document, .. } => render_loaded_page(document, page, options)?,
             Self::Markup(document) => render_markup_page(document, page, options, None)?,
-        }
-        .into_rgb()
-        .map_err(|error| RenderError::Converting(error.to_string()))?;
+        };
+        let background = page.background;
+        let image = page
+            .into_rgb()
+            .map_err(|error| RenderError::Converting(error.to_string()))?;
         let image = if auto_crop {
-            crop_whitespace_image(image)
+            crop_whitespace_image(image, background)
         } else {
             image
         };
@@ -1161,6 +1176,7 @@ fn render_markup_page(
         None => Arc::new(render_markup_base(document, page_num, search_term)?),
     };
     let mut highlights = rendered.highlights.clone();
+    let mut links = rendered.links.clone();
 
     let requested_zoom = if options.zoom_factor.is_finite() {
         options.zoom_factor.max(1.0)
@@ -1177,7 +1193,10 @@ fn render_markup_page(
     let mut image = if scale > 1.0 + f32::EPSILON {
         let width = (rendered.image.width() as f32 * scale).round().max(1.0) as u32;
         let height = (rendered.image.height() as f32 * scale).round().max(1.0) as u32;
-        for rect in &mut highlights {
+        for rect in highlights
+            .iter_mut()
+            .chain(links.iter_mut().map(|link| &mut link.rect))
+        {
             rect.x0 = (rect.x0 as f32 * scale).round() as u32;
             rect.y0 = (rect.y0 as f32 * scale).round() as u32;
             rect.x1 = (rect.x1 as f32 * scale).round() as u32;
@@ -1192,7 +1211,10 @@ fn render_markup_page(
     for _ in 0..((options.rotation % 360) / 90) {
         let old_height = image.height();
         image = image::imageops::rotate90(&image);
-        for rect in &mut highlights {
+        for rect in highlights
+            .iter_mut()
+            .chain(links.iter_mut().map(|link| &mut link.rect))
+        {
             let previous = *rect;
             rect.x0 = old_height.saturating_sub(previous.y1);
             rect.y0 = previous.x0;
@@ -1202,6 +1224,9 @@ fn render_markup_page(
     }
     apply_markup_colors(&mut image, options);
 
+    // Fixed markup paper margins keep the origin at the transformed paper color.
+    let paper = image.get_pixel(0, 0);
+    let background = [paper[0], paper[1], paper[2]];
     let width = image.width();
     let height = image.height();
     let mut pixels = Vec::with_capacity(width as usize * height as usize * 3);
@@ -1213,19 +1238,14 @@ fn render_markup_page(
         width,
         height,
         row_stride: width as usize * 3,
+        background,
         highlights,
+        links,
     })
 }
 
 fn apply_markup_colors(image: &mut image::RgbaImage, options: &RenderOptions) {
-    let (mut black, mut white) = if options.tinted {
-        (TINT_BLACK, TINT_WHITE)
-    } else {
-        (options.black, options.white)
-    };
-    if options.inverted {
-        std::mem::swap(&mut black, &mut white);
-    }
+    let (black, white) = options.colors();
     if black == MUPDF_BLACK && white == MUPDF_WHITE {
         return;
     }
@@ -1314,14 +1334,8 @@ fn render_loaded_page(
     crate::markup::mermaid::validate_raster_size(w as u32, h as u32)
         .map_err(|e| RenderError::Converting(e.to_string()))?;
     let mut pixmap = page.to_pixmap(&matrix, &Colorspace::device_rgb(), false, false)?;
-    let (black, white) = if options.tinted {
-        (TINT_BLACK, TINT_WHITE)
-    } else {
-        (options.black, options.white)
-    };
-    if options.inverted {
-        pixmap.tint(white, black)?;
-    } else if black != MUPDF_BLACK || white != MUPDF_WHITE {
+    let (black, white) = options.colors();
+    if black != MUPDF_BLACK || white != MUPDF_WHITE {
         pixmap.tint(black, white)?;
     }
     let highlights = search_page(&page, options.search_term.as_deref())?
@@ -1335,12 +1349,42 @@ fn render_loaded_page(
             )
         })
         .collect();
-    copy_pixmap_rgb(&pixmap, highlights)
+    let [_, red, green, blue] = white.to_be_bytes();
+    let mut image = copy_pixmap_rgb(&pixmap, highlights, [red, green, blue])?;
+    if let Ok(links) = page.links() {
+        image.links = links
+            .filter(|link| {
+                [
+                    link.bounds.x0,
+                    link.bounds.y0,
+                    link.bounds.x1,
+                    link.bounds.y1,
+                ]
+                .into_iter()
+                .all(f32::is_finite)
+            })
+            .map(|link| crate::compositor::LinkRegion {
+                rect: highlight_rect(
+                    link.bounds.into(),
+                    &matrix,
+                    pixmap.origin(),
+                    (pixmap.width(), pixmap.height()),
+                ),
+                target: LinkInfo {
+                    text: link.uri.clone(),
+                    uri: link.uri,
+                    page: link.dest.map(|dest| dest.loc.page_number as usize),
+                },
+            })
+            .collect();
+    }
+    Ok(image)
 }
 
 fn copy_pixmap_rgb(
     pixmap: &mupdf::Pixmap,
     highlights: Vec<HighlightRect>,
+    background: [u8; 3],
 ) -> Result<PageImage, RenderError> {
     let width = pixmap.width();
     let height = pixmap.height();
@@ -1366,7 +1410,9 @@ fn copy_pixmap_rgb(
         width,
         height,
         row_stride,
+        background,
         highlights,
+        links: Vec::new(),
     })
 }
 
@@ -1533,6 +1579,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pdf_link_annotations_follow_raster_rotation_and_worker_serialization() {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Annots [4 0 R] >>",
+            "<< /Type /Annot /Subtype /Link /Rect [20 30 60 50] /A << /S /URI /URI (https://example.com/pdf) >> >>",
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{object}\nendobj\n", i + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str("xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+        ));
+        let document = Document::from_bytes(pdf.as_bytes(), "application/pdf").unwrap();
+        for (rotation, width, height, expected) in [
+            (
+                0,
+                200,
+                100,
+                HighlightRect {
+                    x0: 20,
+                    y0: 50,
+                    x1: 60,
+                    y1: 70,
+                },
+            ),
+            (
+                90,
+                100,
+                200,
+                HighlightRect {
+                    x0: 30,
+                    y0: 20,
+                    x1: 50,
+                    y1: 60,
+                },
+            ),
+        ] {
+            let mut options =
+                RenderOptions::for_viewport(WindowSize::from_cells(1, 2, width, height), 1);
+            options.rotation = rotation;
+            let image = render_loaded_page(&document, 0, &options).unwrap();
+            assert_eq!(image.links.len(), 1);
+            assert_eq!(image.links[0].rect, expected);
+            assert_eq!(image.links[0].target.uri, "https://example.com/pdf");
+            let decoded: PageImage =
+                serde_json::from_slice(&serde_json::to_vec(&image).unwrap()).unwrap();
+            assert_eq!(decoded.links, image.links);
+        }
+    }
+
+    #[test]
     #[ignore = "isolated performance measurement"]
     fn audit_bench_cache_hits() {
         let options = RenderOptions::for_viewport(WindowSize::from_cells(80, 24, 10, 20), 1);
@@ -1545,7 +1651,9 @@ mod tests {
                 height: 2640,
                 row_stride: 2040 * 3,
                 pixels: vec![1; 2040 * 2640 * 3],
+                background: [255; 3],
                 highlights: Vec::new(),
+                links: Vec::new(),
             },
         );
         crate::audit_bench::begin_measurement();
@@ -1599,7 +1707,9 @@ mod tests {
             height: 1,
             row_stride: 3,
             pixels: vec![0; 3],
+            background: [255; 3],
             highlights: Vec::new(),
+            links: Vec::new(),
         });
         cache.insert(key.clone(), page.clone());
         assert!(Arc::ptr_eq(&page, &cache.get(&key).unwrap()));
@@ -1767,6 +1877,72 @@ mod tests {
         options.rotation = 90;
         let page = render_markup_page(&document, 0, &options, None).unwrap();
         assert_eq!((page.width, page.height), (2_640, 2_040));
+    }
+
+    #[test]
+    fn auto_crop_mupdf_pages_follows_rendered_colors_and_rotation() {
+        let document = Document::from_bytes(
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="64">
+                <rect x="28" y="24" width="24" height="16" fill="#000"/>
+            </svg>"##,
+            "image/svg+xml",
+        )
+        .unwrap();
+        let viewport = WindowSize::from_cells(1, 2, 80, 80);
+        for (black, white) in [(MUPDF_BLACK, MUPDF_WHITE), (0x283c50, 0xd2beaa)] {
+            for (inverted, tinted) in [(false, false), (true, false), (false, true), (true, true)] {
+                for rotation in [0, 90] {
+                    let mut options = RenderOptions::for_viewport(viewport, 1);
+                    options.black = black;
+                    options.white = white;
+                    options.inverted = inverted;
+                    options.tinted = tinted;
+                    options.rotation = rotation;
+                    let page = render_loaded_page(&document, 0, &options).unwrap();
+                    let background = page.background;
+                    assert_eq!(&page.pixels[..3], &background);
+                    let image = crop_whitespace_image(page.into_rgb().unwrap(), background);
+                    let expected = if rotation == 0 { (40, 32) } else { (32, 40) };
+                    assert_eq!(image.dimensions(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auto_crop_markup_and_exports_follow_inversion_tint_and_paper_theme() {
+        let viewport = WindowSize::from_cells(80, 24, 10, 20);
+        for theme in [ThemeMode::Light, ThemeMode::Dark] {
+            let document = MarkupDocument::parse(
+                "# Crop\n\npage margins",
+                Path::new("."),
+                "crop",
+                MarkupKind::Markdown,
+                theme,
+                false,
+            )
+            .unwrap();
+            let backend = BackendDocument::Markup(document.clone());
+            let mut base = MarkupBase::default();
+            for (inverted, tinted) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut options = RenderOptions::for_viewport(viewport, 1);
+                options.inverted = inverted;
+                options.tinted = tinted;
+                let page = render_markup_page(&document, 0, &options, Some(&mut base)).unwrap();
+                let background = page.background;
+                assert_eq!(&page.pixels[..3], &background);
+                let image = crop_whitespace_image(page.into_rgb().unwrap(), background);
+                assert!(image.width() < 2_040 && image.height() < 2_640);
+
+                let output = temp_file("png");
+                backend.export_page(0, &options, &output, true).unwrap();
+                assert_eq!(
+                    image::image_dimensions(&output).unwrap(),
+                    image.dimensions()
+                );
+                fs::remove_file(output).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -2111,7 +2287,9 @@ mod tests {
                     width: 1,
                     height: 1,
                     row_stride: 3,
+                    background: [255; 3],
                     highlights: Vec::new(),
+                    links: Vec::new(),
                 },
             );
         }

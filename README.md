@@ -1,16 +1,15 @@
 # vvrd
 
-`vvrd` is a full-screen PDF, EPUB, Markdown, Mermaid, and optional office-document reader for the Vivido
-terminal. MuPDF handles PDF/EPUB; the built-in Markdown/Mermaid backend paginates markup onto fixed
-portrait Letter pages (2040×2640 pixels at 240 DPI, with 180-pixel margins); PPTX, DOCX, ODP, and
-ODT files are converted to PDF once per distinct content by a headless LibreOffice and then read
-like any PDF. Page pixels use the Vivid 1.5 side
-channel, never terminal escape sequences. The same binary runs directly in Vivido and in a remote
-shell reached with `vvssh`.
-(Nested operation in vvmux panes returns once vvmux migrates to Vivid 1.5.)
+**Every document, in your terminal.**
+
+vvrd is a fast, full-screen document reader for the [Vivido](https://vivido.dev) terminal. Open a
+PDF, an EPUB, a Markdown file, a Mermaid diagram, or a PowerPoint deck, and it shows up as crisp,
+print-quality pages right where you're working. You don't need a separate viewer window or a
+browser tab, and nothing gets mangled into ASCII art.
 
 ```sh
 cargo install vvrd
+vvrd paper.pdf
 vvrd book.epub
 vvrd --page 12 paper.pdf
 vvrd --theme dark guide.md
@@ -20,49 +19,86 @@ vvrd deck.pptx
 vvrd --export paper.pdf
 ```
 
-Vivido and vvssh provide `VIVID_ENDPOINT_CONTROL`, optional `VIVID_ENDPOINT_BULK`, and
-`VIVID_ROOT_SECRET`; vvrd discovers them automatically and never puts the secret on the wire. `--dry-run` exercises the renderer and protocol
-without a live presenter. `--trace DIR` writes Vivid control and raster streams for debugging.
+▶ [Watch vvrd working alongside AI agents](https://youtu.be/Qa1DrxK1Bu8)
 
-## Controls
+## Why vvrd
+
+- **Real pages, not approximations.** vvrd renders actual pixels at full resolution, with real
+  fonts, real figures, and real typography.
+- **One reader for everything.** PDF, EPUB, Markdown, Mermaid, PPTX, DOCX, ODP, and ODT all open
+  with the same command and the same keys.
+- **Live Markdown preview.** Write in your editor in one pane and keep `vvrd notes.md` open in the
+  next. Every save repaginates within a moment, and a broken edit never blanks the screen.
+- **Mermaid without the baggage.** Flowcharts, sequence, class, state, ER, Gantt, pie, mindmap,
+  timeline, and more come from a built-in Rust engine. There's no Node, no headless browser, and
+  no network.
+- **Works where you work.** The same binary runs locally, on a remote machine over `vvssh`, and
+  inside a `vvmux` pane. Your remote PDFs appear on your local screen.
+- **Remembers your place.** Every document reopens at the page you left it on.
+
+## Built for developers
+
+- **A home for your agent's output.** Have an AI agent write its report as Markdown with Mermaid
+  diagrams, then read it as a typeset document instead of a scrolling wall of text.
+- **Review docs before you push.** READMEs, design docs, and architecture diagrams render the way
+  a reader will see them, with GFM tables, task lists, code blocks, and local images.
+- **Script it.** `vvrd --export` turns any page into a PNG, and `--preview` embeds vvrd in file
+  managers such as [vfm](https://github.com/wensheng/vfm).
+- **A clean terminal.** Page pixels travel on Vivid Protocol's authenticated side channel, never
+  as escape sequences in your PTY, so your terminal session never gets corrupted.
+
+## Quick start
+
+```sh
+vvrd book.epub                 # paginated like print
+vvrd --page 12 paper.pdf       # jump straight to a page
+vvrd --theme dark design.md    # Markdown on dark paper
+vvrd architecture.mmd          # a Mermaid diagram, centred on the page
+vvrd deck.pptx                 # slides, via LibreOffice
+vvrd --export paper.pdf        # save the current page as PNG
+```
+
+## Keys
 
 | Key | Action |
 |---|---|
-| Left | Previous page |
-| Right, Space | next page |
-| Up/Down | Scroll; turn at the page boundary |
-| `j`/`k` | Next/previous page without scrolling |
-| `h`/`l` | Page turn, or horizontal pan in zoom mode |
-| PageUp/PageDown | Page turn, or viewport jump in zoom mode |
+| ← / → / Space, or click outside a link | Previous / next page |
+| Left click on a link | Open local documents in vvrd; open web links in the default browser |
+| ↑ / ↓ | Scroll, turning at page edges |
 | `g` | Go to page |
-| `z`, `o`/`O` | Toggle zoom; zoom in/out |
-| `<`/`>` | Decrease/increase EPUB font size |
-| `i`, `r`, `c`, `d` | Invert, rotate, auto-crop, warm tint |
-| `/`, `n`/`N` | Search; next/previous matching page |
-| `t`, `M`, `f`, `?` | TOC, metadata, links, help |
-| `e` | Export the current page as PNG |
-| `R` or F5 | Manually reread and repaginate the document and local assets |
-| `q`, Esc, Ctrl-C | Quit |
+| `/`, `n` / `N` | Search, then next / previous match |
+| `t` · `f` · `M` | Table of contents · links · metadata |
+| `z`, `o` / `O` | Zoom, then zoom in / out |
+| `i` · `d` · `c` · `r` | Invert · warm tint · auto-crop margins · rotate |
+| `<` / `>` | EPUB font size |
+| `e` | Export the page as PNG |
+| `R` / F5 | Reload |
+| `?` | All keys |
+| `q` | Quit |
 
-Reader state is saved per document in the platform cache directory. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the transport and compositor design.
+Local Markdown, PDF, EPUB, Mermaid, and Office document links open directly in vvrd.
+Relative Markdown links resolve from the current document’s directory. Missing files leave the
+current document open; an unreadable linked document returns to the previous document.
 
-Markdown supports GFM tables, strikethrough, task lists, autolinks, styled inline/code text,
-blockquotes, local raster/SVG/data-URI images, and fenced Mermaid. Remote images are represented by
-an in-page placeholder and are never fetched. `--theme light|dark` selects the Markdown/Mermaid
-paper theme (default: `light`); `-l`/`--landscape` paginates Markdown and Mermaid onto landscape
-2640×2040 Letter pages and lays out reflowable HTML/EPUB wider than tall. The existing invert,
-tint, colour mapping, rotation, crop, search, TOC, links, zoom/pan, state restore, and PNG export
-controls apply to markup pages too. A failed reload leaves the previous document visible.
-During interactive viewing, vvrd watches Markdown (`.md`, `.markdown`, `.mkd`), DOCX, and PPTX
-sources and automatically performs the same transactional reload after a short save debounce.
-Only the opened source is watched; use `R`/F5 after changing a linked local asset.
+## Install
 
-PPTX, DOCX, ODP, and ODT documents require LibreOffice. The Vivido installer does not bundle or
-require LibreOffice; vvrd reports that Office document support is disabled when LibreOffice is not
-installed. When it is available, vvrd locates the `soffice` launcher on `PATH` or in the standard
-install location per platform (override with `VVRD_SOFFICE`) and converts headlessly to a PDF cached under
-the platform cache directory keyed by the source content hash (override with `VVRD_OFFICE_CACHE`).
-Converted documents support the full fixed-layout feature set — search, TOC, links, zoom, rotation,
-export — and DOCX/PPTX sources are reconverted automatically when they change. `R`/F5 remains
-available as a manual fallback; ODP and ODT sources require it.
+The Vivido installers already include vvrd. Otherwise, use Cargo:
+
+```sh
+cargo install vvrd
+```
+
+For PPTX, DOCX, ODP, and ODT files, install [LibreOffice](https://www.libreoffice.org/). vvrd
+finds it on its own, converts each document once, and caches the result. Every other format works
+without LibreOffice.
+
+## Learn more
+
+- [`docs/help.md`](docs/help.md) covers every option, format detail, and environment variable.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains how vvrd streams pages over Vivid 1.5.
+  It's a good starting point if you want to build your own terminal media app with
+  [`vivid_sdk`](https://crates.io/crates/vivid_sdk).
+
+## License
+
+[AGPL-3.0](LICENSE). Third-party notices are in [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).

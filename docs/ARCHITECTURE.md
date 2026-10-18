@@ -138,6 +138,18 @@ raw full frame and 192,112 bytes as a raw copy-plus-strip delta, an 86.95% reduc
 outside the raster source, the terminal cursor is hidden, and full-screen overlays hide the node;
 those changes correctly generate zero raster bytes rather than artificial overwrite rectangles.
 
+Clickable regions travel with each rendered page through worker IPC. MuPDF annotation bounds use
+the raster matrix and pixmap origin; Markdown regions use the same shaped spans as rasterization.
+The compositor applies crop, scale, centering and viewport clipping to those regions. Clicks use
+only the submitted frame whose image, viewport and transform still match the current view;
+terminal cell overlap accommodates links smaller than a character cell.
+
+Local document navigation saves the current reading state and tears down its worker, watcher and
+presentation session before opening the linked document in the same vvrd process. This gives each
+document its own path, title, capture policy, reload watcher and export destination. Failed opens
+return to the previous document with an error in the status bar. Process-wide logging, font loading
+and panic cleanup are installed once.
+
 ### D4 — Full-screen alt-screen + grid-cell node; text overlays hide the node
 vvrd is a full-screen TUI: it enters the alternate screen, hides the cursor, and reserves the last
 row for a status bar. Because it owns its whole surface, it uses **grid-cell coordinates**
@@ -190,6 +202,10 @@ matrix and pixmap origin. The Vivid compositor borrows page pixels, retains one 
 crop/highlight/scale result, reuses viewport and delta buffers, and compares translated rows
 without allocating a reference framebuffer. Identical frames send no media except when a full
 recovery frame is required.
+
+Each page carries its rendered paper color through worker IPC. Margin cropping compares pixels
+against that color with a small tolerance, so inversion, tinting, custom colors, and dark markup
+paper work in both the viewport and PNG exports.
 
 ### D5a — vvrd owns MuPDF's system-font lookups
 MuPDF asks for a substitute font whenever it meets a character no loaded face covers, and it only
@@ -586,7 +602,7 @@ core design; §Verification calls out explicit tiled/floating-pane test cases.
 | Rotate 90° | MuPDF matrix or markup raster rotation |
 | Search + highlight + n/N + cross-page counts | MuPDF text quads or markup page semantics; highlight composited into buffer |
 | Table of contents (+ mouse) | MuPDF outlines or Markdown heading slugs; full-screen overlay |
-| Metadata / links / follow links | MuPDF extraction or markup semantics; scrubbed external opener |
+| Metadata / links / follow links | MuPDF annotations or shaped Markdown link regions; local document links reopen in vvrd; web links use the scrubbed system opener; internal links navigate within the document |
 | Go-to-page, PgUp/PgDn, arrows, hjkl, space | Same `App` key handling |
 | EPUB reflow + font size `<`/`>` | Renderer EPUB layout path (unchanged) |
 | State persistence (XDG) | `state.rs` (unchanged) |

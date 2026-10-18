@@ -60,12 +60,29 @@ const SEMANTIC_AVAILABLE_OUTLINE: u64 = 1 << 3;
 // negotiated settled geometry normally wins and cancels this local terminal-size fallback.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 const LOADING_DELAY: Duration = Duration::from_millis(90);
+/// How long the preview loop waits for a pane command before servicing renderer events again.
+///
+/// Matches the interactive loop's input poll, so page turns are equally responsive.
+const PANE_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
     /// PDF, EPUB, Markdown, Mermaid, PPTX, DOCX, ODP, or ODT document to read.
     document: PathBuf,
+
+    /// With --preview: the pane's COLUMNS ROWS [COLUMN ROW] in grid cells, as file managers
+    /// append them after the document.
+    #[arg(requires = "preview")]
+    pane: Vec<u16>,
+
+    /// Show the document in a file manager's preview pane instead of full screen.
+    ///
+    /// Nothing is drawn in the terminal and no reader state is saved. Stdin takes one command
+    /// per line: `next`, `prev`, `first`, `last`, and `hide`/`show` while the pane is covered.
+    /// The preview ends when stdin closes.
+    #[arg(long, conflicts_with_all = ["export", "probe_document"])]
+    preview: bool,
 
     /// Page number to open (one-based; overrides saved state).
     #[arg(short = 'p', long = "page")]
@@ -126,6 +143,40 @@ impl From<ThemeArg> for ThemeMode {
     }
 }
 
+/// A file manager's preview pane, in grid cells from the viewport's upper-left corner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pane {
+    column: u16,
+    row: u16,
+    columns: u16,
+    rows: u16,
+}
+
+/// A line a file manager writes to a preview's stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneCommand {
+    Next,
+    Prev,
+    First,
+    Last,
+    /// `false` while something covers the pane.
+    Visible(bool),
+}
+
+impl PaneCommand {
+    fn parse(line: &str) -> Option<Self> {
+        Some(match line.trim() {
+            "next" => Self::Next,
+            "prev" => Self::Prev,
+            "first" => Self::First,
+            "last" => Self::Last,
+            "hide" => Self::Visible(false),
+            "show" => Self::Visible(true),
+            _ => return None,
+        })
+    }
+}
+
 struct Runtime {
     app: App,
     viewport: WindowSize,
@@ -136,6 +187,8 @@ struct Runtime {
     /// undoing a newer authoritative target change after detach/reattach.
     target_generation: u64,
     current_image: Option<(usize, u64, Arc<PageImage>)>,
+    shown_view: Option<vivid_thread::ShownView>,
+    next_document: Option<PathBuf>,
     pending_resize: Option<(u16, u16, Instant)>,
     interactive: bool,
     /// Whether the terminal currently has room for a page and its status row. While it does not,
@@ -146,6 +199,8 @@ struct Runtime {
     semantic: Arc<semantic::SemanticControl>,
     document_revision: u64,
     render_pending: bool,
+    /// A file manager covered the preview pane; pages arrive but stay hidden.
+    covered: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,31 +217,72 @@ fn main() -> anyhow::Result<()> {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--paginate-worker")) {
         return render_process::pagination_main().map_err(Into::into);
     }
-    let cli = Cli::parse();
-    validate_cli(&cli)?;
-    validate_document_capabilities(&cli.document, office::find_soffice().is_some())?;
-    // Before any document is opened: MuPDF caches resolved fonts per context, so a loader
-    // installed later would not be consulted for faces already looked up.
+    let mut cli = Cli::parse();
+    // Install the font loader and process-wide hooks once, across document navigation.
     mupdf_fonts::install();
+    let _logger =
+        flexi_logger::Logger::try_with_str(if cli.verbose { "debug" } else { "warn" })?.start()?;
+    let old_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        terminal::reset_terminal();
+        old_hook(info);
+    }));
+    read_documents(&mut cli, read_document)
+}
+
+/// Navigate without nesting readers; a failed linked document returns to the previous one.
+fn read_documents(
+    cli: &mut Cli,
+    mut read: impl FnMut(&Cli, Option<String>) -> anyhow::Result<Option<PathBuf>>,
+) -> anyhow::Result<()> {
+    let mut previous = None;
+    let mut notice = None;
+    loop {
+        match read(cli, notice.take()) {
+            Ok(Some(path)) => {
+                previous = Some(std::mem::replace(&mut cli.document, path));
+                cli.page = None;
+            }
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                let Some(path) = previous.take() else {
+                    return Err(error);
+                };
+                cli.document = path;
+                notice = Some(format!("cannot open linked document: {error}"));
+            }
+        }
+    }
+}
+
+fn read_document(cli: &Cli, notice: Option<String>) -> anyhow::Result<Option<PathBuf>> {
+    validate_cli(cli)?;
+    validate_document_capabilities(&cli.document, office::find_soffice().is_some())?;
     if cli.probe_document {
         if renderer::is_epub(&cli.document) {
             renderer::probe_epub(&cli.document)?;
-            return Ok(());
+            return Ok(None);
         }
         let rendered = renderer::render_page(
             &cli.document,
             cli.page.unwrap_or(1) - 1,
             WindowSize::from_cells(80, 24, 10, 20),
-            paper_style(&cli),
+            paper_style(cli),
         )?;
         let _ = (rendered.page.width, rendered.page_num, rendered.n_pages);
-        return Ok(());
+        return Ok(None);
     }
     probe_document(&cli.document, cli.theme, cli.landscape)?;
 
     let black = parse_color(&cli.black)?;
     let white = parse_color(&cli.white)?;
-    let saved = state::load_state(&cli.document).unwrap_or_default();
+    let pane = pane_of(cli)?;
+    // A preview is a glance: it starts at the top in default colours, whatever was last read.
+    let saved = if pane.is_some() {
+        state::SavedState::default()
+    } else {
+        state::load_state(&cli.document).unwrap_or_default()
+    };
     let initial_page = cli.page.map(|page| page - 1).unwrap_or(saved.page);
 
     if cli.export {
@@ -204,19 +300,17 @@ fn main() -> anyhow::Result<()> {
             viewport,
             options,
             saved.auto_crop,
-            paper_style(&cli),
+            paper_style(cli),
         )?;
         println!("{}", output.display());
-        return Ok(());
+        return Ok(None);
     }
 
     if let Some(trace_dir) = &cli.trace {
         std::fs::create_dir_all(trace_dir)
             .with_context(|| format!("cannot create trace directory {}", trace_dir.display()))?;
     }
-    let _logger =
-        flexi_logger::Logger::try_with_str(if cli.verbose { "debug" } else { "warn" })?.start()?;
-    let session = Session::connect(producer_config(&cli))
+    let session = Session::connect(producer_config(cli))
         .map_err(|error| anyhow::anyhow!("cannot connect to Vivid presenter: {error}"))?;
     ensure!(
         session.info().target_profile == TERMINAL_SURFACE,
@@ -234,6 +328,16 @@ fn main() -> anyhow::Result<()> {
             WindowSize::from_terminal()?
         }
     };
+    // In a pane the page area is the pane; the row WindowSize reserves for status lies outside.
+    let viewport = match pane {
+        Some(pane) => WindowSize::from_cells(
+            pane.columns,
+            pane.rows.saturating_add(1),
+            viewport.cell_width_px,
+            viewport.cell_height_px,
+        ),
+        None => viewport,
+    };
     let target_generation = session.info().target_generation.get();
 
     let mut app = App::new(initial_page);
@@ -242,7 +346,11 @@ fn main() -> anyhow::Result<()> {
     app.tinted = saved.tinted;
     app.auto_crop = saved.auto_crop;
     app.epub_font_size = saved.epub_font_size.unwrap_or(11.0);
-    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if let Some(notice) = notice {
+        app.show_info(notice);
+    }
+    let interactive =
+        pane.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let title = document_title(&cli.document);
     let semantic = Arc::new(semantic::SemanticControl::start(
         title.clone(),
@@ -253,6 +361,8 @@ fn main() -> anyhow::Result<()> {
         viewport,
         target_generation,
         current_image: None,
+        shown_view: None,
+        next_document: None,
         pending_resize: None,
         interactive,
         target_presentable: true,
@@ -261,13 +371,9 @@ fn main() -> anyhow::Result<()> {
         semantic: semantic.clone(),
         document_revision: 1,
         render_pending: false,
+        covered: false,
     };
 
-    let old_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        terminal::reset_terminal();
-        old_hook(info);
-    }));
     let _terminal = interactive
         .then(terminal::TerminalGuard::enter)
         .transpose()?;
@@ -302,18 +408,25 @@ fn main() -> anyhow::Result<()> {
             | SEMANTIC_AVAILABLE_OUTLINE,
         locator_hint: semantic.locator().to_owned(),
     };
-    let vivid = VividThread::spawn(
+    let vivid = VividThread::spawn_in(
         session,
         viewport,
         document_capture_policy(&cli.document),
         descriptor,
         initial_page,
+        pane.map(|pane| (pane.column, pane.row)),
     )?;
     wait_for_presenter(&vivid)?;
-    let render = RenderThread::spawn(cli.document.clone(), viewport, paper_style(&cli));
+    let render = RenderThread::spawn(cli.document.clone(), viewport, paper_style(cli));
     wait_for_document(&render, &mut runtime)?;
     request_render(&render, &vivid, &mut runtime, black, white, interactive)?;
 
+    if pane.is_some() {
+        run_pane_loop(&render, &vivid, &mut runtime, black, white)?;
+        render.shutdown();
+        vivid.shutdown();
+        return Ok(None);
+    }
     if interactive {
         run_event_loop(
             &cli.document,
@@ -346,7 +459,97 @@ fn main() -> anyhow::Result<()> {
     drop(source_watcher);
     render.shutdown();
     vivid.shutdown();
-    Ok(())
+    Ok(runtime.next_document)
+}
+
+/// The pane a `--preview` run is confined to, or `None` for the full-screen reader.
+fn pane_of(cli: &Cli) -> anyhow::Result<Option<Pane>> {
+    if !cli.preview {
+        return Ok(None);
+    }
+    let (columns, rows, column, row) = match cli.pane[..] {
+        [columns, rows] => (columns, rows, 0, 0),
+        [columns, rows, column, row] => (columns, rows, column, row),
+        _ => bail!("--preview needs the pane's COLUMNS ROWS [COLUMN ROW] after the document"),
+    };
+    ensure!(
+        columns > 0 && rows > 0,
+        "--preview pane must be at least one cell"
+    );
+    Ok(Some(Pane {
+        column,
+        row,
+        columns,
+        rows,
+    }))
+}
+
+/// Serves a file manager's preview pane until its stdin closes.
+///
+/// Stdin is read on its own thread, which ends at end of input and so disconnects the channel.
+fn run_pane_loop(
+    render: &RenderThread,
+    vivid: &VividThread,
+    runtime: &mut Runtime,
+    black: i32,
+    white: i32,
+) -> anyhow::Result<()> {
+    let (commands, received) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("vvrd-pane-input".to_owned())
+        .spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if let Some(command) = PaneCommand::parse(&line)
+                    && commands.send(command).is_err()
+                {
+                    break;
+                }
+            }
+        })?;
+    let document = Path::new("document");
+    loop {
+        while let Ok(event) = render.events.try_recv() {
+            handle_render_event(document, render, vivid, runtime, event, black, white)?;
+        }
+        while let Ok(event) = vivid.events.try_recv() {
+            handle_present_event(render, vivid, runtime, event, black, white)?;
+        }
+        if runtime.render_pending {
+            request_render(render, vivid, runtime, black, white, false)?;
+        }
+        let command = match received.recv_timeout(PANE_POLL) {
+            Ok(command) => command,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+        let turned = match command {
+            PaneCommand::Next => runtime.app.next_page(),
+            PaneCommand::Prev => runtime.app.prev_page(),
+            PaneCommand::First => runtime.app.go_to_page(0),
+            // Before an EPUB is fully paginated its last page is unknown; stay put until it is.
+            PaneCommand::Last => {
+                runtime.app.pagination_complete
+                    && runtime
+                        .app
+                        .go_to_page(runtime.app.n_pages.saturating_sub(1))
+            }
+            PaneCommand::Visible(false) => {
+                runtime.covered = true;
+                hide_node(vivid, runtime)?;
+                false
+            }
+            PaneCommand::Visible(true) => {
+                runtime.covered = false;
+                show_current(vivid, runtime)?;
+                false
+            }
+        };
+        if turned {
+            request_render(render, vivid, runtime, black, white, false)?;
+        }
+    }
 }
 
 fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
@@ -524,7 +727,8 @@ fn request_render(
     draw_loading: bool,
 ) -> anyhow::Result<()> {
     match loading_policy(
-        draw_loading,
+        // Only a terminal the reader owns can show a placeholder.
+        draw_loading && runtime.interactive,
         runtime.current_image.is_some(),
         current_image_is_ready(runtime),
         current_image_shows_another_page(runtime),
@@ -788,7 +992,7 @@ fn run_event_loop(
                     _ => {}
                 }
             }
-            Ok(false)
+            Ok(runtime.next_document.is_some())
         })();
         match tick {
             Ok(true) => return Ok(()),
@@ -814,6 +1018,23 @@ fn handle_mouse(
     black: i32,
     white: i32,
 ) -> anyhow::Result<()> {
+    if matches!(runtime.app.input_mode, InputMode::Normal) {
+        let rerender = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(link) = clicked_link(runtime, mouse.column, mouse.row).cloned() {
+                    follow_link(render, vivid, runtime, &link, black, white)?;
+                    return Ok(());
+                }
+                runtime.app.next_page()
+            }
+            MouseEventKind::Down(MouseButton::Right) => runtime.app.prev_page(),
+            _ => false,
+        };
+        if rerender {
+            request_render(render, vivid, runtime, black, white, true)?;
+        }
+        return Ok(());
+    }
     let InputMode::Toc { selected } = runtime.app.input_mode else {
         return Ok(());
     };
@@ -972,7 +1193,9 @@ fn handle_present_event(
             frame_id,
             content_width,
             content_height,
+            view,
         } => {
+            runtime.shown_view = Some(view);
             log::debug!("presented frame {frame_id}");
             runtime
                 .app
@@ -1021,7 +1244,10 @@ fn handle_present_event(
 }
 
 fn show_current(vivid: &VividThread, runtime: &mut Runtime) -> anyhow::Result<()> {
-    if !matches!(runtime.app.input_mode, InputMode::Normal) || !runtime.target_presentable {
+    if !matches!(runtime.app.input_mode, InputMode::Normal)
+        || !runtime.target_presentable
+        || runtime.covered
+    {
         return Ok(());
     }
     let Some((_, _, image)) = &runtime.current_image else {
@@ -1038,12 +1264,7 @@ fn show_current(vivid: &VividThread, runtime: &mut Runtime) -> anyhow::Result<()
     vivid.commands.send(PresentCmd::ShowView {
         image: Arc::clone(image),
         viewport: runtime.viewport,
-        transform: ViewTransform {
-            offset_x: runtime.app.pan_x,
-            offset_y: runtime.app.scroll_y,
-            auto_crop: runtime.app.auto_crop,
-            fit_to_viewport: !runtime.app.zoom_mode,
-        },
+        transform: view_transform(runtime),
     })?;
     draw_status(runtime)
 }
@@ -1213,14 +1434,7 @@ fn handle_key(
                         .cloned();
                     runtime.app.input_mode = InputMode::Normal;
                     if let Some(link) = selected {
-                        if let Some(page) = link.page {
-                            runtime.app.go_to_page(page);
-                            request_render(render, vivid, runtime, black, white, true)?;
-                        } else {
-                            open_url(&link.uri);
-                            runtime.app.show_info(format!("opened {}", link.uri));
-                            show_current(vivid, runtime)?;
-                        }
+                        follow_link(render, vivid, runtime, &link, black, white)?;
                     } else {
                         show_current(vivid, runtime)?;
                     }
@@ -1412,12 +1626,101 @@ fn handle_key(
     Ok(false)
 }
 
-fn open_url(url: &str) {
+fn clicked_link(runtime: &Runtime, column: u16, row: u16) -> Option<&renderer::LinkInfo> {
+    if !runtime.node_visible || !runtime.target_presentable || !current_image_is_ready(runtime) {
+        return None;
+    }
+    let view = runtime.shown_view.as_ref()?;
+    let (_, _, image) = runtime.current_image.as_ref()?;
+    if !Arc::ptr_eq(image, &view.image)
+        || view.viewport != runtime.viewport
+        || view.transform != view_transform(runtime)
+    {
+        return None;
+    }
+    view.link_at(column, row)
+}
+
+fn view_transform(runtime: &Runtime) -> ViewTransform {
+    ViewTransform {
+        offset_x: runtime.app.pan_x,
+        offset_y: runtime.app.scroll_y,
+        auto_crop: runtime.app.auto_crop,
+        fit_to_viewport: !runtime.app.zoom_mode,
+    }
+}
+
+fn follow_link(
+    render: &RenderThread,
+    vivid: &VividThread,
+    runtime: &mut Runtime,
+    link: &renderer::LinkInfo,
+    black: i32,
+    white: i32,
+) -> anyhow::Result<()> {
+    if let Some(page) = link.page {
+        runtime.app.go_to_page(page);
+        request_render(render, vivid, runtime, black, white, true)?;
+    } else if let Some(path) = local_document_link(&link.uri) {
+        if path.is_file() {
+            runtime.next_document = Some(path);
+        } else {
+            runtime
+                .app
+                .show_info(format!("document does not exist: {}", path.display()));
+            show_current(vivid, runtime)?;
+        }
+    } else {
+        match open_url(&link.uri) {
+            Ok(()) => runtime.app.show_info(format!("opened {}", link.uri)),
+            Err(error) => runtime.app.show_info(format!("cannot open link: {error}")),
+        }
+        show_current(vivid, runtime)?;
+    }
+    Ok(())
+}
+
+/// Classify local reader formats without treating remote URLs as local paths.
+fn local_document_link(uri: &str) -> Option<PathBuf> {
+    // Markdown has already resolved relative hrefs against its source directory.
+    // URI schemes belong to the system opener; a Windows drive prefix is a local path.
+    if let Some((scheme, _)) = uri.split_once(':')
+        && !(scheme.len() == 1 && scheme.as_bytes()[0].is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let path = Path::new(uri);
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "md" | "markdown"
+            | "mkd"
+            | "mmd"
+            | "mermaid"
+            | "pdf"
+            | "epub"
+            | "pptx"
+            | "docx"
+            | "odp"
+            | "odt"
+    )
+    .then(|| path.to_owned())
+}
+
+fn open_url(url: &str) -> std::io::Result<()> {
+    if url.is_empty() || url.starts_with('-') || url.chars().any(char::is_control) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid link target",
+        ));
+    }
     #[cfg(target_os = "macos")]
     let command = "open";
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    let command = "explorer.exe";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let command = "xdg-open";
-    let _ = child_process::scrub(&mut Command::new(command))
+    let mut child = child_process::scrub(&mut Command::new(command))
         .arg(url)
         .env_remove("VIVID_ROOT_SECRET")
         .env_remove("VIVID_TOKEN")
@@ -1428,12 +1731,152 @@ fn open_url(url: &str) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .spawn()?;
+    // Reap the launcher without blocking the reader while the browser starts.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_reader_links_stay_in_vvrd_and_web_links_stay_external() {
+        for path in [
+            "docs/ARCHITECTURE.md",
+            "../guide.MARKDOWN",
+            "/tmp/a book.pdf",
+            "diagram.mmd",
+            "book.epub",
+            "deck.pptx",
+        ] {
+            assert_eq!(local_document_link(path), Some(PathBuf::from(path)));
+        }
+        for uri in [
+            "https://example.com/guide.md",
+            "http://example.com/book.pdf",
+            "mailto:reader@example.com",
+            "custom:guide.md",
+            "image.png",
+        ] {
+            assert_eq!(local_document_link(uri), None);
+        }
+    }
+
+    #[test]
+    fn readme_architecture_link_resolves_to_a_readable_local_document() {
+        use markup::markdown::{MarkupDocument, MarkupKind};
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let document = MarkupDocument::open(
+            &directory.join("README.md"),
+            MarkupKind::Markdown,
+            ThemeMode::Light,
+            false,
+        )
+        .unwrap();
+        let link = (0..document.page_count())
+            .flat_map(|page| document.page_links(page))
+            .find(|link| link.uri.ends_with("docs/ARCHITECTURE.md"))
+            .unwrap();
+        let path = local_document_link(&link.uri).unwrap();
+        assert_eq!(path, directory.join("docs/ARCHITECTURE.md"));
+        let linked =
+            MarkupDocument::open(&path, MarkupKind::Markdown, ThemeMode::Light, false).unwrap();
+        assert!(linked.page_count() > 0);
+        assert!(linked.page_text(0).contains("Architecture"));
+    }
+
+    #[test]
+    fn navigation_clears_startup_page_and_recovers_from_a_failed_link() {
+        let mut cli =
+            Cli::try_parse_from(["vvrd", "--page", "3", "--theme", "dark", "README.md"]).unwrap();
+        let mut opened = Vec::new();
+        read_documents(&mut cli, |cli, notice| {
+            opened.push(cli.document.clone());
+            assert_eq!(cli.theme, ThemeArg::Dark);
+            match opened.len() {
+                1 => {
+                    assert_eq!(cli.page, Some(3));
+                    Ok(Some(PathBuf::from("docs/ARCHITECTURE.md")))
+                }
+                2 => {
+                    assert_eq!(cli.page, None);
+                    Ok(Some(PathBuf::from("broken.md")))
+                }
+                3 => bail!("invalid Markdown source"),
+                4 => {
+                    assert_eq!(cli.document, PathBuf::from("docs/ARCHITECTURE.md"));
+                    assert!(notice.unwrap().contains("invalid Markdown source"));
+                    Ok(None)
+                }
+                _ => panic!("navigation must stop after quitting"),
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            opened,
+            [
+                "README.md",
+                "docs/ARCHITECTURE.md",
+                "broken.md",
+                "docs/ARCHITECTURE.md"
+            ]
+            .map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn preview_takes_the_pane_after_the_document() {
+        let pane = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["vvrd", "--dry-run", "--preview"].iter().chain(args))?;
+            pane_of(&cli)
+                .map_err(|error| clap::Error::raw(clap::error::ErrorKind::ValueValidation, error))
+        };
+        assert_eq!(
+            pane(&["doc.pdf", "48", "20", "51", "2"]).unwrap(),
+            Some(Pane {
+                column: 51,
+                row: 2,
+                columns: 48,
+                rows: 20
+            })
+        );
+        assert_eq!(
+            pane(&["doc.pdf", "10", "5"])
+                .unwrap()
+                .map(|pane| (pane.column, pane.row)),
+            Some((0, 0))
+        );
+        for bad in [
+            &["doc.pdf"][..],
+            &["doc.pdf", "10"],
+            &["doc.pdf", "0", "5"],
+            &["doc.pdf", "x", "5"],
+        ] {
+            assert!(pane(bad).is_err(), "{bad:?}");
+        }
+        // Pane cells only make sense for a preview; the full-screen reader takes one document.
+        assert!(Cli::try_parse_from(["vvrd", "doc.pdf", "10", "5"]).is_err());
+        let reader = Cli::try_parse_from(["vvrd", "doc.pdf"]).unwrap();
+        assert_eq!(pane_of(&reader).unwrap(), None);
+    }
+
+    #[test]
+    fn pane_commands_are_one_word_lines() {
+        assert_eq!(PaneCommand::parse("next\n"), Some(PaneCommand::Next));
+        assert_eq!(PaneCommand::parse("prev"), Some(PaneCommand::Prev));
+        assert_eq!(PaneCommand::parse(" first "), Some(PaneCommand::First));
+        assert_eq!(PaneCommand::parse("last"), Some(PaneCommand::Last));
+        assert_eq!(
+            PaneCommand::parse("hide"),
+            Some(PaneCommand::Visible(false))
+        );
+        assert_eq!(PaneCommand::parse("show"), Some(PaneCommand::Visible(true)));
+        assert_eq!(PaneCommand::parse("quit"), None);
+    }
 
     #[test]
     fn parses_css_colors_for_mupdf() {

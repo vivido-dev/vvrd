@@ -36,7 +36,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         if ENABLED.load(Ordering::Relaxed) {
-            let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+            let _ = LIVE.try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
                 Some(live.saturating_sub(layout.size()))
             });
         }
@@ -77,6 +77,8 @@ fn reader_composition_and_delta_workloads() {
                 .map(|i| ((i / (2040 * 3)) % 251) as u8)
                 .collect(),
             highlights: Vec::new(),
+            links: Vec::new(),
+            background: [255; 3],
         });
         let mut composer = Composer::default();
         let mut planner = DeltaPlanner::default();
