@@ -10,6 +10,13 @@ browser tab, and nothing gets mangled into ASCII art.
 ```sh
 cargo install vvrd
 vvrd paper.pdf
+vvrd book.epub
+vvrd --page 12 paper.pdf
+vvrd --theme dark guide.md
+vvrd --landscape guide.md
+vvrd diagram.mmd
+vvrd deck.pptx
+vvrd --export paper.pdf
 ```
 
 ▶ [Watch vvrd working alongside AI agents](https://youtu.be/Qa1DrxK1Bu8)
