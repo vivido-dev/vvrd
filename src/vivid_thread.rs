@@ -9,7 +9,7 @@ use std::{
 use crate::compositor::compose_view;
 use crate::mailbox::{Receiver, Sender};
 use flume::RecvTimeoutError;
-use vivid_protocol::registry;
+use vivid_protocol::messages;
 use vivid_sdk::{Session, SurfaceDescriptor};
 
 use crate::{
@@ -393,7 +393,7 @@ fn service_presenter_signals(
             PresenterSignal::ChannelLost(diagnostic) => {
                 outcome.interrupted = true;
                 outcome.resend_full = true;
-                if let Err(error) = presenter.recover_channel(registry::error::DEVICE_LOST) {
+                if let Err(error) = presenter.recover_channel(messages::ERROR_DEVICE_LOST) {
                     let _ = events.send(PresentEvent::Error(format!(
                         "{diagnostic}; channel recovery failed: {error}"
                     )));

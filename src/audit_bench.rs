@@ -191,13 +191,35 @@ fn encoded_body_len(
                     },
                 })
                 .collect();
-            media::raster_delta_frame_body(1, 2, 1, 0, 0, width, height, 8, &operations, compress)
-                .unwrap()
-                .len()
+            media::raster_delta_frame_body(
+                &vivid_protocol::media::RasterDeltaFrame {
+                    epoch: 1,
+                    frame_id: 2,
+                    base_frame_id: 1,
+                    pts_us: 0,
+                    duration_us: 0,
+                    width,
+                    height,
+                    operations: &operations,
+                },
+                8,
+                compress,
+            )
+            .unwrap()
+            .len()
         } else {
-            media::raster_frame_body_with_compression(1, 2, width, height, rgba, compress)
-                .unwrap()
-                .len()
+            media::raster_frame_body_with_compression(
+                &vivid_protocol::media::RasterFrame {
+                    epoch: 1,
+                    frame_id: 2,
+                    width,
+                    height,
+                    rgba,
+                },
+                compress,
+            )
+            .unwrap()
+            .len()
         }
     };
     encode(false).min(encode(true))

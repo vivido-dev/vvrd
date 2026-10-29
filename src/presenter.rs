@@ -8,8 +8,7 @@ use std::time::{Duration, Instant};
 use vivid_protocol::{
     cbor::Value,
     media::{self, RasterDeltaOperation},
-    messages::LaneClass,
-    registry,
+    messages::{self, LaneClass},
     track::{KindConfiguration, TrackConfiguration, TrackMode},
 };
 use vivid_sdk::{
@@ -579,7 +578,7 @@ fn commit_node_following_target(
         let stale = match attempt {
             Ok(()) => return Ok(()),
             Err(error)
-                if presenter_code(&error) == Some(registry::error::STALE_TARGET_GENERATION) =>
+                if presenter_code(&error) == Some(messages::ERROR_STALE_TARGET_GENERATION) =>
             {
                 error
             }
@@ -1269,7 +1268,7 @@ mod tests {
                 .is_some_and(|(retained, _)| Arc::ptr_eq(retained, &image))
         );
     }
-    use vivid_protocol::registry;
+    use vivid_protocol::messages;
     use vivid_sdk::{ProducerConfig, Session, SurfaceRole};
 
     fn offline_session() -> Session {
@@ -1420,7 +1419,7 @@ mod tests {
         let before = presenter.frame_id;
 
         presenter
-            .recover_channel(registry::error::NEED_KEYFRAME)
+            .recover_channel(messages::ERROR_NEED_KEYFRAME)
             .unwrap();
 
         assert_eq!(
@@ -1471,7 +1470,7 @@ mod tests {
         presenter.show_frame(&changed, Some(&delta)).unwrap();
         assert_eq!(presenter.accumulated_damage_pixels, 1);
 
-        presenter.require_full_frame(registry::error::NEED_KEYFRAME);
+        presenter.require_full_frame(messages::ERROR_NEED_KEYFRAME);
         assert!(presenter.force_full_frame);
         presenter.show_frame(&changed, Some(&delta)).unwrap();
         assert!(!presenter.force_full_frame);
@@ -1690,15 +1689,15 @@ mod tests {
     }
 
     fn messages_delete_node() -> u16 {
-        registry::record::DELETE_NODE
+        messages::DELETE_NODE
     }
 
     fn messages_destroy_track() -> u16 {
-        registry::record::DESTROY_TRACK
+        messages::DESTROY_TRACK
     }
 
     fn messages_destroy_surface() -> u16 {
-        registry::record::DESTROY_SURFACE
+        messages::DESTROY_SURFACE
     }
 
     #[test]
@@ -1786,7 +1785,7 @@ mod tests {
         assert!(error.to_string().contains("unavailable"));
 
         presenter
-            .recover_channel(registry::error::DEVICE_LOST)
+            .recover_channel(messages::ERROR_DEVICE_LOST)
             .expect("channel recovery");
         assert_eq!(
             presenter.track.id(),
@@ -1851,7 +1850,7 @@ mod tests {
                 (0, Value::Unsigned(context_id)),
                 (1, Value::Unsigned(surface_id)),
                 (2, Value::Unsigned(track_id)),
-                (3, Value::Unsigned(registry::error::DECODER)),
+                (3, Value::Unsigned(messages::ERROR_DECODER)),
             ],
         };
 
